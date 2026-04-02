@@ -143,10 +143,7 @@ Frontend 採用 Next.js + TailwindCSS + Shadcn/UI，提供以下頁面：
 |---|---|---|
 | Task 1 | 資料結構設計 + 進程管理器核心類別 | ✅ 完成 |
 | Task 2 | GGUF 模型掃描 API | ✅ 完成 |
-| Task 3 | 模型群組管理 API + 啟動/停止 llama-server | ⏳ 待開始 |
-| Task 4 | llama-bench 整合 | ⏳ 待開始 |
-| Task 5 | OpenAI 相容 API Router + Fallback + 遠端存取 | ⏳ 待開始 |
-| Task 6 | Frontend UI (Dashboard, Model Manager, Benchmark, Settings) | ⏳ 待開始 |
-
-
-Task 3, 4, 5 completed.
+| Task 3 | 多模型並行進程管理 + ModelGroup CRUD + 一鍵啟動 API | ✅ 完成 |
+| Task 4 | llama-bench 整合 (async 執行、regex 解析、SQLite 儲存) | ✅ 完成 |
+| Task 5 | OpenAI 相容 API Router + Fallback + 503 機制 | ✅ 完成 |
+| Task 6 | Frontend UI (Dashboard, Model Manager, Benchmark, Settings) | ✅ 完成 |

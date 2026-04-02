@@ -18,6 +18,12 @@
 - Task 3: 實作模型控制端點 (`POST /api/process/start`, `stop`, `status`)
 - Task 4: 實作 async `llama-bench` 執行器與 regex 數據解析，將結果寫回 SQLite
 - Task 5: 實作 OpenAI 兼容 API (`/v1/chat/completions`, `/v1/models`)，處理 httpx 反向代理與未啟動模型的 503 HTTP 反應
+- Task 5 追加: ModelGroup CRUD API + 一鍵啟動端點 (`/api/model-groups/{id}/launch`)
+- Task 6: Frontend UI (Next.js + TailwindCSS + Shadcn/UI)
+  - Dashboard: 即時狀態、運行中模型清單、stats cards
+  - Model Manager: GGUF 掃描表格、ModelGroup CRUD 對話框、launch/stop 按鈕
+  - Benchmark Viewer: 歷史測試數據表格、最佳分數高亮
+  - Settings: 掃描目錄管理、API endpoint 參考
 - 新增 `README.md` 作為專案的對外總覽介紹
 
 ### Changed

@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.database import init_db
-from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router
+from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes
 from backend.app.core.process_manager import llama_process_manager
 
 # 設定 logging
@@ -58,6 +58,7 @@ app.include_router(settings_routes.router)
 app.include_router(process_routes.router)
 app.include_router(benchmark_routes.router)
 app.include_router(openai_router.router)
+app.include_router(model_group_routes.router)
 
 
 @app.get("/")
@@ -72,5 +73,9 @@ def root():
 
 @app.get("/api/status")
 def get_server_status():
-    """取得 llama-server 進程狀態。"""
-    return llama_process_manager.get_status()
+    """取得所有 llama-server 進程狀態。"""
+    statuses = llama_process_manager.get_all_status()
+    return {
+        "active_count": len(statuses),
+        "processes": statuses,
+    }
