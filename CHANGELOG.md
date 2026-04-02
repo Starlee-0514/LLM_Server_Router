@@ -18,6 +18,7 @@
 - Task 3: 實作模型控制端點 (`POST /api/process/start`, `stop`, `status`)
 - Task 4: 實作 async `llama-bench` 執行器與 regex 數據解析，將結果寫回 SQLite
 - Task 5: 實作 OpenAI 兼容 API (`/v1/chat/completions`, `/v1/models`)，處理 httpx 反向代理與未啟動模型的 503 HTTP 反應
+- 新增 `README.md` 作為專案的對外總覽介紹
 
 ### Changed
 - 修正統一記憶體規格為 64GB
