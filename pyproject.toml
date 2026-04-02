@@ -1,0 +1,23 @@
+[project]
+name = "llm-server-router"
+version = "0.1.0"
+description = "本地 LLM 路由管理系統 - 針對 AMD Radeon 890M (Strix Point) 優化"
+readme = "docs/DESIGN_DOC.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "sqlalchemy>=2.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "aiosqlite>=0.20.0",
+    "httpx>=0.28.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
