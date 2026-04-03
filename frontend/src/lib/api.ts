@@ -154,7 +154,7 @@ export const stopProcess = (identifier: string) =>
 export const getAllProcessStatus = () => apiFetch<AllProcessesStatus>("/api/process/status");
 
 // --- Benchmarks ---
-export const runBenchmark = (req: {
+export interface BenchmarkRunParams {
   model_name: string;
   model_path: string;
   engine_type?: string;
@@ -166,7 +166,78 @@ export const runBenchmark = (req: {
   n_gen?: number;
   flash_attn?: number;
   no_kv_offload?: number;
-}) => apiFetch<BenchmarkRecord>("/api/benchmarks/run", { method: "POST", body: JSON.stringify(req) });
+}
+
+/**
+ * Run benchmark with SSE streaming.
+ * Receives real-time log lines via onLog callback.
+ * Returns the final results when done.
+ */
+export const runBenchmarkStream = async (
+  req: BenchmarkRunParams,
+  onLog: (line: string) => void,
+): Promise<{ pp_tokens_per_second?: number; tg_tokens_per_second?: number; raw_output?: string; record_id?: number }> => {
+  const base = getApiBase();
+  const res = await fetch(`${base}/api/benchmarks/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `API Error: ${res.status}`);
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResults: any = {};
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Process complete SSE events (separated by double newlines)
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || ""; // keep incomplete event in buffer
+
+    for (const event of events) {
+      if (!event.trim()) continue;
+
+      const lines = event.split("\n");
+      let eventType = "";
+      let data = "";
+
+      for (const line of lines) {
+        if (line.startsWith("event: ")) eventType = line.slice(7).trim();
+        if (line.startsWith("data: ")) data = line.slice(6);
+      }
+
+      if (!data) continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        if (eventType === "log") {
+          onLog(parsed.line);
+        } else if (eventType === "done") {
+          finalResults = parsed;
+        } else if (eventType === "error") {
+          throw new Error(parsed.error || "Benchmark failed");
+        }
+      } catch (e: any) {
+        if (e.message && !e.message.includes("JSON")) throw e;
+      }
+    }
+  }
+
+  return finalResults;
+};
+
 export const getBenchmarkHistory = () => apiFetch<BenchmarkRecord[]>("/api/benchmarks/history");
 export const deleteBenchmark = (id: number) =>
   apiFetch(`/api/benchmarks/${id}`, { method: "DELETE" });

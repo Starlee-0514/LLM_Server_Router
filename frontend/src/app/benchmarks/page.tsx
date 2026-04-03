@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import {
   getBenchmarkHistory,
   getModelGroups,
-  runBenchmark,
+  runBenchmarkStream,
   deleteBenchmark,
   importBenchmarks,
   type BenchmarkRecord,
@@ -82,28 +82,36 @@ export default function BenchmarksPage() {
 
     setRunning(true);
     let total = batches.length * ngls.length;
+    let completed = 0;
     try {
       for (const batch of batches) {
         for (const ngl of ngls) {
-          setDebugLog((prev) => prev + `Running test for ${group.name} (NGL: ${ngl}, Batch: ${batch}, pp: ${nPrompt}, tg: ${nGen}, FA: ${flashAttn})...\n`);
-          const result = await runBenchmark({
-            model_name: group.name,
-            model_path: group.model_path,
-            engine_type: group.engine_type,
-            n_gpu_layers: ngl,
-            batch_size: batch,
-            ubatch_size: group.ubatch_size,
-            ctx_size: group.ctx_size,
-            n_prompt: nPrompt,
-            n_gen: nGen,
-            flash_attn: flashAttn,
-            no_kv_offload: noKvOffload,
-          });
-          setDebugLog((prev) => prev + `\n--- Completed (NGL: ${ngl}, Batch: ${batch}) ---\n${result.raw_output || "No output"}\n`);
+          completed++;
+          setDebugLog((prev) => prev + `\n━━━ Test ${completed}/${total}: ${group.name} (NGL: ${ngl}, Batch: ${batch}, pp: ${nPrompt}, tg: ${nGen}) ━━━\n`);
+          await runBenchmarkStream(
+            {
+              model_name: group.name,
+              model_path: group.model_path,
+              engine_type: group.engine_type,
+              n_gpu_layers: ngl,
+              batch_size: batch,
+              ubatch_size: group.ubatch_size,
+              ctx_size: group.ctx_size,
+              n_prompt: nPrompt,
+              n_gen: nGen,
+              flash_attn: flashAttn,
+              no_kv_offload: noKvOffload,
+            },
+            (line) => {
+              // Real-time log line callback
+              setDebugLog((prev) => prev + line + "\n");
+            },
+          );
+          setDebugLog((prev) => prev + `✓ Test ${completed}/${total} completed\n`);
           await refresh();
         }
       }
-      alert(`Completed ${total} benchmark(s)!`);
+      setDebugLog((prev) => prev + `\n══════ All ${total} benchmark(s) finished ══════\n`);
     } catch (e: any) {
       setDebugLog((prev) => prev + `\n[ERROR] ${e.message}\n`);
       alert("Error: " + e.message);
