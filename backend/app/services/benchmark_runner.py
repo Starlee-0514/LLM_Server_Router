@@ -89,7 +89,8 @@ async def run_benchmark_async(
     if engine == EngineType.ROCM:
         env["HSA_OVERRIDE_GFX_VERSION"] = settings.hsa_override_gfx_version
 
-    logger.info(f"執行 llama-bench: {' '.join(cmd)}")
+    cmd_str = ' '.join(cmd)
+    logger.info(f"執行 llama-bench: {cmd_str}")
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -99,15 +100,25 @@ async def run_benchmark_async(
     )
 
     stdout, stderr = await process.communicate()
-    output = stdout.decode("utf-8")
-    
+    stdout_text = stdout.decode("utf-8")
+    stderr_text = stderr.decode("utf-8")
+
+    # Build full execution log: command + stderr (GPU info, loading) + stdout (results)
+    full_log_parts = [f"$ {cmd_str}", ""]
+    if stderr_text.strip():
+        full_log_parts.append(stderr_text.strip())
+        full_log_parts.append("")
+    if stdout_text.strip():
+        full_log_parts.append(stdout_text.strip())
+    full_log = "\n".join(full_log_parts)
+
     if process.returncode != 0:
-        logger.error(f"llama-bench failed:\n{stderr.decode('utf-8')}")
-        raise RuntimeError("llama-bench 執行失敗")
+        logger.error(f"llama-bench failed:\n{stderr_text}")
+        raise RuntimeError(f"llama-bench 執行失敗\n{full_log}")
 
     # 解析輸出
-    results = {"raw_output": output}
-    for line in output.splitlines():
+    results = {"raw_output": full_log}
+    for line in stdout_text.splitlines():
         # 方法 1：Regex
         match = BENCH_ROW_REGEX.search(line)
         if match:
