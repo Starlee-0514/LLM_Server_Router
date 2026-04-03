@@ -33,6 +33,17 @@ export default function BenchmarksPage() {
   const [debugLog, setDebugLog] = useState<string>("");
   const logEndRef = useRef<HTMLDivElement>(null);
 
+  // Restore debug log from localStorage on mount
+  useEffect(() => {
+    const saved = localStorage.getItem("benchmark_debug_log");
+    if (saved) setDebugLog(saved);
+  }, []);
+
+  // Persist debug log to localStorage on every change
+  useEffect(() => {
+    localStorage.setItem("benchmark_debug_log", debugLog);
+  }, [debugLog]);
+
   const scrollToBottom = () => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
@@ -40,6 +51,11 @@ export default function BenchmarksPage() {
   useEffect(() => {
     scrollToBottom();
   }, [debugLog]);
+
+  const clearLog = () => {
+    setDebugLog("");
+    localStorage.removeItem("benchmark_debug_log");
+  };
 
   const handleGroupSelect = (idStr: string) => {
     setSelectedGroupId(idStr);
@@ -288,7 +304,7 @@ export default function BenchmarksPage() {
           <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
             <CardHeader className="flex flex-row items-center justify-between py-2">
               <CardTitle className="text-sm">Testing Debug Log</CardTitle>
-              <Button variant="ghost" size="xs" onClick={() => setDebugLog("")} className="h-7 text-xs px-2">Clear Log</Button>
+              <Button variant="ghost" size="xs" onClick={clearLog} className="h-7 text-xs px-2">Clear Log</Button>
             </CardHeader>
             <CardContent>
               <div className="bg-black/50 p-4 rounded-md overflow-x-auto max-h-[300px] overflow-y-auto">
