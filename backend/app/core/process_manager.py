@@ -12,6 +12,8 @@ import os
 import signal
 import subprocess
 import time
+import shutil
+from pathlib import Path
 from enum import Enum
 from dataclasses import dataclass, field
 
@@ -68,11 +70,24 @@ class LlamaProcessManager:
     def _get_binary_path(self, engine_type: EngineType) -> str:
         """根據引擎類型取得對應的 llama-server 二進位檔案路徑。"""
         if engine_type == EngineType.ROCM:
-            return settings.llama_rocm_path
+            server_path = settings.llama_rocm_path
         elif engine_type == EngineType.VULKAN:
-            return settings.llama_vulkan_path
+            server_path = settings.llama_vulkan_path
         else:
             raise ValueError(f"不支援的引擎類型: {engine_type}")
+
+        if server_path.startswith("~/"):
+            server_path = str(Path(server_path).expanduser())
+
+        if not shutil.which(server_path):
+            if Path(server_path).is_dir():
+                server_path = str(Path(server_path) / "llama-server")
+                if not shutil.which(server_path) and not Path(server_path).exists():
+                    raise FileNotFoundError(f"找不到 llama-server 二進位檔: {server_path}")
+            else:
+                raise FileNotFoundError(f"找不到 llama-server: {server_path} (請確認在 PATH 內或輸入完整路徑)")
+
+        return server_path
 
     def _build_env(self, engine_type: EngineType) -> dict[str, str]:
         """建構子進程的環境變數。"""

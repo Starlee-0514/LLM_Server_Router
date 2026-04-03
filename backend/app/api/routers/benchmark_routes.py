@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
 from backend.app.models import BenchmarkRecord
-from backend.app.schemas import BenchmarkRunRequest, BenchmarkRecordResponse
+from backend.app.schemas import BenchmarkRunRequest, BenchmarkRecordResponse, BenchmarkImportRequest
 from backend.app.services.benchmark_runner import run_benchmark_async
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,10 @@ async def _run_and_save_benchmark(request: BenchmarkRunRequest, db: Session):
             batch_size=request.batch_size,
             ubatch_size=request.ubatch_size,
             ctx_size=request.ctx_size,
+            n_prompt=request.n_prompt,
+            n_gen=request.n_gen,
+            flash_attn=request.flash_attn,
+            no_kv_offload=request.no_kv_offload,
         )
 
         record = BenchmarkRecord(
@@ -44,21 +48,55 @@ async def _run_and_save_benchmark(request: BenchmarkRunRequest, db: Session):
             ctx_size=request.ctx_size,
             pp_tokens_per_second=results.get("pp_tokens_per_second"),
             tg_tokens_per_second=results.get("tg_tokens_per_second"),
+            raw_output=results.get("raw_output", ""),
         )
         db.add(record)
         db.commit()
+        db.refresh(record)
+        return record
     except Exception as e:
         logger.error(f"Benchmark run failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/run")
+@router.post("/run", response_model=BenchmarkRecordResponse)
 async def run_benchmark(
     request: BenchmarkRunRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """觸發一次 llama-bench 效能測試。
-    測試會在背景非同步執行，完成後將寫入資料庫。
-    """
-    background_tasks.add_task(_run_and_save_benchmark, request, db)
-    return {"message": "Benchmark started in background", "model": request.model_name}
+    """觸發一次 llama-bench 效能測試（同步等待完成）。"""
+    return await _run_and_save_benchmark(request, db)
+
+
+@router.delete("/{benchmark_id}")
+def delete_benchmark(benchmark_id: int, db: Session = Depends(get_db)):
+    """刪除特定的效能測試紀錄。"""
+    record = db.query(BenchmarkRecord).filter(BenchmarkRecord.id == benchmark_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="找不到該筆紀錄")
+    db.delete(record)
+    db.commit()
+    return {"message": "已刪除"}
+
+
+@router.post("/import")
+def import_benchmarks(request: BenchmarkImportRequest, db: Session = Depends(get_db)):
+    """匯入效能測試紀錄。"""
+    imported_count = 0
+    for r in request.records:
+        record = BenchmarkRecord(
+            model_name=r.model_name,
+            model_path=r.model_path,
+            engine_type=r.engine_type,
+            n_gpu_layers=r.n_gpu_layers,
+            batch_size=r.batch_size,
+            ubatch_size=r.ubatch_size,
+            ctx_size=r.ctx_size,
+            pp_tokens_per_second=r.pp_tokens_per_second,
+            tg_tokens_per_second=r.tg_tokens_per_second,
+            raw_output=r.raw_output,
+        )
+        db.add(record)
+        imported_count += 1
+    db.commit()
+    return {"message": f"成功匯入 {imported_count} 筆紀錄"}

@@ -44,6 +44,7 @@ class ModelGroup(Base):
     __tablename__ = "model_groups"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    group_name = Column(String(255), default="Default", index=True)
     name = Column(String(255), unique=True, nullable=False)
     description = Column(Text, default="")
     model_path = Column(Text, nullable=False)          # .gguf 檔案路徑

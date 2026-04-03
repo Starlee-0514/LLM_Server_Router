@@ -41,6 +41,10 @@ class GGUFFileInfo(BaseModel):
     size_bytes: int
     size_human: str  # e.g., "4.2 GB"
     parent_dir: str
+    publisher: str = ""     # e.g., "lmstudio-community"
+    quantize: str = ""      # e.g., "Q4_K_M"
+    param_size: str = ""    # e.g., "9B"
+    arch: str = ""          # e.g., "Qwen3.5"
 
 
 class ModelScanRequest(BaseModel):
@@ -65,6 +69,7 @@ class ModelScanResponse(BaseModel):
 # =====================
 class ModelGroupCreate(BaseModel):
     """建立模型群組的請求。"""
+    group_name: str = "Default"
     name: str
     description: str = ""
     model_path: str
@@ -79,6 +84,7 @@ class ModelGroupCreate(BaseModel):
 class ModelGroupResponse(BaseModel):
     """模型群組回應。"""
     id: int
+    group_name: str
     name: str
     description: str
     model_path: str
@@ -135,6 +141,10 @@ class BenchmarkRunRequest(BaseModel):
     batch_size: int = 512
     ubatch_size: int = 512
     ctx_size: int = 4096
+    n_prompt: int = 512      # prompt tokens count
+    n_gen: int = 128         # generation tokens count
+    flash_attn: int = 0      # flash attention 0|1
+    no_kv_offload: int = 0   # no kv offload 0|1
 
 class BenchmarkRecordResponse(BaseModel):
     """效能測試結果回應。"""
@@ -148,6 +158,12 @@ class BenchmarkRecordResponse(BaseModel):
     ctx_size: int
     pp_tokens_per_second: float | None = None
     tg_tokens_per_second: float | None = None
+    raw_output: str = ""
     created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class BenchmarkImportRequest(BaseModel):
+    """匯入效能測試紀錄的要求。"""
+    records: list[BenchmarkRecordResponse]

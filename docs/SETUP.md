@@ -18,9 +18,10 @@
 |---|---|
 | OS | Linux (Ubuntu 22.04+ 推薦) |
 | Python | 3.10+ |
+| Node.js | 18+ (前端) |
 | GPU | AMD Radeon 890M 或其他支援 ROCm/Vulkan 的 GPU |
 | RAM | 建議 16GB 以上（統一記憶體環境可充分利用） |
-| llama.cpp | 需自備編譯好的 `llama-server` 二進位檔（ROCm 或 Vulkan 版本） |
+| llama.cpp | 需自備編譯好的 `llama-server` 與 `llama-bench` 二進位檔（ROCm 或 Vulkan 版本） |
 
 ### 預置軟體
 
@@ -39,7 +40,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### 1. 克隆專案
 
 ```bash
-git clone <repository-url> LLM_Server_Router
+git clone git@github.com:Starlee-0514/LLM_Server_Router.git
 cd LLM_Server_Router
 ```
 
@@ -56,19 +57,27 @@ nano .env  # 或使用任何編輯器
 ### 3. 安裝依賴
 
 ```bash
+# 後端
 uv sync
+
+# 前端
+cd frontend && npm install && cd ..
 ```
 
-### 4. 啟動後端服務
+### 4. 啟動服務
 
 ```bash
-# 開發模式（附帶自動重載）
+# 終端 1：後端（開發模式，附帶自動重載）
 uv run uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+
+# 終端 2：前端
+cd frontend && npm run dev
 ```
 
 ### 5. 驗證
 
-開啟瀏覽器前往 `http://localhost:8000/docs` 查看自動產生的 API 文件。
+- **前端儀表板**：`http://localhost:3000`
+- **API 文件 (Swagger)**：`http://localhost:8000/docs`
 
 ---
 
@@ -184,11 +193,15 @@ curl -X POST http://localhost:8000/api/models/scan \
   "scanned_directories": ["/home/starlee/models"],
   "models": [
     {
-      "filename": "llama-3.1-8b-q4_k_m.gguf",
-      "filepath": "/home/starlee/models/llama-3.1-8b-q4_k_m.gguf",
-      "size_bytes": 4920000000,
-      "size_human": "4.58 GB",
-      "parent_dir": "/home/starlee/models"
+      "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+      "filepath": "/home/starlee/models/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf",
+      "size_bytes": 5610000000,
+      "size_human": "5.23 GB",
+      "parent_dir": "/home/starlee/models/lmstudio-community/Qwen3.5-9B-GGUF",
+      "publisher": "lmstudio-community",
+      "quantize": "Q4_K_M",
+      "param_size": "9B",
+      "arch": "Qwen3.5"
     }
   ],
   "errors": []

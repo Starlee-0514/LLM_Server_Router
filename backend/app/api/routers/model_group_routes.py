@@ -42,9 +42,10 @@ def create_model_group(request: ModelGroupCreate, db: Session = Depends(get_db))
     """
     existing = db.query(ModelGroup).filter(ModelGroup.name == request.name).first()
     if existing:
-        raise HTTPException(status_code=409, detail=f"模型群組名稱 '{request.name}' 已存在")
+        raise HTTPException(status_code=409, detail=f"模型設定檔名稱 '{request.name}' 已存在")
 
     group = ModelGroup(
+        group_name=request.group_name,
         name=request.name,
         description=request.description,
         model_path=request.model_path,
@@ -59,7 +60,7 @@ def create_model_group(request: ModelGroupCreate, db: Session = Depends(get_db))
     db.commit()
     db.refresh(group)
 
-    logger.info(f"建立模型群組: {request.name} -> {request.model_path}")
+    logger.info(f"建立模型群組: {request.group_name} / {request.name} -> {request.model_path}")
     return group
 
 
@@ -74,6 +75,7 @@ def update_model_group(
     if group is None:
         raise HTTPException(status_code=404, detail=f"模型群組 ID={group_id} 不存在")
 
+    group.group_name = request.group_name
     group.name = request.name
     group.description = request.description
     group.model_path = request.model_path

@@ -1,14 +1,89 @@
 """
 GGUF 模型掃描服務
 
-遞迴掃描指定目錄下的所有 .gguf 檔案。
+遞迴掃描指定目錄下的所有 .gguf 檔案，並解析模型元資料。
 """
 import logging
+import re
 from pathlib import Path
 
 from backend.app.schemas import GGUFFileInfo
 
 logger = logging.getLogger(__name__)
+
+# 常見的量化格式
+QUANT_PATTERNS = [
+    "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M",
+    "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M", "IQ4_XS", "IQ4_NL",
+    "Q2_K_S", "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L",
+    "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q4_K_L",
+    "Q5_0", "Q5_1", "Q5_K_S", "Q5_K_M", "Q5_K_L",
+    "Q6_K", "Q8_0", "F16", "F32", "BF16",
+]
+
+# 參數大小的正則 (e.g., 0.5B, 1.5B, 7B, 70B, 405B)
+PARAM_SIZE_REGEX = re.compile(r"[\-_](\d+(?:\.\d+)?[Bb])[\-_\.]")
+
+
+def _parse_gguf_metadata(filename: str, parent_dir: str) -> dict[str, str]:
+    """從 GGUF 檔名與上層目錄解析出模型元資料。
+
+    常見格式範例：
+      - Qwen3.5-9B-Q4_K_M.gguf
+      - Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf
+      - lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
+
+    Returns:
+        {"publisher": ..., "quantize": ..., "param_size": ..., "arch": ...}
+    """
+    meta: dict[str, str] = {
+        "publisher": "",
+        "quantize": "",
+        "param_size": "",
+        "arch": "",
+    }
+
+    name_no_ext = filename.replace(".gguf", "")
+
+    # 1. Quantize: 在檔名中找已知量化格式
+    name_upper = name_no_ext.upper()
+    for q in QUANT_PATTERNS:
+        if q in name_upper:
+            meta["quantize"] = q
+            break
+
+    # 2. Param Size: 找 7B, 9B, 70B, 1.5B 之類
+    pm = PARAM_SIZE_REGEX.search(filename)
+    if pm:
+        meta["param_size"] = pm.group(1).upper()
+
+    # 3. Publisher: 從上層目錄推斷
+    #    lmstudio 結構: publisher/ModelName-GGUF/file.gguf
+    parts = Path(parent_dir).parts
+    if len(parts) >= 2:
+        # 檢查上上層 (publisher) -> 上層 (model-GGUF)
+        potential_publisher = parts[-2] if len(parts) >= 2 else ""
+        potential_model_dir = parts[-1]
+        if "gguf" in potential_model_dir.lower() or "GGUF" in potential_model_dir:
+            meta["publisher"] = potential_publisher
+        else:
+            # 仍嘗試 parent 是否為 publisher 結構
+            meta["publisher"] = parts[-1]
+
+    # 4. Arch: 從檔名提取模型架構（去掉 quant、param size、instruct 等）
+    arch = name_no_ext
+    # 去掉量化後綴
+    if meta["quantize"]:
+        arch = re.sub(re.escape(meta["quantize"]), "", arch, flags=re.IGNORECASE).strip("-_ ")
+    # 去掉參數大小
+    if meta["param_size"]:
+        arch = re.sub(r"[\-_]?" + re.escape(meta["param_size"]) + r"[\-_]?", "-", arch, flags=re.IGNORECASE).strip("-_ ")
+    # 去掉常見的後綴
+    for suffix in ["Instruct", "Chat", "Base", "GGUF", "gguf"]:
+        arch = arch.replace(f"-{suffix}", "").replace(f"_{suffix}", "")
+    meta["arch"] = arch.strip("-_ ") or name_no_ext
+
+    return meta
 
 
 def _human_readable_size(size_bytes: int) -> str:
@@ -24,14 +99,7 @@ def _human_readable_size(size_bytes: int) -> str:
 
 
 def scan_directory(directory: str) -> tuple[list[GGUFFileInfo], list[str]]:
-    """掃描單一目錄下的所有 .gguf 檔案。
-
-    Args:
-        directory: 要掃描的目錄路徑
-
-    Returns:
-        (models, errors) - 找到的模型清單與錯誤訊息列表
-    """
+    """掃描單一目錄下的所有 .gguf 檔案。"""
     models: list[GGUFFileInfo] = []
     errors: list[str] = []
 
@@ -46,20 +114,25 @@ def scan_directory(directory: str) -> tuple[list[GGUFFileInfo], list[str]]:
         return models, errors
 
     try:
-        # 遞迴搜尋所有 .gguf 檔案
         for gguf_path in sorted(dir_path.rglob("*.gguf")):
             if not gguf_path.is_file():
                 continue
 
             try:
                 stat = gguf_path.stat()
+                parent = str(gguf_path.parent.resolve())
+                meta = _parse_gguf_metadata(gguf_path.name, parent)
                 models.append(
                     GGUFFileInfo(
                         filename=gguf_path.name,
                         filepath=str(gguf_path.resolve()),
                         size_bytes=stat.st_size,
                         size_human=_human_readable_size(stat.st_size),
-                        parent_dir=str(gguf_path.parent.resolve()),
+                        parent_dir=parent,
+                        publisher=meta["publisher"],
+                        quantize=meta["quantize"],
+                        param_size=meta["param_size"],
+                        arch=meta["arch"],
                     )
                 )
             except OSError as e:

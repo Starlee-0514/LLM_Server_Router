@@ -1,10 +1,18 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+function getApiBase(): string {
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
+  if (typeof window !== "undefined") {
+    // Use the same hostname the browser loaded the page from, but on port 8000
+    return `http://${window.location.hostname}:8000`;
+  }
+  return "http://localhost:8000";
+}
 
 // ==================
 // Generic Fetcher
 // ==================
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const base = getApiBase();
+  const res = await fetch(`${base}${path}`, {
     headers: { "Content-Type": "application/json", ...options?.headers },
     ...options,
   });
@@ -24,6 +32,10 @@ export interface GGUFFileInfo {
   size_bytes: number;
   size_human: string;
   parent_dir: string;
+  publisher: string;
+  quantize: string;
+  param_size: string;
+  arch: string;
 }
 
 export interface ModelScanResponse {
@@ -42,6 +54,7 @@ export interface SettingItem {
 
 export interface ModelGroup {
   id: number;
+  group_name: string;
   name: string;
   description: string;
   model_path: string;
@@ -81,6 +94,7 @@ export interface BenchmarkRecord {
   ctx_size: number;
   pp_tokens_per_second: number | null;
   tg_tokens_per_second: number | null;
+  raw_output?: string;
   created_at: string | null;
 }
 
@@ -115,6 +129,11 @@ export const createModelGroup = (group: Omit<ModelGroup, "id" | "created_at" | "
     method: "POST",
     body: JSON.stringify(group),
   });
+export const updateModelGroup = (id: number, group: Omit<ModelGroup, "id" | "created_at" | "updated_at">) =>
+  apiFetch<ModelGroup>(`/api/model-groups/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(group),
+  });
 export const deleteModelGroup = (id: number) =>
   apiFetch("/api/model-groups/" + id, { method: "DELETE" });
 export const launchModelGroup = (id: number) =>
@@ -143,5 +162,16 @@ export const runBenchmark = (req: {
   batch_size?: number;
   ubatch_size?: number;
   ctx_size?: number;
-}) => apiFetch("/api/benchmarks/run", { method: "POST", body: JSON.stringify(req) });
+  n_prompt?: number;
+  n_gen?: number;
+  flash_attn?: number;
+  no_kv_offload?: number;
+}) => apiFetch<BenchmarkRecord>("/api/benchmarks/run", { method: "POST", body: JSON.stringify(req) });
 export const getBenchmarkHistory = () => apiFetch<BenchmarkRecord[]>("/api/benchmarks/history");
+export const deleteBenchmark = (id: number) =>
+  apiFetch(`/api/benchmarks/${id}`, { method: "DELETE" });
+export const importBenchmarks = (records: any[]) =>
+  apiFetch("/api/benchmarks/import", {
+    method: "POST",
+    body: JSON.stringify({ records }),
+  });

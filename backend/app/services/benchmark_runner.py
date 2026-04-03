@@ -6,6 +6,7 @@ llama-bench 效能測試執行器
 import asyncio
 import logging
 import re
+import shutil
 from pathlib import Path
 
 from backend.app.core.config import settings
@@ -17,8 +18,16 @@ logger = logging.getLogger(__name__)
 # | model | size | params | backend | ngl | test | t/s | ...
 # 例如：
 # | llama 7B | 6.61 GiB | 7.24 B | ROCm | 99 | pp512 | 120.5 | ...
-# | llama 7B | 6.61 GiB | 7.24 B | ROCm | 99 | tg128 | 34.2  | ...
-BENCH_ROW_REGEX = re.compile(r"\|\s*([^|]+)\s*\|\s*[^|]+\s*\|\s*[^|]+\s*\|\s*([^|]+)\s*\|\s*(\d+)\s*\|\s*(pp\d+|tg\d+)\s*\|\s*([\d.]+)\s*\|")
+# | qwen35 9B | 5.23 GiB | 8.95 B | ROCm | 999 | pp512 | 365.20 ± 3.22 |
+BENCH_ROW_REGEX = re.compile(
+    r"\|\s*(?P<model>[^|]+)\s*\|"      # model
+    r"\s*(?P<size>[^|]+)\s*\|"       # size
+    r"\s*(?P<params>[^|]+)\s*\|"     # params
+    r"\s*(?P<backend>[^|]+)\s*\|"    # backend
+    r"\s*(?P<ngl>\d+)\s*\|"          # ngl
+    r"\s*(?P<test>pp\d+|tg\d+)\s*\|" # test
+    r"\s*(?P<ts>[\d.]+)[^|]*\|"      # t/s (只抓前面的數字，忽略 ± 等符號)
+)
 
 
 def _get_bench_binary(engine_type: EngineType) -> str:
@@ -29,8 +38,21 @@ def _get_bench_binary(engine_type: EngineType) -> str:
         server_path = settings.llama_vulkan_path
         
     bench_path = server_path.replace("llama-server", "llama-bench")
-    if not Path(bench_path).exists():
-        raise FileNotFoundError(f"找不到 llama-bench: {bench_path}")
+    
+    # 支援 `~/` 路徑展開
+    if bench_path.startswith("~/"):
+        bench_path = str(Path(bench_path).expanduser())
+        
+    # 若在 PATH 內，此方法能正確定位
+    if not shutil.which(bench_path):
+        # 也有可能是傳入的是資料夾，嘗試補上 llama-bench
+        if Path(bench_path).is_dir():
+            bench_path = str(Path(bench_path) / "llama-bench")
+            if not shutil.which(bench_path) and not Path(bench_path).exists():
+                raise FileNotFoundError(f"找不到 llama-bench 二進位檔: {bench_path}")
+        else:
+            raise FileNotFoundError(f"找不到 llama-bench: {bench_path} (請確認在 PATH 內或輸入完整路徑)")
+            
     return bench_path
 
 
@@ -42,25 +64,25 @@ async def run_benchmark_async(
     batch_size: int = 512,
     ubatch_size: int = 512,
     ctx_size: int = 4096,
+    n_prompt: int = 512,
+    n_gen: int = 128,
+    flash_attn: int = 0,
+    no_kv_offload: int = 0,
 ) -> dict[str, float]:
-    """非同步執行 llama-bench 並解析輸出。
-
-    Returns:
-        {"pp_t_s": 120.5, "tg_t_s": 34.2} 或空字典
-    """
+    """非同步執行 llama-bench 並解析輸出。"""
     engine = EngineType(engine_type.lower())
     bench_path = _get_bench_binary(engine)
 
-    # 執行基本的 prompt processing 512, text generation 128
     cmd = [
         bench_path,
         "-m", model_path,
-        "-n", "128",   # generation tokens
-        "-p", "512",   # prompt tokens
+        "-n", str(n_gen),
+        "-p", str(n_prompt),
         "-ngl", str(n_gpu_layers),
         "-b", str(batch_size),
         "-ub", str(ubatch_size),
-        "-c", str(ctx_size),
+        "-fa", str(flash_attn),
+        "-nkvo", str(no_kv_offload),
     ]
 
     env = {}
@@ -84,17 +106,37 @@ async def run_benchmark_async(
         raise RuntimeError("llama-bench 執行失敗")
 
     # 解析輸出
-    results = {}
+    results = {"raw_output": output}
     for line in output.splitlines():
+        # 方法 1：Regex
         match = BENCH_ROW_REGEX.search(line)
         if match:
-            test_type = match.group(4).strip() # pp512 or tg128
-            ts_val = float(match.group(5).strip())
+            test_type = match.group("test").strip()
+            ts_val = float(match.group("ts").strip())
             
             if test_type.startswith("pp"):
                 results["pp_tokens_per_second"] = ts_val
             elif test_type.startswith("tg"):
                 results["tg_tokens_per_second"] = ts_val
+            continue
+
+        # 方法 2：Fallback 分割 (針對某些版本格式微調)
+        if line.startswith("|") and ("pp" in line.lower() or "tg" in line.lower()):
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 8:
+                test_type = parts[6].lower()
+                ts_str = parts[7]
+                # 只擷取數字部分
+                num_match = re.search(r"[\d.]+", ts_str)
+                if num_match:
+                    try:
+                        ts_val = float(num_match.group(0))
+                        if "pp" in test_type:
+                            results["pp_tokens_per_second"] = ts_val
+                        elif "tg" in test_type:
+                            results["tg_tokens_per_second"] = ts_val
+                    except:
+                        pass
 
     logger.info(f"Benchmark results: {results}")
     return results
