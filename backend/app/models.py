@@ -103,3 +103,86 @@ class BenchmarkRecord(Base):
             f"<BenchmarkRecord(model={self.model_name!r}, "
             f"pp={self.pp_tokens_per_second}, tg={self.tg_tokens_per_second})>"
         )
+
+
+class ProviderEndpoint(Base):
+    """通用 Provider 端點定義。
+
+    provider_type:
+      - openai_compatible: /v1/chat/completions + /v1/models
+      - anthropic: /v1/messages (需轉換)
+      - local_process: 由本機 process manager 管理 (llama.cpp)
+    """
+
+    __tablename__ = "provider_endpoints"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), unique=True, nullable=False, index=True)
+    provider_type = Column(String(50), nullable=False, default="openai_compatible")
+    base_url = Column(Text, nullable=True, default="")
+    api_key = Column(Text, nullable=True, default="")
+    extra_headers = Column(Text, nullable=False, default="")  # JSON object string
+    enabled = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    @validates("provider_type")
+    def validate_provider_type(self, key, value):
+        allowed = {"openai_compatible", "anthropic", "local_process"}
+        if value not in allowed:
+            raise ValueError(f"provider_type 必須是 {allowed} 之一，收到: {value!r}")
+        return value
+
+
+class ModelRoute(Base):
+    """模型路由規則：把 model 名稱映射到特定 provider。"""
+
+    __tablename__ = "model_routes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_name = Column(String(255), unique=True, nullable=False, index=True)
+    match_type = Column(String(20), nullable=False, default="exact")  # exact | prefix
+    match_value = Column(String(255), nullable=False, index=True)
+    target_model = Column(String(255), nullable=True, default="")
+    provider_id = Column(Integer, nullable=False, index=True)
+    priority = Column(Integer, nullable=False, default=100)
+    enabled = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    @validates("match_type")
+    def validate_match_type(self, key, value):
+        allowed = {"exact", "prefix"}
+        if value not in allowed:
+            raise ValueError(f"match_type 必須是 {allowed} 之一，收到: {value!r}")
+        return value
+
+
+class MeshWorker(Base):
+    """Tailscale Mesh 節點註冊表。"""
+
+    __tablename__ = "mesh_workers"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_name = Column(String(255), unique=True, nullable=False, index=True)
+    base_url = Column(Text, nullable=False)
+    api_token = Column(Text, nullable=False, default="")
+    provider_id = Column(Integer, nullable=True, index=True)
+    models_json = Column(Text, nullable=False, default="[]")
+    metadata_json = Column(Text, nullable=False, default="{}")
+    status = Column(String(50), nullable=False, default="unknown")
+    last_seen_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
