@@ -4,7 +4,7 @@ A high-performance local LLM routing system optimized for AMD Radeon 890M (Strix
 
 ## 🌟 Overview
 
-The LLM Server Router is the central hub for your local language models, specifically optimized for AMD hardware with unified memory (e.g., 72GB on Strix Point). It provides:
+The LLM Server Router is the central hub for your local language models, specifically optimized for AMD hardware with unified memory (e.g., 64GB on Strix Point). It provides:
 
 - **Local Model Management**: Discover, organize, and manage `.gguf` models with automatic metadata extraction (publisher, quantize, param size, architecture).
 - **Smart Routing & Fallback**: OpenAI-compatible API endpoint — routes to local `llama-server` instances first, falls back to external APIs (OpenAI/Anthropic) if unavailable.
@@ -128,6 +128,59 @@ For detailed information, refer to:
 - [Setup Guide](docs/SETUP.md) — Installation, configuration, and API usage
 - [Design Document](docs/DESIGN_DOC.md) — Architecture overview, core features, and technical stack
 
+## 🌐 Tailscale Mesh Router (Single Endpoint)
+
+You can deploy this project as a hub-and-worker mesh so third-party agents only configure one local endpoint.
+
+### Topology
+
+- **Hub node**: runs this router, exposes `/v1/chat/completions` and `/v1/models`
+- **Worker nodes**: run any OpenAI-compatible LLM framework (llama.cpp, vLLM, SGLang, TGI gateway, etc.)
+- **Network**: all nodes connected by Tailscale (MagicDNS or `100.x.y.z` addresses)
+
+### New Management APIs
+
+- `POST /api/mesh/workers/heartbeat` — register/update worker model inventory
+- `GET /api/mesh/workers` — list workers
+- `POST /api/providers` / `GET /api/providers` — manage provider endpoints
+- `POST /api/model-routes` / `GET /api/model-routes` — model name routing rules
+
+### Basic Flow
+
+1. Register provider endpoint (for an OpenAI-compatible worker gateway).
+2. Create model route rules (`exact` or `prefix`) to map requested model names to provider.
+3. (Optional) send worker heartbeats to advertise available models.
+4. Point all third-party tools to the hub: `http://<hub-tailnet-name>:8000/v1`.
+
+### Example: Register a Tailscale worker provider
+
+```bash
+curl -X POST http://localhost:8000/api/providers \
+   -H "Content-Type: application/json" \
+   -d '{
+      "name": "worker-a",
+      "provider_type": "openai_compatible",
+      "base_url": "http://worker-a.tailnet.ts.net:8000",
+      "api_key": "",
+      "extra_headers": "",
+      "enabled": true
+   }'
+```
+
+```bash
+curl -X POST http://localhost:8000/api/model-routes \
+   -H "Content-Type: application/json" \
+   -d '{
+      "route_name": "qwen-route",
+      "match_type": "prefix",
+      "match_value": "qwen",
+      "target_model": "Qwen3.5-9B-Instruct",
+      "provider_id": 1,
+      "priority": 10,
+      "enabled": true
+   }'
+```
+
 ## 🛠️ Tech Stack
 
 | Layer | Technology |
@@ -137,7 +190,7 @@ For detailed information, refer to:
 | **Database** | SQLite |
 | **Dependencies** | `uv` (Python), `npm` (Node.js) |
 | **Core Engine** | `llama.cpp` (`llama-server`, `llama-bench`) |
-| **Target Hardware** | AMD Radeon 890M (gfx1150), 72GB unified memory |
+| **Target Hardware** | AMD Radeon 890M (gfx1150), 64GB unified memory |
 
 ## 📁 Project Structure
 
@@ -161,7 +214,7 @@ LLM_Server_Router/
 │           ├── process_routes.py     # /api/process/*
 │           ├── benchmark_routes.py   # /api/benchmarks/*
 │           ├── settings_routes.py    # /api/settings
-│           └── openai_routes.py      # /v1/chat/completions
+│           └── openai_router.py      # /v1/chat/completions
 ├── frontend/
 │   └── src/
 │       ├── app/
