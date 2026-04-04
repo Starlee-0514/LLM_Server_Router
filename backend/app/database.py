@@ -43,5 +43,12 @@ def get_db():
 
 def init_db():
     """建立所有資料表 (如果不存在)。"""
-    from backend.app.models import Setting, ModelGroup, BenchmarkRecord  # noqa: F401
+    from backend.app.models import (  # noqa: F401
+        Setting,
+        ModelGroup,
+        BenchmarkRecord,
+        ProviderEndpoint,
+        ModelRoute,
+        MeshWorker,
+    )
     Base.metadata.create_all(bind=engine)

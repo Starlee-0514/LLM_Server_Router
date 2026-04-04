@@ -7,12 +7,15 @@ LLM Server Router - FastAPI 主應用程式
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.database import init_db
-from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes
+from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes
 from backend.app.core.process_manager import llama_process_manager
+from backend.app.database import SessionLocal
+from backend.app.models import Setting
 
 # 設定 logging
 logging.basicConfig(
@@ -59,6 +62,40 @@ app.include_router(process_routes.router)
 app.include_router(benchmark_routes.router)
 app.include_router(openai_router.router)
 app.include_router(model_group_routes.router)
+app.include_router(metrics_routes.router)
+app.include_router(provider_routes.router)
+app.include_router(provider_routes.routes_router)
+app.include_router(provider_routes.mesh_router)
+
+
+@app.middleware("http")
+async def enforce_api_token(request: Request, call_next):
+    """Optionally require API token for OpenAI-compatible routes."""
+    path = request.url.path
+    if not path.startswith("/v1/"):
+        return await call_next(request)
+
+    db = SessionLocal()
+    try:
+        token_setting = db.query(Setting).filter(Setting.key == "api_token").first()
+        token = (token_setting.value.strip() if token_setting and token_setting.value else "")
+    finally:
+        db.close()
+
+    if not token:
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "")
+    supplied = ""
+    if auth_header.lower().startswith("bearer "):
+        supplied = auth_header[7:].strip()
+    if not supplied:
+        supplied = request.headers.get("x-api-key", "").strip()
+
+    if supplied != token:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized: invalid API token"})
+
+    return await call_next(request)
 
 
 @app.get("/")

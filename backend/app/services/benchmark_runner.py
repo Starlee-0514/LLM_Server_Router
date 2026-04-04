@@ -12,8 +12,12 @@ import shutil
 from pathlib import Path
 from typing import AsyncGenerator
 
-from backend.app.core.config import settings
 from backend.app.core.process_manager import EngineType
+from backend.app.core.runtime_settings import (
+    get_hsa_override_gfx_version,
+    get_llama_rocm_path,
+    get_llama_vulkan_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +36,9 @@ BENCH_ROW_REGEX = re.compile(
 def _get_bench_binary(engine_type: EngineType) -> str:
     """自動推導 llama-bench 的路徑。"""
     if engine_type == EngineType.ROCM:
-        server_path = settings.llama_rocm_path
+        server_path = get_llama_rocm_path()
     else:
-        server_path = settings.llama_vulkan_path
+        server_path = get_llama_vulkan_path()
         
     bench_path = server_path.replace("llama-server", "llama-bench")
     
@@ -144,7 +148,7 @@ async def run_benchmark_stream(
 
     env = {}
     if engine == EngineType.ROCM:
-        env["HSA_OVERRIDE_GFX_VERSION"] = settings.hsa_override_gfx_version
+        env["HSA_OVERRIDE_GFX_VERSION"] = get_hsa_override_gfx_version()
 
     cmd_str = " ".join(cmd)
     logger.info(f"執行 llama-bench (streaming): {cmd_str}")
@@ -246,7 +250,7 @@ async def run_benchmark_async(
 
     env = {}
     if engine == EngineType.ROCM:
-        env["HSA_OVERRIDE_GFX_VERSION"] = settings.hsa_override_gfx_version
+        env["HSA_OVERRIDE_GFX_VERSION"] = get_hsa_override_gfx_version()
 
     cmd_str = ' '.join(cmd)
     logger.info(f"執行 llama-bench: {cmd_str}")

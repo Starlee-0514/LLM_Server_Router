@@ -18,6 +18,11 @@ from enum import Enum
 from dataclasses import dataclass, field
 
 from backend.app.core.config import settings
+from backend.app.core.runtime_settings import (
+    get_hsa_override_gfx_version,
+    get_llama_rocm_path,
+    get_llama_vulkan_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +75,9 @@ class LlamaProcessManager:
     def _get_binary_path(self, engine_type: EngineType) -> str:
         """根據引擎類型取得對應的 llama-server 二進位檔案路徑。"""
         if engine_type == EngineType.ROCM:
-            server_path = settings.llama_rocm_path
+            server_path = get_llama_rocm_path()
         elif engine_type == EngineType.VULKAN:
-            server_path = settings.llama_vulkan_path
+            server_path = get_llama_vulkan_path()
         else:
             raise ValueError(f"不支援的引擎類型: {engine_type}")
 
@@ -95,9 +100,10 @@ class LlamaProcessManager:
 
         # ROCm 需要 HSA_OVERRIDE_GFX_VERSION
         if engine_type == EngineType.ROCM:
-            env["HSA_OVERRIDE_GFX_VERSION"] = settings.hsa_override_gfx_version
+            hsa_override = get_hsa_override_gfx_version()
+            env["HSA_OVERRIDE_GFX_VERSION"] = hsa_override
             logger.info(
-                f"注入環境變數: HSA_OVERRIDE_GFX_VERSION={settings.hsa_override_gfx_version}"
+                f"注入環境變數: HSA_OVERRIDE_GFX_VERSION={hsa_override}"
             )
 
         return env
