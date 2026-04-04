@@ -167,3 +167,80 @@ class BenchmarkRecordResponse(BaseModel):
 class BenchmarkImportRequest(BaseModel):
     """匯入效能測試紀錄的要求。"""
     records: list[BenchmarkRecordResponse]
+
+
+# =====================
+# Provider Router / Mesh
+# =====================
+class ProviderEndpointCreate(BaseModel):
+    name: str
+    provider_type: str = "openai_compatible"
+    base_url: str = ""
+    api_key: str = ""
+    extra_headers: str = ""
+    enabled: bool = True
+
+
+class ProviderEndpointResponse(BaseModel):
+    id: int
+    name: str
+    provider_type: str
+    base_url: str | None = ""
+    api_key: str | None = ""
+    extra_headers: str
+    enabled: bool
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class ModelRouteCreate(BaseModel):
+    route_name: str
+    match_type: str = "exact"
+    match_value: str
+    target_model: str = ""
+    provider_id: int
+    priority: int = 100
+    enabled: bool = True
+
+
+class ModelRouteResponse(BaseModel):
+    id: int
+    route_name: str
+    match_type: str
+    match_value: str
+    target_model: str | None = ""
+    provider_id: int
+    priority: int
+    enabled: bool
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class MeshWorkerUpsert(BaseModel):
+    node_name: str
+    base_url: str
+    api_token: str = ""
+    provider_id: int | None = None
+    models: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+    status: str = "online"
+
+
+class MeshWorkerResponse(BaseModel):
+    id: int
+    node_name: str
+    base_url: str
+    api_token: str = ""
+    provider_id: int | None = None
+    models_json: str
+    metadata_json: str
+    status: str
+    last_seen_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
