@@ -98,6 +98,116 @@ export interface BenchmarkRecord {
   created_at: string | null;
 }
 
+export interface RequestMetrics {
+  day: string;
+  total: number;
+  local: number;
+  remote: number;
+  local_ratio: number;
+  remote_ratio: number;
+}
+
+export interface SystemMetrics {
+  memory: {
+    total_bytes: number | null;
+    used_bytes: number | null;
+    available_bytes: number | null;
+    used_percent: number | null;
+  };
+  gpu: {
+    busy_percent: number | null;
+    vram_used_bytes: number | null;
+    vram_total_bytes: number | null;
+  };
+}
+
+export interface RecentBenchmarkItem {
+  id: number;
+  model_name: string;
+  engine_type: string;
+  pp_tokens_per_second: number | null;
+  tg_tokens_per_second: number | null;
+  created_at: string | null;
+}
+
+export interface ProviderEndpoint {
+  id: number;
+  name: string;
+  provider_type: "openai_compatible" | "anthropic" | "local_process";
+  base_url: string;
+  api_key: string;
+  extra_headers: string;
+  enabled: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ProviderCreatePayload {
+  name: string;
+  provider_type: "openai_compatible" | "anthropic" | "local_process";
+  base_url: string;
+  api_key: string;
+  extra_headers: string;
+  enabled: boolean;
+}
+
+export interface ProviderHealthResponse {
+  ok: boolean;
+  status_code?: number;
+  provider?: string;
+  provider_type?: string;
+  url?: string;
+  detail?: string;
+  error?: string;
+}
+
+export interface ModelRouteItem {
+  id: number;
+  route_name: string;
+  match_type: "exact" | "prefix";
+  match_value: string;
+  target_model: string;
+  provider_id: number;
+  priority: number;
+  enabled: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ModelRoutePayload {
+  route_name: string;
+  match_type: "exact" | "prefix";
+  match_value: string;
+  target_model: string;
+  provider_id: number;
+  priority: number;
+  enabled: boolean;
+}
+
+export interface MeshWorker {
+  id: number;
+  node_name: string;
+  base_url: string;
+  api_token: string;
+  provider_id: number | null;
+  models_json: string;
+  metadata_json: string;
+  status: string;
+  last_seen_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface MeshWorkerHeartbeatPayload {
+  node_name: string;
+  base_url: string;
+  api_token: string;
+  provider_id: number | null;
+  models: string[];
+  metadata: Record<string, unknown>;
+  status: string;
+}
+
 // ==================
 // API Functions
 // ==================
@@ -245,4 +355,58 @@ export const importBenchmarks = (records: any[]) =>
   apiFetch("/api/benchmarks/import", {
     method: "POST",
     body: JSON.stringify({ records }),
+  });
+
+// --- Metrics ---
+export const getRequestMetrics = () => apiFetch<RequestMetrics>("/api/metrics/requests");
+export const getSystemMetrics = () => apiFetch<SystemMetrics>("/api/metrics/system");
+export const getRecentBenchmarks = (limit = 5) =>
+  apiFetch<RecentBenchmarkItem[]>(`/api/metrics/benchmarks/recent?limit=${limit}`);
+
+// --- Providers ---
+export const getProviders = () => apiFetch<ProviderEndpoint[]>("/api/providers");
+export const createProvider = (payload: ProviderCreatePayload) =>
+  apiFetch<ProviderEndpoint>("/api/providers", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const updateProvider = (id: number, payload: ProviderCreatePayload) =>
+  apiFetch<ProviderEndpoint>(`/api/providers/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+export const deleteProvider = (id: number) =>
+  apiFetch<{ message: string }>(`/api/providers/${id}`, {
+    method: "DELETE",
+  });
+export const checkProviderHealth = (id: number) =>
+  apiFetch<ProviderHealthResponse>(`/api/providers/${id}/health`);
+
+// --- Model Routes ---
+export const getModelRoutes = () => apiFetch<ModelRouteItem[]>("/api/model-routes");
+export const createModelRoute = (payload: ModelRoutePayload) =>
+  apiFetch<ModelRouteItem>("/api/model-routes", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const updateModelRoute = (id: number, payload: ModelRoutePayload) =>
+  apiFetch<ModelRouteItem>(`/api/model-routes/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+export const deleteModelRoute = (id: number) =>
+  apiFetch<{ message: string }>(`/api/model-routes/${id}`, {
+    method: "DELETE",
+  });
+
+// --- Mesh Workers ---
+export const getMeshWorkers = () => apiFetch<MeshWorker[]>("/api/mesh/workers");
+export const upsertMeshWorkerHeartbeat = (payload: MeshWorkerHeartbeatPayload) =>
+  apiFetch<MeshWorker>("/api/mesh/workers/heartbeat", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const deleteMeshWorker = (id: number) =>
+  apiFetch<{ message: string }>(`/api/mesh/workers/${id}`, {
+    method: "DELETE",
   });
