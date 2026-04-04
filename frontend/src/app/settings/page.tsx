@@ -7,13 +7,22 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import { getSettings, updateSettings, type SettingItem } from "@/lib/api";
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<SettingItem[]>([]);
   const [scanDirs, setScanDirs] = useState<string[]>([]);
   const [newDir, setNewDir] = useState("");
+  const [llamaRocmPath, setLlamaRocmPath] = useState("");
+  const [llamaVulkanPath, setLlamaVulkanPath] = useState("");
+  const [hsaOverrideGfxVersion, setHsaOverrideGfxVersion] = useState("");
+  const [defaultEngine, setDefaultEngine] = useState("rocm");
+  const [openaiApiKey, setOpenaiApiKey] = useState("");
+  const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [listenHost, setListenHost] = useState("0.0.0.0");
+  const [listenPort, setListenPort] = useState("8000");
+  const [corsAllowOrigins, setCorsAllowOrigins] = useState("*");
+  const [apiToken, setApiToken] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -29,6 +38,17 @@ export default function SettingsPage() {
           setScanDirs([]);
         }
       }
+
+      setLlamaRocmPath(data.find((s) => s.key === "llama_rocm_path")?.value ?? "");
+      setLlamaVulkanPath(data.find((s) => s.key === "llama_vulkan_path")?.value ?? "");
+      setHsaOverrideGfxVersion(data.find((s) => s.key === "hsa_override_gfx_version")?.value ?? "11.5.0");
+      setDefaultEngine(data.find((s) => s.key === "default_engine")?.value ?? "rocm");
+      setOpenaiApiKey(data.find((s) => s.key === "openai_api_key")?.value ?? "");
+      setAnthropicApiKey(data.find((s) => s.key === "anthropic_api_key")?.value ?? "");
+      setListenHost(data.find((s) => s.key === "listen_host")?.value ?? "0.0.0.0");
+      setListenPort(data.find((s) => s.key === "listen_port")?.value ?? "8000");
+      setCorsAllowOrigins(data.find((s) => s.key === "cors_allow_origins")?.value ?? "*");
+      setApiToken(data.find((s) => s.key === "api_token")?.value ?? "");
     } catch {}
   };
 
@@ -53,6 +73,16 @@ export default function SettingsPage() {
     try {
       await updateSettings([
         { key: "model_scan_dirs", value: JSON.stringify(scanDirs) },
+        { key: "llama_rocm_path", value: llamaRocmPath.trim() },
+        { key: "llama_vulkan_path", value: llamaVulkanPath.trim() },
+        { key: "hsa_override_gfx_version", value: hsaOverrideGfxVersion.trim() },
+        { key: "default_engine", value: defaultEngine },
+        { key: "openai_api_key", value: openaiApiKey.trim() },
+        { key: "anthropic_api_key", value: anthropicApiKey.trim() },
+        { key: "listen_host", value: listenHost.trim() },
+        { key: "listen_port", value: listenPort.trim() },
+        { key: "cors_allow_origins", value: corsAllowOrigins.trim() },
+        { key: "api_token", value: apiToken.trim() },
       ]);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -63,9 +93,6 @@ export default function SettingsPage() {
       setSaving(false);
     }
   };
-
-  const getSettingValue = (key: string) =>
-    settings.find((s) => s.key === key)?.value || "";
 
   return (
     <div className="flex min-h-screen">
@@ -109,6 +136,86 @@ export default function SettingsPage() {
                 <Button variant="outline" onClick={handleAddDir} disabled={!newDir.trim()}>
                   Add
                 </Button>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Runtime Settings</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                設定 llama.cpp 執行檔與預設執行引擎
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label className="text-xs">ROCm llama-server Path</Label>
+                <Input value={llamaRocmPath} onChange={(e) => setLlamaRocmPath(e.target.value)} className="font-mono text-xs" placeholder="/path/to/llama-server" />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">Vulkan llama-server Path</Label>
+                <Input value={llamaVulkanPath} onChange={(e) => setLlamaVulkanPath(e.target.value)} className="font-mono text-xs" placeholder="/path/to/llama-server-vulkan" />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label className="text-xs">HSA_OVERRIDE_GFX_VERSION</Label>
+                  <Input value={hsaOverrideGfxVersion} onChange={(e) => setHsaOverrideGfxVersion(e.target.value)} className="font-mono text-xs" placeholder="11.5.0" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">Default Engine</Label>
+                  <select value={defaultEngine} onChange={(e) => setDefaultEngine(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs">
+                    <option value="rocm" className="bg-background text-foreground">ROCm</option>
+                    <option value="vulkan" className="bg-background text-foreground">Vulkan</option>
+                  </select>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Remote API Keys</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                設定 OpenAI / Anthropic fallback 金鑰
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label className="text-xs">OpenAI API Key</Label>
+                <Input value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)} type="password" className="font-mono text-xs" placeholder="sk-..." />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">Anthropic API Key</Label>
+                <Input value={anthropicApiKey} onChange={(e) => setAnthropicApiKey(e.target.value)} type="password" className="font-mono text-xs" placeholder="sk-ant-..." />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Network Access</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                設定監聽位址、CORS 與 API Token 驗證（儲存後生效範圍依後端實作）
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label className="text-xs">Listen Host</Label>
+                  <Input value={listenHost} onChange={(e) => setListenHost(e.target.value)} className="font-mono text-xs" placeholder="0.0.0.0" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">Listen Port</Label>
+                  <Input value={listenPort} onChange={(e) => setListenPort(e.target.value)} className="font-mono text-xs" placeholder="8000" />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">CORS Allow Origins</Label>
+                <Input value={corsAllowOrigins} onChange={(e) => setCorsAllowOrigins(e.target.value)} className="font-mono text-xs" placeholder="* or comma-separated origins" />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">API Token (for /v1 routes)</Label>
+                <Input value={apiToken} onChange={(e) => setApiToken(e.target.value)} type="password" className="font-mono text-xs" placeholder="optional bearer token" />
               </div>
             </CardContent>
           </Card>

@@ -30,6 +30,8 @@ export default function BenchmarksPage() {
   const [nGen, setNGen] = useState(128);
   const [flashAttn, setFlashAttn] = useState(0);
   const [noKvOffload, setNoKvOffload] = useState(0);
+  const [filterModel, setFilterModel] = useState<string>("all");
+  const [filterEngine, setFilterEngine] = useState<string>("all");
   const [debugLog, setDebugLog] = useState<string>("");
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -169,6 +171,25 @@ export default function BenchmarksPage() {
 
   const bestPp = Math.max(...records.filter((r) => r.pp_tokens_per_second).map((r) => r.pp_tokens_per_second!), 0);
   const bestTg = Math.max(...records.filter((r) => r.tg_tokens_per_second).map((r) => r.tg_tokens_per_second!), 0);
+  const modelOptions = Array.from(new Set(records.map((r) => r.model_name))).sort();
+  const engineOptions = Array.from(new Set(records.map((r) => r.engine_type))).sort();
+
+  const filteredRecords = records.filter((r) => {
+    if (filterModel !== "all" && r.model_name !== filterModel) return false;
+    if (filterEngine !== "all" && r.engine_type !== filterEngine) return false;
+    return true;
+  });
+
+  const chartPoints = filteredRecords
+    .slice()
+    .sort((a, b) => (b.created_at ? new Date(b.created_at).getTime() : 0) - (a.created_at ? new Date(a.created_at).getTime() : 0))
+    .slice(0, 10)
+    .reverse();
+
+  const maxChartValue = Math.max(
+    1,
+    ...chartPoints.map((item) => Math.max(item.pp_tokens_per_second ?? 0, item.tg_tokens_per_second ?? 0)),
+  );
 
   return (
     <div className="flex min-h-screen">
@@ -252,7 +273,70 @@ export default function BenchmarksPage() {
           </CardContent>
         </Card>
 
+        {/* Comparison Charts */}
+        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm">Performance Comparison</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {chartPoints.length > 0 ? (
+              <div className="space-y-3">
+                {chartPoints.map((row) => (
+                  <div key={row.id} className="space-y-1">
+                    <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                      <span className="truncate pr-2">{row.model_name} · {row.engine_type} · n{row.n_gpu_layers} · b{row.batch_size}</span>
+                      <span>{row.created_at ? new Date(row.created_at).toLocaleTimeString() : "—"}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="w-10 text-[10px] text-blue-300">PP</span>
+                      <div className="h-2 flex-1 rounded bg-muted/40 overflow-hidden">
+                        <div className="h-full bg-blue-400" style={{ width: `${((row.pp_tokens_per_second ?? 0) / maxChartValue) * 100}%` }} />
+                      </div>
+                      <span className="w-14 text-right text-[10px] font-mono">{row.pp_tokens_per_second?.toFixed(1) ?? "—"}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="w-10 text-[10px] text-purple-300">TG</span>
+                      <div className="h-2 flex-1 rounded bg-muted/40 overflow-hidden">
+                        <div className="h-full bg-purple-400" style={{ width: `${((row.tg_tokens_per_second ?? 0) / maxChartValue) * 100}%` }} />
+                      </div>
+                      <span className="w-14 text-right text-[10px] font-mono">{row.tg_tokens_per_second?.toFixed(1) ?? "—"}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">No benchmark records to compare.</p>
+            )}
+          </CardContent>
+        </Card>
+
         {/* Results Table FIRST (switched with debug log) */}
+        {records.length > 0 ? (
+          <div className="mb-3 flex gap-2 items-center">
+            <select
+              value={filterModel}
+              onChange={(e) => setFilterModel(e.target.value)}
+              className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
+            >
+              <option value="all" className="bg-background text-foreground">All Models</option>
+              {modelOptions.map((name) => (
+                <option key={name} value={name} className="bg-background text-foreground">{name}</option>
+              ))}
+            </select>
+            <select
+              value={filterEngine}
+              onChange={(e) => setFilterEngine(e.target.value)}
+              className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
+            >
+              <option value="all" className="bg-background text-foreground">All Engines</option>
+              {engineOptions.map((engine) => (
+                <option key={engine} value={engine} className="bg-background text-foreground">{engine}</option>
+              ))}
+            </select>
+            <span className="text-xs text-muted-foreground">Showing {filteredRecords.length} / {records.length}</span>
+          </div>
+        ) : null}
+
         {records.length > 0 ? (
           <div className="rounded-lg border border-border/40 overflow-hidden mb-6 max-h-[50vh] overflow-y-auto">
             <table className="w-full text-sm">
@@ -269,7 +353,7 @@ export default function BenchmarksPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-border/20">
-                {records.map((r) => (
+                {filteredRecords.map((r) => (
                   <tr key={r.id} className="hover:bg-accent/30 transition-colors group">
                     <td className="px-4 py-3 font-medium text-xs">{r.model_name}</td>
                     <td className="px-4 py-3 text-center"><Badge variant="outline" className="uppercase text-[10px]">{r.engine_type}</Badge></td>

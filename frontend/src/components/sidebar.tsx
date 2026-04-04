@@ -8,6 +8,9 @@ const navItems = [
   { href: "/", label: "Dashboard", icon: "◈" },
   { href: "/models", label: "Models", icon: "⬡" },
   { href: "/benchmarks", label: "Benchmarks", icon: "◉" },
+  { href: "/providers", label: "Providers", icon: "⟠" },
+  { href: "/routes", label: "Routes", icon: "⇄" },
+  { href: "/mesh", label: "Mesh", icon: "⛓" },
   { href: "/settings", label: "Settings", icon: "⚙" },
 ];
 
