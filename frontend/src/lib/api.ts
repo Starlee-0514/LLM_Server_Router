@@ -82,6 +82,8 @@ export interface ProcessStatus {
   model_path: string | null;
   port: number | null;
   uptime_seconds: number | null;
+  phase: string | null;
+  recent_output: string[];
 }
 
 export interface AllProcessesStatus {
@@ -232,6 +234,7 @@ export interface CommonProviderTemplate {
   base_url: string;
   auth_hint: string;
   default_extra_headers: string;
+  oauth_method: "api_key" | "device_code" | "pkce";
 }
 
 export interface CommonProviderRegisterPayload {
@@ -243,6 +246,20 @@ export interface CommonProviderRegisterPayload {
 
 export interface CommonProviderOAuthStartResponse {
   auth_url: string;
+}
+
+export interface DeviceCodeStartResponse {
+  session_id: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+  interval: number;
+}
+
+export interface DeviceCodePollResponse {
+  status: "pending" | "complete" | "slow_down" | "expired" | "error";
+  interval?: number;
+  error?: string;
 }
 
 export interface ProviderModelItem {
@@ -586,6 +603,20 @@ export const registerCommonProvider = (payload: CommonProviderRegisterPayload) =
   });
 export const startCommonProviderOAuth = (providerKey: string, nameOverride = "") =>
   apiFetch<CommonProviderOAuthStartResponse>(`/api/providers/common/oauth/start/${providerKey}?name_override=${encodeURIComponent(nameOverride)}`);
+export const startDeviceCodeFlow = (providerKey: string, nameOverride = "") =>
+  apiFetch<DeviceCodeStartResponse>("/api/providers/common/oauth/device/start", {
+    method: "POST",
+    body: JSON.stringify({ provider_key: providerKey, name_override: nameOverride }),
+  });
+export const pollDeviceCodeFlow = (sessionId: string) =>
+  apiFetch<DeviceCodePollResponse>("/api/providers/common/oauth/device/poll", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+export const refreshProviderToken = (providerId: number) =>
+  apiFetch<{ status: string }>(`/api/providers/common/oauth/refresh/${providerId}`, {
+    method: "POST",
+  });
 export const getProviderModels = (id: number) =>
   apiFetch<ProviderModelItem[]>(`/api/providers/${id}/models`);
 
@@ -728,3 +759,110 @@ export const getReportImageUrl = (filename: string): string => {
   const base = getApiBase();
   return `${base}/api/reports/images/${encodeURIComponent(filename)}`;
 };
+
+// ==================
+// Dev / Monitor
+// ==================
+export interface DevEvent {
+  timestamp: string;
+  type: string;
+  identifier: string;
+  detail: string;
+  [key: string]: unknown;
+}
+
+export interface DevProcessDetail {
+  identifier: string;
+  is_running: boolean;
+  pid: number | null;
+  engine_type: string | null;
+  model_path: string | null;
+  port: number | null;
+  uptime_seconds: number | null;
+  command: string;
+  phase: string | null;
+  recent_output: string[];
+}
+
+export interface DevLogEntry {
+  timestamp: string;
+  level: string;
+  logger: string;
+  message: string;
+}
+
+export const getDevEvents = (limit = 100) =>
+  apiFetch<DevEvent[]>(`/api/dev/events?limit=${limit}`);
+export const getDevProcesses = () =>
+  apiFetch<DevProcessDetail[]>("/api/dev/processes");
+export const getDevLogs = (limit = 200) =>
+  apiFetch<DevLogEntry[]>(`/api/dev/logs?limit=${limit}`);
+
+export interface CompletionRecord {
+  timestamp: string;
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  elapsed: number;
+  target: string;
+  prompt_preview: string;
+}
+
+export const getDevCompletions = (limit = 50) =>
+  apiFetch<CompletionRecord[]>(`/api/dev/completions?limit=${limit}`);
+
+// ---------------------------------------------------------------------------
+// Frontend Logger — sends frontend console logs to backend for persistence
+// ---------------------------------------------------------------------------
+interface FrontendLogEntry {
+  timestamp: string;
+  level: string;
+  source: string;
+  message: string;
+}
+
+const _pendingLogs: FrontendLogEntry[] = [];
+let _flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function _flushFrontendLogs() {
+  if (_pendingLogs.length === 0) return;
+  const batch = _pendingLogs.splice(0, 100);
+  const apiBase = getApiBase();
+  // Fire-and-forget — don't block UI
+  fetch(`${apiBase}/api/dev/logs/frontend`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ logs: batch }),
+  }).catch(() => {}); // silently ignore failures
+}
+
+function _scheduleFrontendFlush() {
+  if (_flushTimer) return;
+  _flushTimer = setTimeout(() => {
+    _flushTimer = null;
+    _flushFrontendLogs();
+  }, 2000);
+}
+
+export function frontendLog(level: string, source: string, message: string) {
+  _pendingLogs.push({
+    timestamp: new Date().toISOString(),
+    level,
+    source,
+    message,
+  });
+  _scheduleFrontendFlush();
+}
+
+export interface LogFileInfo {
+  name: string;
+  size_bytes: number;
+  modified: string;
+}
+
+export const getLogFiles = () =>
+  apiFetch<LogFileInfo[]>("/api/dev/logs/files");
+
+export const getLogFileUrl = (filename: string) =>
+  `${getApiBase()}/api/dev/logs/files/${encodeURIComponent(filename)}`;
