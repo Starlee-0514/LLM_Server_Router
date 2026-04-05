@@ -82,48 +82,60 @@ Model Group = 一組預設好的啟動參數。把「模型路徑 + GPU Layers +
 ## 系統架構總覽
 
 ```mermaid
-graph TB
-    subgraph Clients["外部客戶端 (External Clients)"]
-        C1["Cursor / VS Code / Continue.dev"]
-        C2["Open WebUI / 手機 App / curl"]
+graph TD
+    %% ── Layer 1: Clients ──
+    C["🖥️ External Clients\nCursor · VS Code · Continue.dev · Open WebUI · curl"]
+
+    %% ── Layer 2: Frontend ──
+    C -->|"OpenAI Format API\nPOST /v1/chat/completions\nGET /v1/models"| F
+
+    subgraph F["Next.js 前端 · Port 3000"]
+        direction LR
+        F1["Dashboard\n儀表板"]
+        F2["Models\n模型管理"]
+        F3["Inference\n推理測試"]
+        F4["Benchmarks\n效能測試"]
+        F5["Providers\n供應商"]
+        F6["Routes · Mesh\nSettings · Dev"]
     end
 
-    Clients -->|"HTTP (OpenAI 格式)\nPOST /v1/chat/completions\nGET /v1/models"| Frontend
+    %% ── Layer 3: API Routers ──
+    F -->|"REST API"| API
 
-    subgraph Frontend["Next.js 前端 (Port 3000)"]
-        F1["Dashboard · Models · Inference · Benchmarks"]
-        F2["Providers · Routes · Mapping · Mesh · Settings · Dev"]
+    subgraph API["FastAPI 後端 · Port 8000 — API 路由層"]
+        direction LR
+        A1["/v1/*\nOpenAI 相容"]
+        A2["/api/models\nmodel-groups"]
+        A3["/api/process\nbenchmarks"]
+        A4["/api/providers\nmodel-routes"]
+        A5["/api/mesh\nruntimes\nmetrics"]
     end
 
-    Frontend -->|"HTTP REST API"| Backend
+    %% ── Layer 4: Core Services ──
+    API --> SVC
 
-    subgraph Backend["FastAPI 後端 (Port 8000)"]
-        subgraph Routers["API 路由層"]
-            R1["/v1/* — OpenAI 相容路由"]
-            R2["/api/models · model-groups · process"]
-            R3["/api/benchmarks · providers · routes"]
-            R4["/api/mesh · runtimes · settings · metrics"]
-        end
-
-        subgraph Services["核心服務層"]
-            PM["ProcessManager\n進程管理器\n啟動/停止 · Port 分配"]
-            RR["RouteResolver\n路由解析器\n本地優先 · 能力篩選"]
-            BR["BenchmarkRunner\n效能測試執行器\n非同步 SSE 串流"]
-        end
-
-        Routers --> Services
-
-        subgraph DB["SQLite Database"]
-            D1["settings · runtimes · model_groups"]
-            D2["benchmark_records · provider_endpoints"]
-            D3["model_routes · mesh_workers · completion_logs"]
-        end
-
-        Services --> DB
+    subgraph SVC["核心服務層"]
+        direction LR
+        S1["🔧 ProcessManager\n進程管理器\n啟動/停止 · Port 分配"]
+        S2["🔀 RouteResolver\n路由解析器\n能力篩選 · 策略評分"]
+        S3["📊 BenchmarkRunner\n效能測試器\nSSE 串流 · 結果解析"]
+        S4["🔍 ModelScanner\n模型掃描器\nGGUF 解析 · Metadata"]
     end
 
-    PM -->|"子進程管理"| Local["本地 llama-server\n(ROCm / Vulkan)\nPort 8081, 8082..."]
-    RR -->|"Fallback 路由"| Remote["遠端 API 供應商\nOpenAI · Anthropic\nCopilot · Gemini"]
+    %% ── Layer 5: Database ──
+    SVC --> DB
+
+    subgraph DB["SQLite Database · WAL Mode"]
+        direction LR
+        D1["settings\nruntimes"]
+        D2["model_groups\nbenchmark_records"]
+        D3["provider_endpoints\nmodel_routes"]
+        D4["mesh_workers\ncompletion_logs"]
+    end
+
+    %% ── Layer 6: Backends ──
+    S1 -->|"子進程管理"| LOCAL["🖥️ 本地 llama-server\nROCm / Vulkan\nPort 8081, 8082 ..."]
+    S2 -->|"Fallback 路由"| REMOTE["☁️ 遠端 API 供應商\nOpenAI · Anthropic\nGitHub Copilot · Gemini"]
 ```
 
 ### 後端架構

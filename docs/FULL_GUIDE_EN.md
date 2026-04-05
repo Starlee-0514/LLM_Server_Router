@@ -80,48 +80,60 @@ When an external tool (e.g., Cursor) sends a request with `model: "gpt-4o"` to t
 ## System Architecture
 
 ```mermaid
-graph TB
-    subgraph Clients["External Clients"]
-        C1["Cursor / VS Code / Continue.dev"]
-        C2["Open WebUI / Mobile App / curl"]
+graph TD
+    %% ── Layer 1: Clients ──
+    C["🖥️ External Clients\nCursor · VS Code · Continue.dev · Open WebUI · curl"]
+
+    %% ── Layer 2: Frontend ──
+    C -->|"OpenAI Format API\nPOST /v1/chat/completions\nGET /v1/models"| F
+
+    subgraph F["Next.js Frontend · Port 3000"]
+        direction LR
+        F1["Dashboard"]
+        F2["Models"]
+        F3["Inference"]
+        F4["Benchmarks"]
+        F5["Providers"]
+        F6["Routes · Mesh\nSettings · Dev"]
     end
 
-    Clients -->|"HTTP (OpenAI format)\nPOST /v1/chat/completions\nGET /v1/models"| Frontend
+    %% ── Layer 3: API Routers ──
+    F -->|"REST API"| API
 
-    subgraph Frontend["Next.js Frontend (Port 3000)"]
-        F1["Dashboard · Models · Inference · Benchmarks"]
-        F2["Providers · Routes · Mapping · Mesh · Settings · Dev"]
+    subgraph API["FastAPI Backend · Port 8000 — API Router Layer"]
+        direction LR
+        A1["/v1/*\nOpenAI Compatible"]
+        A2["/api/models\nmodel-groups"]
+        A3["/api/process\nbenchmarks"]
+        A4["/api/providers\nmodel-routes"]
+        A5["/api/mesh\nruntimes\nmetrics"]
     end
 
-    Frontend -->|"HTTP REST API"| Backend
+    %% ── Layer 4: Core Services ──
+    API --> SVC
 
-    subgraph Backend["FastAPI Backend (Port 8000)"]
-        subgraph Routers["API Router Layer"]
-            R1["/v1/* — OpenAI Compatible Router"]
-            R2["/api/models · model-groups · process"]
-            R3["/api/benchmarks · providers · routes"]
-            R4["/api/mesh · runtimes · settings · metrics"]
-        end
-
-        subgraph Services["Core Services"]
-            PM["ProcessManager\nStart/Stop · Port Allocation"]
-            RR["RouteResolver\nLocal-First · Capability Filtering"]
-            BR["BenchmarkRunner\nAsync SSE Streaming"]
-        end
-
-        Routers --> Services
-
-        subgraph DB["SQLite Database"]
-            D1["settings · runtimes · model_groups"]
-            D2["benchmark_records · provider_endpoints"]
-            D3["model_routes · mesh_workers · completion_logs"]
-        end
-
-        Services --> DB
+    subgraph SVC["Core Services"]
+        direction LR
+        S1["🔧 ProcessManager\nStart/Stop · Port Allocation"]
+        S2["🔀 RouteResolver\nCapability Filter · Policy Scoring"]
+        S3["📊 BenchmarkRunner\nSSE Streaming · Result Parsing"]
+        S4["🔍 ModelScanner\nGGUF Parsing · Metadata"]
     end
 
-    PM -->|"Subprocess Mgmt"| Local["Local llama-server\n(ROCm / Vulkan)\nPort 8081, 8082..."]
-    RR -->|"Fallback Routing"| Remote["Remote API Providers\nOpenAI · Anthropic\nCopilot · Gemini"]
+    %% ── Layer 5: Database ──
+    SVC --> DB
+
+    subgraph DB["SQLite Database · WAL Mode"]
+        direction LR
+        D1["settings\nruntimes"]
+        D2["model_groups\nbenchmark_records"]
+        D3["provider_endpoints\nmodel_routes"]
+        D4["mesh_workers\ncompletion_logs"]
+    end
+
+    %% ── Layer 6: Backends ──
+    S1 -->|"Subprocess Mgmt"| LOCAL["🖥️ Local llama-server\nROCm / Vulkan\nPort 8081, 8082 ..."]
+    S2 -->|"Fallback Routing"| REMOTE["☁️ Remote API Providers\nOpenAI · Anthropic\nGitHub Copilot · Gemini"]
 ```
 
 ### Backend Architecture
