@@ -197,6 +197,22 @@ def _get_google_creds() -> tuple[str, str]:
 
 
 COMMON_PROVIDER_TEMPLATES: dict[str, dict] = {
+    "lm_studio": {
+        "label": "LM Studio (local)",
+        "provider_type": "openai_compatible",
+        "base_url": "http://127.0.0.1:1234",
+        "auth_hint": "No API key required — available while LM Studio server is running",
+        "default_extra_headers": "",
+        "oauth_method": "none",
+    },
+    "lm_studio_network": {
+        "label": "LM Studio (network)",
+        "provider_type": "openai_compatible",
+        "base_url": "http://192.168.1.x:1234",
+        "auth_hint": "Set base_url to your LM Studio host. No API key needed unless you configured one.",
+        "default_extra_headers": "",
+        "oauth_method": "none",
+    },
     "openrouter": {
         "label": "OpenRouter",
         "provider_type": "openai_compatible",
@@ -964,6 +980,15 @@ def upsert_worker_heartbeat(request: MeshWorkerUpsert, db: Session = Depends(get
     row = db.query(MeshWorker).filter(MeshWorker.node_name == request.node_name).first()
     now = datetime.now(timezone.utc)
 
+    capability_fields = dict(
+        supports_tools=int(request.supports_tools),
+        supports_vision=int(request.supports_vision),
+        supports_embeddings=int(request.supports_embeddings),
+        max_context_length=request.max_context_length,
+        current_load=request.current_load,
+        gpu_memory_used_pct=request.gpu_memory_used_pct,
+    )
+
     if row is None:
         row = MeshWorker(
             node_name=request.node_name,
@@ -974,6 +999,8 @@ def upsert_worker_heartbeat(request: MeshWorkerUpsert, db: Session = Depends(get
             metadata_json=json.dumps(request.metadata),
             status=request.status,
             last_seen_at=now,
+            consecutive_failures=0,
+            **capability_fields,
         )
         db.add(row)
     else:
@@ -984,6 +1011,10 @@ def upsert_worker_heartbeat(request: MeshWorkerUpsert, db: Session = Depends(get
         row.metadata_json = json.dumps(request.metadata)
         row.status = request.status
         row.last_seen_at = now
+        # Reset failure counter on successful heartbeat
+        row.consecutive_failures = 0
+        for k, v in capability_fields.items():
+            setattr(row, k, v)
 
     db.commit()
     db.refresh(row)
