@@ -181,6 +181,7 @@ class BenchmarkRunRequest(BaseModel):
     batch_size: int = 512
     ubatch_size: int = 512
     ctx_size: int = 4096
+    preset_recipe: str = ""
     n_prompt: int = 512      # prompt tokens count
     n_gen: int = 128         # generation tokens count
     flash_attn: int = 0      # flash attention 0|1
@@ -198,6 +199,7 @@ class BenchmarkRecordResponse(BaseModel):
     batch_size: int
     ubatch_size: int
     ctx_size: int
+    preset_recipe: str = ""
     pp_tokens_per_second: float | None = None
     tg_tokens_per_second: float | None = None
     raw_output: str = ""
@@ -304,6 +306,13 @@ class MeshWorkerUpsert(BaseModel):
     models: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
     status: str = "online"
+    # capability fields (optional — workers can self-report)
+    supports_tools: bool = False
+    supports_vision: bool = False
+    supports_embeddings: bool = False
+    max_context_length: int | None = None
+    current_load: float = 0.0
+    gpu_memory_used_pct: float | None = None
 
 
 class MeshWorkerResponse(BaseModel):
@@ -315,9 +324,75 @@ class MeshWorkerResponse(BaseModel):
     models_json: str
     metadata_json: str
     status: str
+    supports_tools: bool = False
+    supports_vision: bool = False
+    supports_embeddings: bool = False
+    max_context_length: int | None = None
+    current_load: float = 0.0
+    gpu_memory_used_pct: float | None = None
+    consecutive_failures: int = 0
     last_seen_at: datetime | None = None
+    last_health_check_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# =====================
+# Route Policy (Phase 2)
+# =====================
+class RoutePolicy(str):
+    """Routing policy constants."""
+    LOCAL_FIRST = "local_first"
+    CHEAPEST = "cheapest"
+    FASTEST = "fastest"
+    HIGHEST_QUALITY = "highest_quality"
+    LOCAL_ONLY = "local_only"
+    REMOTE_ONLY = "remote_only"
+
+    VALID = {"local_first", "cheapest", "fastest", "highest_quality", "local_only", "remote_only"}
+
+
+class VirtualModelCreate(BaseModel):
+    model_id: str
+    display_name: str = ""
+    description: str = ""
+    routing_hints: dict = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class VirtualModelResponse(BaseModel):
+    id: int
+    model_id: str
+    display_name: str
+    description: str
+    routing_hints_json: str
+    enabled: bool
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# =====================
+# Completion Log (Phase 4)
+# =====================
+class CompletionLogResponse(BaseModel):
+    id: int
+    model_requested: str
+    model_resolved: str | None = ""
+    provider_name: str | None = ""
+    provider_type: str | None = ""
+    prompt_tokens: int | None = 0
+    completion_tokens: int | None = 0
+    total_tokens: int | None = 0
+    latency_ms: float | None = None
+    tool_calls_count: int = 0
+    success: bool = True
+    error_message: str | None = ""
+    conversation_id: str | None = None
+    created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

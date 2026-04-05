@@ -112,6 +112,7 @@ class BenchmarkRecord(Base):
     batch_size = Column(Integer, nullable=False)
     ubatch_size = Column(Integer, nullable=False)
     ctx_size = Column(Integer, nullable=False)
+    preset_recipe = Column(String(120), nullable=True, default="")  # recipe key used during this run
     pp_tokens_per_second = Column(Float, nullable=True)    # prompt processing t/s
     tg_tokens_per_second = Column(Float, nullable=True)    # text generation t/s
     raw_output = Column(Text, default="")                  # llama-bench 完整輸出
@@ -216,7 +217,10 @@ class ModelPropertyOverride(Base):
 
 
 class MeshWorker(Base):
-    """Tailscale Mesh 節點註冊表。"""
+    """Tailscale Mesh 節點註冊表。
+
+    status values: online | stale | offline | unknown
+    """
 
     __tablename__ = "mesh_workers"
 
@@ -229,6 +233,66 @@ class MeshWorker(Base):
     metadata_json = Column(Text, nullable=False, default="{}")
     status = Column(String(50), nullable=False, default="unknown")
     last_seen_at = Column(DateTime, nullable=True)
+    # ---- capability fields (populated from heartbeat + /v1/models probe) ----
+    supports_tools = Column(Integer, nullable=False, default=0)       # 1 = yes
+    supports_vision = Column(Integer, nullable=False, default=0)      # 1 = yes
+    supports_embeddings = Column(Integer, nullable=False, default=0)  # 1 = yes
+    max_context_length = Column(Integer, nullable=True, default=None)
+    current_load = Column(Float, nullable=True, default=0.0)          # 0.0-1.0
+    gpu_memory_used_pct = Column(Float, nullable=True, default=None)  # 0-100
+    # ---- health tracking ----
+    consecutive_failures = Column(Integer, nullable=False, default=0)
+    last_health_check_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class CompletionLog(Base):
+    """Per-request log for every /v1/chat/completions call.
+
+    Enables cost tracking, replay, provider analytics.
+    """
+
+    __tablename__ = "completion_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model_requested = Column(String(255), nullable=False, index=True)
+    model_resolved = Column(String(255), nullable=True, default="")
+    provider_name = Column(String(255), nullable=True, default="")
+    provider_type = Column(String(50), nullable=True, default="")
+    prompt_tokens = Column(Integer, nullable=True, default=0)
+    completion_tokens = Column(Integer, nullable=True, default=0)
+    total_tokens = Column(Integer, nullable=True, default=0)
+    latency_ms = Column(Float, nullable=True, default=None)
+    tool_calls_count = Column(Integer, nullable=False, default=0)
+    success = Column(Integer, nullable=False, default=1)   # 1 = ok, 0 = error
+    error_message = Column(Text, nullable=True, default="")
+    conversation_id = Column(String(255), nullable=True, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class VirtualModel(Base):
+    """Stable logical model IDs exposed via GET /v1/models.
+
+    Maps human-friendly aliases (coding, chat, fast, vision, cheap) to
+    routing rules that the route_resolver can evaluate at request time.
+    """
+
+    __tablename__ = "virtual_models"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model_id = Column(String(255), unique=True, nullable=False, index=True)  # e.g. "coding"
+    display_name = Column(String(255), nullable=False, default="")
+    description = Column(Text, default="")
+    # Routing hints stored as JSON object:
+    # { "requires_tools": bool, "requires_vision": bool, "preferred_policy": str,
+    #   "fallback_provider_id": int, "preferred_provider_ids": [int] }
+    routing_hints_json = Column(Text, nullable=False, default="{}")
+    enabled = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(
         DateTime,
