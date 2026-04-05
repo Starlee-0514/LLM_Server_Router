@@ -1,5 +1,7 @@
 # LLM Server Router — 完整使用指南
 
+**🌐 Language / 語言**: [English](FULL_GUIDE_EN.md) | **繁體中文**
+
 > **一句話介紹**：LLM Server Router 是一個跑在你本機的 **AI 模型管理中心**，讓你可以一鍵啟動本地模型、自動效能測試、並且對外提供一個統一的 OpenAI 格式 API — 當本地模型忙不過來時，自動切換到雲端 API（OpenAI / Anthropic / GitHub Copilot / Gemini）。
 
 ---
@@ -30,14 +32,14 @@
 
 ## 誰適合用這個專案？
 
-| 你的需求 | 這個專案能幫你 |
-|---------|--------------|
-| 我有一台 AMD GPU 的主機，想跑本地模型 | ✅ 自動管理 llama-server 進程，支援 ROCm / Vulkan |
-| 我想讓筆電 / 手機也能用我桌機的本地模型 | ✅ 暴露 OpenAI 格式 API，區網內直接連線 |
-| 我想在 Cursor / VS Code / Continue.dev 用本地模型 | ✅ 完全相容 OpenAI API，直接填入 Base URL 即可 |
-| 本地模型不夠用時想自動切換到雲端 | ✅ 內建 Fallback：本地 → Mesh → 雲端 API |
-| 我想比較不同量化版本的模型效能 | ✅ 內建 llama-bench 整合，一鍵跑分 |
-| 我想把多台電腦的 GPU 串起來用 | ✅ Tailscale Mesh 支援多節點路由 |
+| 你的需求                                      | 這個專案能幫你                                 |
+| ----------------------------------------- | --------------------------------------- |
+| 我有一台 AMD GPU 的主機，想跑本地模型                   | ✅ 自動管理 llama-server 進程，支援 ROCm / Vulkan |
+| 我想讓筆電 / 手機也能用我桌機的本地模型                     | ✅ 暴露 OpenAI 格式 API，區網內直接連線              |
+| 我想在 Cursor / VS Code / Continue.dev 用本地模型 | ✅ 完全相容 OpenAI API，直接填入 Base URL 即可      |
+| 本地模型不夠用時想自動切換到雲端                          | ✅ 內建 Fallback：本地 → Mesh → 雲端 API        |
+| 我想比較不同量化版本的模型效能                           | ✅ 內建 llama-bench 整合，一鍵跑分                |
+| 我想把多台電腦的 GPU 串起來用                         | ✅ Tailscale Mesh 支援多節點路由                |
 
 ---
 
@@ -79,141 +81,122 @@ Model Group = 一組預設好的啟動參數。把「模型路徑 + GPU Layers +
 
 ## 系統架構總覽
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    外部客戶端 (External Clients)                  │
-│  Cursor / VS Code / Continue.dev / Open WebUI / 手機 App / curl  │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ HTTP (OpenAI 格式)
-                          │ POST /v1/chat/completions
-                          │ GET  /v1/models
-┌─────────────────────────▼───────────────────────────────────────┐
-│                     Next.js 前端 (Port 3000)                      │
-│  ┌──────────┬──────────┬──────────┬──────────┬──────────────┐   │
-│  │Dashboard │ Models   │Benchmark │Inference │ Settings     │   │
-│  │ 儀表板   │ 模型管理 │ 效能測試 │ 推理測試 │ 系統設定     │   │
-│  ├──────────┼──────────┼──────────┼──────────┼──────────────┤   │
-│  │Providers │ Routes   │ Mapping  │ Mesh     │ Reports/Dev  │   │
-│  │ 供應商   │ 路由規則 │ 模型對映 │ 節點網格 │ 報告/除錯    │   │
-│  └──────────┴──────────┴──────────┴──────────┴──────────────┘   │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │ HTTP REST API
-┌─────────────────────────▼───────────────────────────────────────┐
-│                    FastAPI 後端 (Port 8000)                        │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │                  API 路由層 (Routers)                         │ │
-│  │  /v1/*           OpenAI 相容路由 (chat/completions, models) │ │
-│  │  /api/models/*   模型掃描 & 屬性覆寫                         │ │
-│  │  /api/model-groups/*  模型群組 CRUD                          │ │
-│  │  /api/process/*  進程啟動 / 停止 / 狀態                     │ │
-│  │  /api/benchmarks/*  效能測試執行 & 歷史                     │ │
-│  │  /api/providers/*  Provider 端點 CRUD + OAuth               │ │
-│  │  /api/model-routes/*  路由規則 CRUD                         │ │
-│  │  /api/mesh/*     Mesh Worker 管理                            │ │
-│  │  /api/runtimes/* Runtime 環境 CRUD                          │ │
-│  │  /api/settings   系統設定 KV                                 │ │
-│  │  /api/metrics/*  系統指標 & 請求統計                         │ │
-│  │  /api/reports/*  Bug Report 管理                             │ │
-│  │  /api/dev/*      開發除錯 (event log, process detail)       │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                   │
-│  ┌───────────────┐  ┌───────────────┐  ┌────────────────────┐   │
-│  │ ProcessManager│  │ RouteResolver │  │ BenchmarkRunner    │   │
-│  │ 進程管理器    │  │ 路由解析器    │  │ 效能測試執行器     │   │
-│  │               │  │               │  │                    │   │
-│  │ · 啟動/停止   │  │ · 本地優先    │  │ · 非同步 SSE 串流 │   │
-│  │ · Port 分配   │  │ · 能力篩選    │  │ · 結果解析入庫    │   │
-│  │ · 自動清理    │  │ · 策略評分    │  │                    │   │
-│  └───────┬───────┘  └───────┬───────┘  └────────┬───────────┘   │
-│          │                  │                    │               │
-│  ┌───────▼──────────────────▼────────────────────▼───────────┐   │
-│  │                    SQLite Database                          │   │
-│  │  settings · runtimes · model_groups · benchmark_records    │   │
-│  │  provider_endpoints · model_routes · mesh_workers          │   │
-│  │  model_property_overrides · completion_logs                │   │
-│  │  virtual_models                                            │   │
-│  └────────────────────────────────────────────────────────────┘   │
-└────────────────────┬────────────────────────┬───────────────────┘
-                     │                        │
-          ┌──────────▼──────────┐   ┌─────────▼─────────┐
-          │  本地 llama-server  │   │   遠端 API 供應商  │
-          │  (ROCm / Vulkan)    │   │  OpenAI · Anthropic│
-          │  Port 8081, 8082... │   │  Copilot · Gemini  │
-          └─────────────────────┘   └───────────────────┘
+```mermaid
+graph TB
+    subgraph Clients["外部客戶端 (External Clients)"]
+        C1["Cursor / VS Code / Continue.dev"]
+        C2["Open WebUI / 手機 App / curl"]
+    end
+
+    Clients -->|"HTTP (OpenAI 格式)\nPOST /v1/chat/completions\nGET /v1/models"| Frontend
+
+    subgraph Frontend["Next.js 前端 (Port 3000)"]
+        F1["Dashboard · Models · Inference · Benchmarks"]
+        F2["Providers · Routes · Mapping · Mesh · Settings · Dev"]
+    end
+
+    Frontend -->|"HTTP REST API"| Backend
+
+    subgraph Backend["FastAPI 後端 (Port 8000)"]
+        subgraph Routers["API 路由層"]
+            R1["/v1/* — OpenAI 相容路由"]
+            R2["/api/models · model-groups · process"]
+            R3["/api/benchmarks · providers · routes"]
+            R4["/api/mesh · runtimes · settings · metrics"]
+        end
+
+        subgraph Services["核心服務層"]
+            PM["ProcessManager\n進程管理器\n啟動/停止 · Port 分配"]
+            RR["RouteResolver\n路由解析器\n本地優先 · 能力篩選"]
+            BR["BenchmarkRunner\n效能測試執行器\n非同步 SSE 串流"]
+        end
+
+        Routers --> Services
+
+        subgraph DB["SQLite Database"]
+            D1["settings · runtimes · model_groups"]
+            D2["benchmark_records · provider_endpoints"]
+            D3["model_routes · mesh_workers · completion_logs"]
+        end
+
+        Services --> DB
+    end
+
+    PM -->|"子進程管理"| Local["本地 llama-server\n(ROCm / Vulkan)\nPort 8081, 8082..."]
+    RR -->|"Fallback 路由"| Remote["遠端 API 供應商\nOpenAI · Anthropic\nCopilot · Gemini"]
 ```
 
 ### 後端架構
 
 後端使用 **Python FastAPI** 框架，以下是各模組職責：
 
-| 模組 | 路徑 | 職責 |
-|-----|------|------|
-| **main.py** | `backend/app/main.py` | FastAPI 應用進入點、生命週期管理、CORS、API Token 中間件 |
-| **config.py** | `backend/app/core/config.py` | 從 `.env` 載入全域設定（Pydantic Settings） |
-| **database.py** | `backend/app/database.py` | SQLAlchemy Engine / Session / 自動 Migration |
-| **models.py** | `backend/app/models.py` | 10 張 ORM 資料表定義 |
-| **schemas.py** | `backend/app/schemas.py` | Pydantic 請求 / 回應模型 |
-| **process_manager.py** | `backend/app/core/process_manager.py` | llama-server 進程生命週期（啟動、停止、port 分配、stderr 監控、phase 偵測） |
-| **runtime_settings.py** | `backend/app/core/runtime_settings.py` | DB-backed 設定讀取、Runtime 環境解析 |
-| **model_scanner.py** | `backend/app/services/model_scanner.py` | 遞迴掃描 `.gguf` 檔案、解析 metadata（publisher, quantize, param_size, arch）、mmproj 關聯 |
-| **benchmark_runner.py** | `backend/app/services/benchmark_runner.py` | 非同步執行 llama-bench、SSE 串流 log、解析 t/s 結果 |
-| **route_resolver.py** | `backend/app/services/route_resolver.py` | 多來源候選收集 → 能力篩選 → 策略評分排序 |
-| **tool_normalizer.py** | `backend/app/services/tool_normalizer.py` | OpenAI ↔ Anthropic tool schema 轉換、參數驗證、迴圈保護 |
-| **mesh_health.py** | `backend/app/services/mesh_health.py` | 背景 Health-Check 任務（30s 週期探測 Mesh Worker） |
-| **system_metrics.py** | `backend/app/services/system_metrics.py` | Linux sysfs 讀取 CPU/GPU/RAM 指標 |
+| 模組                      | 路徑                                         | 職責                                                                           |
+| ----------------------- | ------------------------------------------ | ---------------------------------------------------------------------------- |
+| **main.py**             | `backend/app/main.py`                      | FastAPI 應用進入點、生命週期管理、CORS、API Token 中間件                                      |
+| **config.py**           | `backend/app/core/config.py`               | 從 `.env` 載入全域設定（Pydantic Settings）                                           |
+| **database.py**         | `backend/app/database.py`                  | SQLAlchemy Engine / Session / 自動 Migration                                   |
+| **models.py**           | `backend/app/models.py`                    | 10 張 ORM 資料表定義                                                               |
+| **schemas.py**          | `backend/app/schemas.py`                   | Pydantic 請求 / 回應模型                                                           |
+| **process_manager.py**  | `backend/app/core/process_manager.py`      | llama-server 進程生命週期（啟動、停止、port 分配、stderr 監控、phase 偵測）                        |
+| **runtime_settings.py** | `backend/app/core/runtime_settings.py`     | DB-backed 設定讀取、Runtime 環境解析                                                  |
+| **model_scanner.py**    | `backend/app/services/model_scanner.py`    | 遞迴掃描 `.gguf` 檔案、解析 metadata（publisher, quantize, param_size, arch）、mmproj 關聯 |
+| **benchmark_runner.py** | `backend/app/services/benchmark_runner.py` | 非同步執行 llama-bench、SSE 串流 log、解析 t/s 結果                                       |
+| **route_resolver.py**   | `backend/app/services/route_resolver.py`   | 多來源候選收集 → 能力篩選 → 策略評分排序                                                      |
+| **tool_normalizer.py**  | `backend/app/services/tool_normalizer.py`  | OpenAI ↔ Anthropic tool schema 轉換、參數驗證、迴圈保護                                  |
+| **mesh_health.py**      | `backend/app/services/mesh_health.py`      | 背景 Health-Check 任務（30s 週期探測 Mesh Worker）                                     |
+| **system_metrics.py**   | `backend/app/services/system_metrics.py`   | Linux sysfs 讀取 CPU/GPU/RAM 指標                                                |
 
 #### 路由層一覽
 
-| Router 檔案 | 端點前綴 | 功能 |
-|------------|---------|------|
-| `openai_router.py` | `/v1/*` | OpenAI 相容的 Chat Completions & Models 端點 |
-| `model_routes.py` | `/api/models/*` | GGUF 模型掃描、屬性覆寫 |
-| `model_group_routes.py` | `/api/model-groups/*` | 模型群組 CRUD + 一鍵啟動 |
-| `process_routes.py` | `/api/process/*` | llama-server 進程控制 |
-| `benchmark_routes.py` | `/api/benchmarks/*` | 效能測試（SSE 串流） |
-| `settings_routes.py` | `/api/settings` | 系統設定 KV store |
-| `runtime_routes.py` | `/api/runtimes/*` | Runtime 環境 CRUD |
-| `provider_routes.py` | `/api/providers/*` `/api/model-routes/*` `/api/mesh/*` | Provider 端點、路由規則、Mesh Worker、OAuth |
-| `metrics_routes.py` | `/api/metrics/*` | 系統指標、請求統計、最近 Benchmark |
-| `report_routes.py` | `/api/reports/*` | Bug Report CRUD |
-| `dev_routes.py` | `/api/dev/*` | 開發除錯工具 |
-| `virtual_model_routes.py` | `/api/virtual-models/*` | Virtual Model CRUD |
+| Router 檔案                 | 端點前綴                                                   | 功能                                      |
+| ------------------------- | ------------------------------------------------------ | --------------------------------------- |
+| `openai_router.py`        | `/v1/*`                                                | OpenAI 相容的 Chat Completions & Models 端點 |
+| `model_routes.py`         | `/api/models/*`                                        | GGUF 模型掃描、屬性覆寫                          |
+| `model_group_routes.py`   | `/api/model-groups/*`                                  | 模型群組 CRUD + 一鍵啟動                        |
+| `process_routes.py`       | `/api/process/*`                                       | llama-server 進程控制                       |
+| `benchmark_routes.py`     | `/api/benchmarks/*`                                    | 效能測試（SSE 串流）                            |
+| `settings_routes.py`      | `/api/settings`                                        | 系統設定 KV store                           |
+| `runtime_routes.py`       | `/api/runtimes/*`                                      | Runtime 環境 CRUD                         |
+| `provider_routes.py`      | `/api/providers/*` `/api/model-routes/*` `/api/mesh/*` | Provider 端點、路由規則、Mesh Worker、OAuth      |
+| `metrics_routes.py`       | `/api/metrics/*`                                       | 系統指標、請求統計、最近 Benchmark                  |
+| `report_routes.py`        | `/api/reports/*`                                       | Bug Report CRUD                         |
+| `dev_routes.py`           | `/api/dev/*`                                           | 開發除錯工具                                  |
+| `virtual_model_routes.py` | `/api/virtual-models/*`                                | Virtual Model CRUD                      |
 
 ### 前端架構
 
 前端使用 **Next.js 16 + React 19 + Tailwind CSS 4 + Shadcn/UI**。
 
-| 頁面 | 路徑 | 功能 |
-|-----|------|------|
-| **Dashboard** | `/` | 系統總覽：後端狀態、Active Models、GPU/RAM 使用率、API 請求統計、最近 Benchmark |
-| **Models** | `/models` | 雙欄佈局：左欄掃描到的 GGUF 檔案、右欄模型群組管理，支援一鍵啟動 / 編輯 / 刪除 |
-| **Inference** | `/inference` | 線上聊天測試介面，選擇模型後即時對話（支援 streaming） |
-| **Benchmarks** | `/benchmarks` | 選擇模型 → 設定參數 → 執行 llama-bench → 即時 Log + 結果表格 |
-| **Providers** | `/providers` | 管理遠端 API 供應商（OpenAI, Anthropic, Copilot, Gemini 等） |
-| **Routes** | `/routes` | 管理模型路由規則：model name → Provider 對映 |
-| **Mapping** | `/mapping` | 模型屬性覆寫、Model Family 分類 |
-| **Mesh** | `/mesh` | Tailscale Mesh Worker 節點管理 |
-| **Reports** | `/reports` | Bug Report 提交與查看 |
-| **Dev** | `/dev` | 開發除錯：進程事件日誌、即時 Log 串流 |
-| **Settings** | `/settings` | 系統設定：掃描目錄、Runtime 設定、API Key 管理 |
+| 頁面             | 路徑            | 功能                                                        |
+| -------------- | ------------- | --------------------------------------------------------- |
+| **Dashboard**  | `/`           | 系統總覽：後端狀態、Active Models、GPU/RAM 使用率、API 請求統計、最近 Benchmark |
+| **Models**     | `/models`     | 雙欄佈局：左欄掃描到的 GGUF 檔案、右欄模型群組管理，支援一鍵啟動 / 編輯 / 刪除             |
+| **Inference**  | `/inference`  | 線上聊天測試介面，選擇模型後即時對話（支援 streaming）                          |
+| **Benchmarks** | `/benchmarks` | 選擇模型 → 設定參數 → 執行 llama-bench → 即時 Log + 結果表格              |
+| **Providers**  | `/providers`  | 管理遠端 API 供應商（OpenAI, Anthropic, Copilot, Gemini 等）        |
+| **Routes**     | `/routes`     | 管理模型路由規則：model name → Provider 對映                         |
+| **Mapping**    | `/mapping`    | 模型屬性覆寫、Model Family 分類                                    |
+| **Mesh**       | `/mesh`       | Tailscale Mesh Worker 節點管理                                |
+| **Reports**    | `/reports`    | Bug Report 提交與查看                                          |
+| **Dev**        | `/dev`        | 開發除錯：進程事件日誌、即時 Log 串流                                     |
+| **Settings**   | `/settings`   | 系統設定：掃描目錄、Runtime 設定、API Key 管理                           |
 
 ### 資料庫結構
 
 使用 **SQLite** + **SQLAlchemy ORM**，資料庫檔案為 `llm_router.db`（根目錄），啟動時自動建立。
 
-| 資料表 | 用途 |
-|-------|------|
-| `settings` | 系統設定鍵值表（model_scan_dirs, api_token, ...） |
-| `runtimes` | Runtime 環境定義（名稱、執行檔路徑、環境變數） |
-| `model_groups` | 模型群組預設（啟動參數打包） |
-| `benchmark_records` | llama-bench 測試結果 |
-| `provider_endpoints` | 遠端 API 供應商端點 |
-| `model_routes` | 模型名稱 → Provider 路由規則 |
-| `model_property_overrides` | 使用者自訂模型屬性覆寫 |
-| `mesh_workers` | Tailscale Mesh 節點註冊表 |
-| `completion_logs` | 每次 /v1/chat/completions 請求記錄 |
-| `virtual_models` | 虛擬模型別名 |
+| 資料表                        | 用途                                       |
+| -------------------------- | ---------------------------------------- |
+| `settings`                 | 系統設定鍵值表（model_scan_dirs, api_token, ...） |
+| `runtimes`                 | Runtime 環境定義（名稱、執行檔路徑、環境變數）              |
+| `model_groups`             | 模型群組預設（啟動參數打包）                           |
+| `benchmark_records`        | llama-bench 測試結果                         |
+| `provider_endpoints`       | 遠端 API 供應商端點                             |
+| `model_routes`             | 模型名稱 → Provider 路由規則                     |
+| `model_property_overrides` | 使用者自訂模型屬性覆寫                              |
+| `mesh_workers`             | Tailscale Mesh 節點註冊表                     |
+| `completion_logs`          | 每次 /v1/chat/completions 請求記錄             |
+| `virtual_models`           | 虛擬模型別名                                   |
 
 ---
 
@@ -221,13 +204,13 @@ Model Group = 一組預設好的啟動參數。把「模型路徑 + GPU Layers +
 
 ### 前置要求
 
-| 項目 | 要求 |
-|-----|------|
-| **作業系統** | Linux（推薦 Ubuntu 22.04+） |
-| **Python** | 3.10 以上 |
-| **Node.js** | 18 以上 |
-| **GPU** | AMD Radeon 890M（或其他支援 ROCm/Vulkan 的 GPU） |
-| **RAM** | 建議 16GB+（統一記憶體環境更佳） |
+| 項目            | 要求                                                     |
+| ------------- | ------------------------------------------------------ |
+| **作業系統**      | Linux（推薦 Ubuntu 22.04+）                                |
+| **Python**    | 3.10 以上                                                |
+| **Node.js**   | 18 以上                                                  |
+| **GPU**       | AMD Radeon 890M（或其他支援 ROCm/Vulkan 的 GPU）               |
+| **RAM**       | 建議 16GB+（統一記憶體環境更佳）                                    |
 | **llama.cpp** | 需自行編譯 `llama-server` 與 `llama-bench`（ROCm 或 Vulkan 版本） |
 
 ### Step 1: 克隆專案
@@ -246,15 +229,15 @@ nano .env   # 編輯以下欄位
 
 **.env 參數說明：**
 
-| 變數 | 說明 | 範例 |
-|-----|------|-----|
-| `LLAMA_ROCM_PATH` | ROCm 版 llama-server 的路徑 | `/home/user/llama.cpp/build-rocm/bin/llama-server` |
-| `LLAMA_VULKAN_PATH` | Vulkan 版 llama-server 的路徑 | `/home/user/llama.cpp/build-vulkan/bin/llama-server` |
-| `HSA_OVERRIDE_GFX_VERSION` | AMD GPU 架構覆寫（Strix Point = 11.5.0） | `11.5.0` |
-| `LLAMA_SERVER_PORT` | llama-server 起始監聽 Port | `8081` |
-| `OPENAI_API_KEY` | OpenAI API Key（選填，用於 fallback） | `sk-...` |
-| `ANTHROPIC_API_KEY` | Anthropic API Key（選填） | `sk-ant-...` |
-| `DATABASE_URL` | SQLite 路徑 | `sqlite:///./llm_router.db` |
+| 變數                         | 說明                                 | 範例                                                   |
+| -------------------------- | ---------------------------------- | ---------------------------------------------------- |
+| `LLAMA_ROCM_PATH`          | ROCm 版 llama-server 的路徑            | `/home/user/llama.cpp/build-rocm/bin/llama-server`   |
+| `LLAMA_VULKAN_PATH`        | Vulkan 版 llama-server 的路徑          | `/home/user/llama.cpp/build-vulkan/bin/llama-server` |
+| `HSA_OVERRIDE_GFX_VERSION` | AMD GPU 架構覆寫（Strix Point = 11.5.0） | `11.5.0`                                             |
+| `LLAMA_SERVER_PORT`        | llama-server 起始監聽 Port             | `8081`                                               |
+| `OPENAI_API_KEY`           | OpenAI API Key（選填，用於 fallback）     | `sk-...`                                             |
+| `ANTHROPIC_API_KEY`        | Anthropic API Key（選填）              | `sk-ant-...`                                         |
+| `DATABASE_URL`             | SQLite 路徑                          | `sqlite:///./llm_router.db`                          |
 
 ### Step 3: 安裝依賴
 
@@ -297,11 +280,11 @@ cd frontend && npm run dev
 
 ### 驗證
 
-| 服務 | 網址 |
-|-----|------|
-| 前端介面 | http://localhost:3000 |
+| 服務               | 網址                         |
+| ---------------- | -------------------------- |
+| 前端介面             | http://localhost:3000      |
 | API 文件 (Swagger) | http://localhost:8000/docs |
-| 健康檢查 | http://localhost:8000/ |
+| 健康檢查             | http://localhost:8000/     |
 
 ### 啟動後自動發生的事
 
@@ -370,14 +353,14 @@ cd frontend && npm run dev
 
 管理你可用的遠端 API：
 
-| 類型 | 支援 |
-|-----|------|
-| OpenAI | API Key 認證 |
-| Anthropic | API Key 認證 |
-| GitHub Copilot | Device Code OAuth 流程 |
-| GitHub Models | Device Code OAuth 流程 |
+| 類型                | 支援                     |
+| ----------------- | ---------------------- |
+| OpenAI            | API Key 認證             |
+| Anthropic         | API Key 認證             |
+| GitHub Copilot    | Device Code OAuth 流程   |
+| GitHub Models     | Device Code OAuth 流程   |
 | Google Gemini CLI | Google OAuth (PKCE) 流程 |
-| 任何 OpenAI 相容 API | 自訂 Base URL + API Key |
+| 任何 OpenAI 相容 API  | 自訂 Base URL + API Key  |
 
 點選 **Add Provider** → 填入資訊 → 系統自動健康檢查。
 
@@ -537,14 +520,14 @@ Hub 會自動每 30 秒健康檢查，狀態轉換：`online → stale（2次失
 
 通過 `X-Route-Policy` Header 或 Virtual Model 的 routing_hints 設定：
 
-| 策略 | 行為 |
-|-----|------|
-| `local_first`（預設）| 優先本地 → Mesh → 雲端 |
-| `local_only` | 只用本地模型 |
-| `remote_only` | 只用遠端 |
-| `fastest` | 選擇 benchmark 最快的 |
-| `cheapest` | 優先免費的（本地 → Mesh → OpenAI → Anthropic） |
-| `highest_quality` | 優先品質（Anthropic → OpenAI → Mesh → 本地） |
+| 策略                | 行為                                    |
+| ----------------- | ------------------------------------- |
+| `local_first`（預設） | 優先本地 → Mesh → 雲端                      |
+| `local_only`      | 只用本地模型                                |
+| `remote_only`     | 只用遠端                                  |
+| `fastest`         | 選擇 benchmark 最快的                      |
+| `cheapest`        | 優先免費的（本地 → Mesh → OpenAI → Anthropic） |
+| `highest_quality` | 優先品質（Anthropic → OpenAI → Mesh → 本地）  |
 
 ### Virtual Model 虛擬模型
 
@@ -711,7 +694,8 @@ LLM_Server_Router/
 │           ├── model-preset-recipes.ts    # 預設參數模板
 │           └── utils.ts                   # 工具函式
 ├── docs/
-│   ├── FULL_GUIDE.md                      # ← 你正在看的這份文件
+│   ├── FULL_GUIDE.md                      # ← 你正在看的這份文件（繁體中文）
+│   ├── FULL_GUIDE_EN.md                   # 完整指南（English）
 │   ├── DESIGN_DOC.md                      # 原始設計文件
 │   ├── SETUP.md                           # 安裝手冊
 │   └── auto-catch-up.md                   # 變更日誌
