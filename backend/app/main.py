@@ -4,6 +4,7 @@ LLM Server Router - FastAPI 主應用程式
 啟動方式:
     uvicorn backend.app.main:app --reload --port 8000
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -12,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.database import init_db
-from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes, dev_routes
+from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes, dev_routes, virtual_model_routes, lmstudio_routes
 from backend.app.core.dev_logs import install_dev_log_handler
 from backend.app.core.process_manager import llama_process_manager
 from backend.app.database import SessionLocal
@@ -34,9 +35,20 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 LLM Server Router 正在啟動...")
     init_db()
     logger.info("✅ 資料庫初始化完成")
+
+    # Start mesh worker health-check background task
+    from backend.app.services.mesh_health import run_health_checks
+    health_task = asyncio.create_task(run_health_checks())
+    logger.info("✅ Mesh health-check task started")
+
     yield
     # === Shutdown ===
     logger.info("🔄 正在關閉...")
+    health_task.cancel()
+    try:
+        await health_task
+    except asyncio.CancelledError:
+        pass
     llama_process_manager.stop_all()
     logger.info("👋 LLM Server Router 已關閉")
 
@@ -71,6 +83,8 @@ app.include_router(provider_routes.routes_router)
 app.include_router(provider_routes.mesh_router)
 app.include_router(report_routes.router)
 app.include_router(dev_routes.router)
+app.include_router(virtual_model_routes.router)
+app.include_router(lmstudio_routes.router)
 
 
 @app.middleware("http")
