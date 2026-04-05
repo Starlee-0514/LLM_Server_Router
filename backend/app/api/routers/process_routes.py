@@ -4,6 +4,7 @@ API 端點：進程控制 (Start / Stop)
 管理 llama-server 的生命週期，支援同時運行多個模型。
 """
 import logging
+import shlex
 
 from fastapi import APIRouter, HTTPException
 
@@ -23,6 +24,7 @@ router = APIRouter(prefix="/api/process", tags=["process"])
 def start_model_process(request: ProcessStartRequest):
     """啟動一個 llama-server 進程。支援並行啟動多個模型。"""
     try:
+        parsed_extra_args = shlex.split(request.extra_args) if request.extra_args else None
         llama_process_manager.start_server(
             identifier=request.model_identifier,
             model_path=request.model_path,
@@ -31,7 +33,7 @@ def start_model_process(request: ProcessStartRequest):
             batch_size=request.batch_size,
             ubatch_size=request.ubatch_size,
             ctx_size=request.ctx_size,
-            extra_args=request.extra_args.split() if request.extra_args else None,
+            extra_args=parsed_extra_args,
         )
     except ValueError as e:
         # 重複啟動

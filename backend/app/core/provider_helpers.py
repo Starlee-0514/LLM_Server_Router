@@ -7,7 +7,15 @@ import json
 def build_provider_headers(api_key: str, extra_headers_json: str) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        # Support JSON-encoded token data (e.g. from Google OAuth PKCE flow)
+        actual_key = api_key
+        if api_key.startswith("{"):
+            try:
+                token_data = json.loads(api_key)
+                actual_key = token_data.get("access_token", api_key)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        headers["Authorization"] = f"Bearer {actual_key}"
     if extra_headers_json:
         try:
             parsed = json.loads(extra_headers_json)
@@ -22,6 +30,9 @@ def _base_with_default_v1(base_url: str) -> tuple[str, bool]:
     base = (base_url or "").rstrip("/")
     lower = base.lower()
     if lower.endswith("/v1") or lower.endswith("/api/v1") or lower.endswith("/v1beta/openai"):
+        return base, True
+    # GitHub Copilot API: no /v1 prefix, it's just /chat/completions
+    if "githubcopilot.com" in lower:
         return base, True
     return base, False
 

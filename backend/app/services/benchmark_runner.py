@@ -154,7 +154,7 @@ async def run_benchmark_stream(
     env.update(runtime_env)
 
     cmd_str = " ".join(cmd)
-    logger.info(f"執行 llama-bench (streaming): {cmd_str}")
+    logger.info("執行 llama-bench (streaming) [%s]: %s", model_name, cmd_str)
 
     # Emit the command itself
     yield f"event: log\ndata: {json.dumps({'line': f'$ {cmd_str}'})}\n\n"
@@ -206,6 +206,8 @@ async def run_benchmark_stream(
         full_log_lines.append(line)
         if label == "stdout":
             stdout_lines.append(line)
+        if line:
+            logger.info("[llama-bench][%s][%s] %s", model_name, label, line)
         # Emit every line to frontend in real-time
         yield f"event: log\ndata: {json.dumps({'line': line})}\n\n"
 
@@ -217,7 +219,7 @@ async def run_benchmark_stream(
 
     if process.returncode != 0:
         error_msg = f"llama-bench exited with code {process.returncode}"
-        logger.error(error_msg)
+        logger.error("%s [%s]", error_msg, model_name)
         yield f"event: error\ndata: {json.dumps({'error': error_msg, 'raw_output': full_log})}\n\n"
         return
 
@@ -225,7 +227,12 @@ async def run_benchmark_stream(
     results = parse_results(stdout_text)
     results["raw_output"] = full_log
 
-    logger.info(f"Benchmark results: pp={results.get('pp_tokens_per_second')}, tg={results.get('tg_tokens_per_second')}")
+    logger.info(
+        "Benchmark results [%s]: pp=%s, tg=%s",
+        model_name,
+        results.get("pp_tokens_per_second"),
+        results.get("tg_tokens_per_second"),
+    )
 
     yield f"event: done\ndata: {json.dumps(results)}\n\n"
 

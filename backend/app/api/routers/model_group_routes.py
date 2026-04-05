@@ -5,6 +5,7 @@ API 端點：模型群組管理 (ModelGroup CRUD)
 日後只需要一鍵即可啟動 llama-server。
 """
 import logging
+import shlex
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -118,6 +119,7 @@ def launch_model_group(group_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"模型群組 ID={group_id} 不存在")
 
     try:
+        parsed_extra_args = shlex.split(group.extra_args) if group.extra_args else None
         llama_process_manager.start_server(
             identifier=group.name,
             model_path=group.model_path,
@@ -126,7 +128,7 @@ def launch_model_group(group_id: int, db: Session = Depends(get_db)):
             batch_size=group.batch_size,
             ubatch_size=group.ubatch_size,
             ctx_size=group.ctx_size,
-            extra_args=group.extra_args.split() if group.extra_args else None,
+            extra_args=parsed_extra_args,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

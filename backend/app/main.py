@@ -12,7 +12,8 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.database import init_db
-from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes
+from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes, dev_routes
+from backend.app.core.dev_logs import install_dev_log_handler
 from backend.app.core.process_manager import llama_process_manager
 from backend.app.database import SessionLocal
 from backend.app.models import Setting
@@ -22,6 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+install_dev_log_handler()
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +70,7 @@ app.include_router(provider_routes.router)
 app.include_router(provider_routes.routes_router)
 app.include_router(provider_routes.mesh_router)
 app.include_router(report_routes.router)
+app.include_router(dev_routes.router)
 
 
 @app.middleware("http")

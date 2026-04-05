@@ -329,6 +329,7 @@ class CommonProviderTemplate(BaseModel):
     base_url: str
     auth_hint: str
     default_extra_headers: str = ""
+    oauth_method: str = "api_key"  # "api_key" | "device_code" | "pkce"
 
 
 class CommonProviderRegisterRequest(BaseModel):

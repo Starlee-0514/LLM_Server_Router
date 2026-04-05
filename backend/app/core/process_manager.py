@@ -9,9 +9,13 @@ LlamaProcessManager - llama-server 進程管理器
 """
 import logging
 import os
+import shlex
 import subprocess
 import time
 import shutil
+import threading
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -19,6 +23,27 @@ from backend.app.core.config import settings
 from backend.app.core.runtime_settings import get_runtime_command
 
 logger = logging.getLogger(__name__)
+
+_EARLY_EXIT_GRACE_SECONDS = 2.0
+_RISKY_STARTUP_FLAGS = {
+    "--flash-attn",
+    "--cont-batching",
+    "--no-kv-offload",
+    "--parallel",
+    "--cache-type-k",
+    "--cache-type-v",
+    "--threads-batch",
+    "--tensor-split",
+}
+_FLAGS_WITH_VALUES = {
+    "--parallel",
+    "--cache-type-k",
+    "--cache-type-v",
+    "--threads",
+    "--threads-batch",
+    "--tensor-split",
+    "--mmproj",
+}
 
 
 @dataclass
@@ -30,9 +55,63 @@ class RunningProcess:
     port: int
     started_at: float = field(default_factory=time.time)
     pid: int = 0
+    phase: str = "starting"
+    recent_output: deque = field(default_factory=lambda: deque(maxlen=50))
+    _reader_thread: threading.Thread | None = field(default=None, repr=False)
 
     def __post_init__(self):
         self.pid = self.process.pid
+
+
+# Patterns to detect llama-server phases from stderr output
+_PHASE_PATTERNS: list[tuple[str, str]] = [
+    ("llm_load_vocab", "loading vocabulary"),
+    ("llm_load_tensors", "loading model tensors"),
+    ("llm_load_print_meta", "loading model metadata"),
+    ("warming up", "warming up"),
+    ("server listening", "ready"),
+    ("listening on", "ready"),
+    ("slot is processing", "processing prompt"),
+    ("slot update_slots", "generating"),
+    ("slot released", "ready"),
+    ("generate_response", "generating"),
+    ("prompt eval time", "ready"),
+    ("eval time", "ready"),
+]
+
+
+def _detect_phase(line: str) -> str | None:
+    """Return a phase name if the line matches a known pattern, else None."""
+    lower = line.lower()
+    for pattern, phase in _PHASE_PATTERNS:
+        if pattern in lower:
+            return phase
+    return None
+
+
+def _start_output_reader(rp: RunningProcess, identifier: str = "") -> None:
+    """Start a daemon thread to read stderr and update process phase."""
+    from backend.app.core.dev_logs import log_process
+
+    def _reader():
+        stderr = rp.process.stderr
+        if not stderr:
+            return
+        try:
+            for line in stderr:
+                stripped = line.rstrip("\n\r")
+                if stripped:
+                    rp.recent_output.append(stripped)
+                    log_process(identifier or str(rp.pid), stripped)
+                    detected = _detect_phase(stripped)
+                    if detected:
+                        rp.phase = detected
+        except (ValueError, OSError):
+            pass  # pipe closed
+
+    t = threading.Thread(target=_reader, daemon=True, name=f"llama-stderr-{rp.pid}")
+    rp._reader_thread = t
+    t.start()
 
 
 class LlamaProcessManager:
@@ -52,6 +131,8 @@ class LlamaProcessManager:
         self._active_processes: dict[str, RunningProcess] = {}
         # 用於自動分配 port 的起始點
         self._base_port = settings.llama_server_port
+        # Ring buffer for recent events (max 200 entries)
+        self._event_log: deque[dict] = deque(maxlen=200)
 
     def _allocate_port(self) -> int:
         """自動尋找下一個未被佔用的 Port。"""
@@ -60,6 +141,22 @@ class LlamaProcessManager:
         while port in used_ports:
             port += 1
         return port
+
+    def _log_event(self, event_type: str, identifier: str, detail: str = "", **extra: object) -> None:
+        """Append a timestamped event to the ring buffer."""
+        self._event_log.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": event_type,
+            "identifier": identifier,
+            "detail": detail,
+            **extra,
+        })
+
+    def get_event_log(self, limit: int = 100) -> list[dict]:
+        """Return the most recent *limit* events (newest first)."""
+        items = list(self._event_log)
+        items.reverse()
+        return items[:limit]
 
     def _get_binary_path(self, runtime_name: str) -> tuple[str, dict[str, str]]:
         """根據運行時名稱取得 llama-server 執行檔路徑與環境變數。"""
@@ -116,6 +213,65 @@ class LlamaProcessManager:
 
         return cmd
 
+    def _collect_process_output(self, process: subprocess.Popen) -> tuple[str, str]:
+        stdout_text = ""
+        stderr_text = ""
+        if process.stdout:
+            try:
+                stdout_text = process.stdout.read() or ""
+            except Exception:
+                stdout_text = ""
+        if process.stderr:
+            try:
+                stderr_text = process.stderr.read() or ""
+            except Exception:
+                stderr_text = ""
+        return stdout_text.strip(), stderr_text.strip()
+
+    def _await_early_exit(self, process: subprocess.Popen, grace_seconds: float = _EARLY_EXIT_GRACE_SECONDS) -> tuple[int, str, str] | None:
+        deadline = time.time() + grace_seconds
+        while time.time() < deadline:
+            return_code = process.poll()
+            if return_code is not None:
+                stdout_text, stderr_text = self._collect_process_output(process)
+                return return_code, stdout_text, stderr_text
+            time.sleep(0.15)
+        return None
+
+    def _strip_risky_startup_args(self, extra_args: list[str] | None) -> list[str]:
+        if not extra_args:
+            return []
+
+        safe_args: list[str] = []
+        index = 0
+        while index < len(extra_args):
+            token = extra_args[index]
+            if token in _RISKY_STARTUP_FLAGS:
+                if token in _FLAGS_WITH_VALUES and index + 1 < len(extra_args):
+                    index += 2
+                    continue
+                index += 1
+                continue
+            safe_args.append(token)
+            if token in _FLAGS_WITH_VALUES and index + 1 < len(extra_args):
+                safe_args.append(extra_args[index + 1])
+                index += 2
+                continue
+            index += 1
+        return safe_args
+
+    def _launch_process(self, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
+        try:
+            return subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as e:
+            raise RuntimeError(f"啟動失敗: {e}\n指令: {shlex.join(cmd)}")
+
     def start_server(
         self,
         identifier: str,
@@ -168,18 +324,47 @@ class LlamaProcessManager:
             extra_args=extra_args,
         )
 
-        logger.info(f"啟動 llama-server [{identifier}]: {' '.join(cmd)}")
+        logger.info("啟動 llama-server [%s]: %s", identifier, shlex.join(cmd))
+        self._log_event("launch", identifier, detail=shlex.join(cmd), engine=runtime_name, port=port)
+        process = self._launch_process(cmd, env)
 
-        try:
-            process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except OSError as e:
-            raise RuntimeError(f"啟動失敗: {e}\n指令: {cmd}")
+        early_exit = self._await_early_exit(process)
+        if early_exit is not None:
+            return_code, stdout_text, stderr_text = early_exit
+            fallback_args = self._strip_risky_startup_args(extra_args)
+            if fallback_args != (extra_args or []):
+                fallback_cmd = self._build_command(
+                    binary_path=binary_path,
+                    model_path=model_path,
+                    port=port,
+                    n_gpu_layers=n_gpu_layers,
+                    batch_size=batch_size,
+                    ubatch_size=ubatch_size,
+                    ctx_size=ctx_size,
+                    extra_args=fallback_args,
+                )
+                logger.warning(
+                    "[%s] llama-server 啟動後立即退出 (rc=%s)，改用安全參數重試: %s",
+                    identifier,
+                    return_code,
+                    shlex.join(fallback_cmd),
+                )
+                self._log_event("retry", identifier, detail=shlex.join(fallback_cmd), rc=return_code)
+                process = self._launch_process(fallback_cmd, env)
+                early_exit = self._await_early_exit(process)
+                if early_exit is None:
+                    extra_args = fallback_args
+                else:
+                    return_code, stdout_text, stderr_text = early_exit
+
+            if early_exit is not None:
+                detail = stderr_text or stdout_text or "llama-server 在啟動後立即退出，沒有輸出更多資訊。"
+                self._log_event("error", identifier, detail=detail[-500:], rc=return_code)
+                raise RuntimeError(
+                    f"llama-server 啟動失敗 (return code={return_code})\n"
+                    f"指令: {shlex.join(cmd)}\n"
+                    f"輸出: {detail[-1500:]}"
+                )
 
         rp = RunningProcess(
             process=process,
@@ -188,7 +373,9 @@ class LlamaProcessManager:
             port=port,
         )
         self._active_processes[identifier] = rp
+        _start_output_reader(rp, identifier)
 
+        self._log_event("running", identifier, detail=f"PID={process.pid}", pid=process.pid, engine=runtime_name, port=port)
         logger.info(
             f"[{identifier}] llama-server 已啟動 (PID={process.pid}, "
             f"engine={runtime_name}, port={port})"
@@ -206,6 +393,7 @@ class LlamaProcessManager:
         proc = rp.process
         pid = rp.pid
 
+        self._log_event("stop", identifier, detail=f"PID={pid}")
         try:
             # 先嘗試 graceful shutdown (SIGTERM)
             proc.terminate()
@@ -237,6 +425,7 @@ class LlamaProcessManager:
         for idf, rp in list(self._active_processes.items()):
             if rp.process.poll() is not None:
                 dead_ids.append(idf)
+                self._log_event("exited", idf, detail=f"rc={rp.process.returncode}", rc=rp.process.returncode, pid=rp.pid)
                 logger.info(
                     f"[{idf}] llama-server (PID={rp.pid}) 已經自行退出 "
                     f"(return code={rp.process.returncode})"
@@ -269,6 +458,8 @@ class LlamaProcessManager:
             "model_path": rp.model_path,
             "port": rp.port,
             "uptime_seconds": round(uptime, 2),
+            "phase": rp.phase,
+            "recent_output": list(rp.recent_output)[-10:],
         }
 
     def get_all_status(self) -> list[dict]:
