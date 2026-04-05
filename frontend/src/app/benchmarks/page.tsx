@@ -12,13 +12,15 @@ import {
   runBenchmarkStream,
   deleteBenchmark,
   importBenchmarks,
+  getSettings,
   type BenchmarkRecord,
   type ModelGroup,
 } from "@/lib/api";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { PRESET_RECIPES, type PresetRecipe } from "@/lib/model-preset-recipes";
 
-type CompareMode = "all" | "same_model" | "same_preset" | "same_engine" | "same_batch" | "same_ngl";
+type CompareMode = "all" | "same_model" | "same_preset" | "same_engine" | "same_recipe" | "same_ctx";
 
 export default function BenchmarksPage() {
   const [records, setRecords] = useState<BenchmarkRecord[]>([]);
@@ -33,6 +35,11 @@ export default function BenchmarksPage() {
   const [presetSearchInput, setPresetSearchInput] = useState("");
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showPresetDropdown, setShowPresetDropdown] = useState(false);
+
+  const [recipeFilter, setRecipeFilter] = useState<string>("all");
+  // Recipe override for benchmark runs
+  const [benchRecipeOverride, setBenchRecipeOverride] = useState<string>("preset");
+  const [customRecipes, setCustomRecipes] = useState<PresetRecipe[]>([]);
 
   const [batchSizesStr, setBatchSizesStr] = useState("");
   const [n_gpu_layersStr, setN_gpu_layersStr] = useState("");
@@ -52,11 +59,11 @@ export default function BenchmarksPage() {
   const [compareModel, setCompareModel] = useState<string>("all");
   const [comparePreset, setComparePreset] = useState<string>("all");
   const [compareEngine, setCompareEngine] = useState<string>("all");
-  const [compareBatch, setCompareBatch] = useState<string>("all");
-  const [compareNgl, setCompareNgl] = useState<string>("all");
+  const [compareRecipe, setCompareRecipe] = useState<string>("all");
+  const [compareCtx, setCompareCtx] = useState<string>("all");
 
   // Sorting for performance comparison
-  type SortField = "tg" | "pp" | "model" | "ngl" | "batch" | "date";
+  type SortField = "tg" | "pp" | "model" | "recipe" | "ctx" | "date";
   const [sortField, setSortField] = useState<SortField>("tg");
   const [sortAsc, setSortAsc] = useState(false);
 
@@ -105,10 +112,13 @@ export default function BenchmarksPage() {
     );
   };
 
+  // Combined recipe list (built-in + custom)
+  const allRecipes = [...PRESET_RECIPES, ...customRecipes];
+
   const selectAllPresets = () => {
-    const filtered = selectedModel === "all" 
-      ? groups.map((g) => String(g.id))
-      : groups.filter((g) => g.name === selectedModel).map((g) => String(g.id));
+    const filtered = recipeFilteredPresets
+      .filter((g) => g.name.toLowerCase().includes(presetSearchInput.toLowerCase()) || g.group_name.toLowerCase().includes(presetSearchInput.toLowerCase()))
+      .map((g) => String(g.id));
     setSelectedPresetIds(filtered);
   };
 
@@ -121,9 +131,20 @@ export default function BenchmarksPage() {
     ? groups
     : groups.filter((g) => g.name === selectedModel);
 
+  // Recipe filter options: recipes assigned to groups + all known recipe keys
+  const assignedRecipeKeys = Array.from(new Set(filteredPresets.map((g) => g.preset_recipe).filter(Boolean)));
+  const allRecipeKeys = Array.from(new Set([...assignedRecipeKeys, ...allRecipes.map((r) => r.key)])).sort();
+  const availableRecipes = allRecipeKeys;
+
+  // Apply recipe filter
+  const recipeFilteredPresets = recipeFilter === "all"
+    ? filteredPresets
+    : filteredPresets.filter((g) => g.preset_recipe === recipeFilter);
+
   // Get filtered presets by search
-  const searchedPresets = filteredPresets.filter((g) =>
-    g.name.toLowerCase().includes(presetSearchInput.toLowerCase())
+  const searchedPresets = recipeFilteredPresets.filter((g) =>
+    g.name.toLowerCase().includes(presetSearchInput.toLowerCase()) ||
+    g.group_name.toLowerCase().includes(presetSearchInput.toLowerCase())
   );
 
   // Get model names (unique model paths)
@@ -146,12 +167,15 @@ export default function BenchmarksPage() {
   const refresh = async () => {
     setLoading(true);
     try {
-      const [data, groupsData] = await Promise.all([
+      const [data, groupsData, settingsItems] = await Promise.all([
         getBenchmarkHistory(),
         getModelGroups(),
+        getSettings(),
       ]);
       setRecords(data);
       setGroups(groupsData);
+      const customRecipesRaw = settingsItems.find((item) => item.key === "custom_preset_recipes")?.value ?? "[]";
+      try { setCustomRecipes(JSON.parse(customRecipesRaw)); } catch { setCustomRecipes([]); }
     } catch {}
     setLoading(false);
   };
@@ -186,7 +210,15 @@ export default function BenchmarksPage() {
         for (const batch of groupBatches) {
           for (const ngl of groupNgls) {
             completed++;
-            setDebugLog((prev) => prev + `\n━━━ Test ${completed}/${total}: ${group.name} (NGL: ${ngl}, Batch: ${batch}, pp: ${nPrompt}, tg: ${nGen}) ━━━\n`);
+            // Resolve recipe: override > group's assigned recipe > manual UI controls
+            const recipeKey = benchRecipeOverride !== "preset" ? benchRecipeOverride : group.preset_recipe;
+            const recipe = recipeKey ? allRecipes.find((r) => r.key === recipeKey) ?? null : null;
+            const effectiveRecipeLabel = recipe ? recipe.key : "manual";
+            const recipeFlashAttn = recipe ? (recipe.options.flashAttn ? 1 : 0) : flashAttn;
+            const recipeNoKvOffload = recipe ? (recipe.options.noKvOffload ? 1 : 0) : noKvOffload;
+            const recipeCacheTypeK = recipe?.options.cacheTypeK || (recipeFlashAttn === 1 ? kvCacheType : "f16");
+            const recipeCacheTypeV = recipe?.options.cacheTypeV || (recipeFlashAttn === 1 ? kvCacheType : "f16");
+            setDebugLog((prev) => prev + `\n━━━ Test ${completed}/${total}: ${group.name} (Recipe: ${effectiveRecipeLabel}, NGL: ${ngl}, Batch: ${batch}, pp: ${nPrompt}, tg: ${nGen}) ━━━\n`);
           await runBenchmarkStream(
             {
               model_name: group.name,
@@ -196,12 +228,13 @@ export default function BenchmarksPage() {
               batch_size: batch,
               ubatch_size: group.ubatch_size,
               ctx_size: group.ctx_size,
+              preset_recipe: effectiveRecipeLabel,
               n_prompt: nPrompt,
               n_gen: nGen,
-              flash_attn: flashAttn,
-              no_kv_offload: noKvOffload,
-              cache_type_k: flashAttn === 1 ? kvCacheType : "f16",
-              cache_type_v: flashAttn === 1 ? kvCacheType : "f16",
+              flash_attn: recipeFlashAttn,
+              no_kv_offload: recipeNoKvOffload,
+              cache_type_k: recipeCacheTypeK,
+              cache_type_v: recipeCacheTypeV,
             },
             (line) => {
               // Real-time log line callback
@@ -258,8 +291,8 @@ export default function BenchmarksPage() {
   const bestTg = Math.max(...records.filter((r) => r.tg_tokens_per_second).map((r) => r.tg_tokens_per_second!), 0);
   const modelOptions = Array.from(new Set(records.map((r) => r.model_name))).sort();
   const engineOptions = Array.from(new Set(records.map((r) => r.engine_type))).sort();
-  const batchOptions = Array.from(new Set(records.map((r) => r.batch_size))).sort((a, b) => a - b);
-  const nglOptions = Array.from(new Set(records.map((r) => r.n_gpu_layers))).sort((a, b) => a - b);
+  const recipeOptions = Array.from(new Set(records.map((r) => r.preset_recipe).filter(Boolean))).sort();
+  const ctxOptions = Array.from(new Set(records.map((r) => r.ctx_size))).sort((a, b) => a - b);
 
   // Derive unique "preset signatures" from benchmark records for comparison
   const presetOptions = Array.from(
@@ -276,8 +309,8 @@ export default function BenchmarksPage() {
   const groupedByModel: Record<string, BenchmarkRecord[]> = {};
   const groupedByPreset: Record<string, BenchmarkRecord[]> = {};
   const groupedByEngine: Record<string, BenchmarkRecord[]> = {};
-  const groupedByBatch: Record<string, BenchmarkRecord[]> = {};
-  const groupedByNgl: Record<string, BenchmarkRecord[]> = {};
+  const groupedByRecipe: Record<string, BenchmarkRecord[]> = {};
+  const groupedByCtx: Record<string, BenchmarkRecord[]> = {};
 
   for (const r of records) {
     if (!groupedByModel[r.model_name]) groupedByModel[r.model_name] = [];
@@ -290,13 +323,13 @@ export default function BenchmarksPage() {
     if (!groupedByEngine[r.engine_type]) groupedByEngine[r.engine_type] = [];
     groupedByEngine[r.engine_type].push(r);
 
-    const batchKey = String(r.batch_size);
-    if (!groupedByBatch[batchKey]) groupedByBatch[batchKey] = [];
-    groupedByBatch[batchKey].push(r);
+    const recipeKey = r.preset_recipe || "(none)";
+    if (!groupedByRecipe[recipeKey]) groupedByRecipe[recipeKey] = [];
+    groupedByRecipe[recipeKey].push(r);
 
-    const nglKey = String(r.n_gpu_layers);
-    if (!groupedByNgl[nglKey]) groupedByNgl[nglKey] = [];
-    groupedByNgl[nglKey].push(r);
+    const ctxKey = String(r.ctx_size);
+    if (!groupedByCtx[ctxKey]) groupedByCtx[ctxKey] = [];
+    groupedByCtx[ctxKey].push(r);
   }
 
   const sortRecords = (arr: BenchmarkRecord[]) => {
@@ -306,8 +339,8 @@ export default function BenchmarksPage() {
         case "tg": diff = (a.tg_tokens_per_second ?? 0) - (b.tg_tokens_per_second ?? 0); break;
         case "pp": diff = (a.pp_tokens_per_second ?? 0) - (b.pp_tokens_per_second ?? 0); break;
         case "model": diff = a.model_name.localeCompare(b.model_name); break;
-        case "ngl": diff = a.n_gpu_layers - b.n_gpu_layers; break;
-        case "batch": diff = a.batch_size - b.batch_size; break;
+        case "recipe": diff = (a.preset_recipe ?? "").localeCompare(b.preset_recipe ?? ""); break;
+        case "ctx": diff = a.ctx_size - b.ctx_size; break;
         case "date": diff = (a.created_at ? new Date(a.created_at).getTime() : 0) - (b.created_at ? new Date(b.created_at).getTime() : 0); break;
       }
       return sortAsc ? diff : -diff;
@@ -428,6 +461,22 @@ export default function BenchmarksPage() {
                       <Button variant="ghost" size="sm" className="text-[10px] h-6 px-2" onClick={clearPresetSelection}>Clear</Button>
                     </div>
                   </div>
+                  {/* Recipe filter */}
+                  {availableRecipes.length > 0 && (
+                    <div className="mb-2 flex items-center gap-2">
+                      <span className="text-[10px] text-muted-foreground whitespace-nowrap">Filter by recipe:</span>
+                      <select
+                        value={recipeFilter}
+                        onChange={(e) => setRecipeFilter(e.target.value)}
+                        className="flex-1 h-7 rounded-md border border-input bg-background px-2 py-0 text-xs"
+                      >
+                        <option value="all" className="bg-background text-foreground">All Recipes</option>
+                        {availableRecipes.map((r) => (
+                          <option key={r} value={r} className="bg-background text-foreground">{r}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
                   <div className="relative">
                     <button
                       onClick={() => setShowPresetDropdown(!showPresetDropdown)}
@@ -466,7 +515,8 @@ export default function BenchmarksPage() {
                               <div className="flex-1 text-left">
                                 <div className="font-medium">{preset.name}</div>
                                 <div className="text-[9px] text-muted-foreground">
-                                  {preset.engine_type} · NGL:{preset.n_gpu_layers} · B:{preset.batch_size}
+                                  {preset.engine_type} · NGL:{preset.n_gpu_layers} · B:{preset.batch_size} · Ctx:{preset.ctx_size}
+                                  {preset.preset_recipe ? <span className="ml-1 text-purple-400">[{preset.preset_recipe}]</span> : null}
                                 </div>
                               </div>
                             </button>
@@ -487,6 +537,30 @@ export default function BenchmarksPage() {
 
                 {/* Benchmark parameters */}
                 <div className="grid grid-cols-2 gap-3">
+                  {/* Recipe Override */}
+                  <div className="grid gap-2 col-span-2">
+                    <Label className="text-xs">Recipe Override</Label>
+                    <select
+                      value={benchRecipeOverride}
+                      onChange={(e) => setBenchRecipeOverride(e.target.value)}
+                      className="flex h-9 w-full rounded-md border border-input bg-background px-2 py-1 text-xs shadow-xs"
+                    >
+                      <option value="preset" className="bg-background text-foreground">Use Preset&apos;s Recipe</option>
+                      <option value="" className="bg-background text-foreground">Manual (use controls below)</option>
+                      {PRESET_RECIPES.map((r) => (
+                        <option key={r.key} value={r.key} className="bg-background text-foreground">📋 {r.label}</option>
+                      ))}
+                      {customRecipes.length > 0 && (
+                        <option disabled className="bg-background text-muted-foreground">── Custom ──</option>
+                      )}
+                      {customRecipes.map((r) => (
+                        <option key={r.key} value={r.key} className="bg-background text-foreground">⭐ {r.label}</option>
+                      ))}
+                    </select>
+                    <p className="text-[10px] text-muted-foreground">
+                      {benchRecipeOverride === "preset" ? "Each model group uses its own assigned recipe." : benchRecipeOverride === "" ? "Using manual Flash Attn / KV controls below." : `Overriding all runs with: ${allRecipes.find((r) => r.key === benchRecipeOverride)?.label ?? benchRecipeOverride}`}
+                    </p>
+                  </div>
                   <div className="grid gap-2">
                     <Label className="text-xs">Batch Sizes (comma-sep)</Label>
                     <Input value={batchSizesStr} onChange={(e) => setBatchSizesStr(e.target.value)} placeholder="use preset default" className="text-xs" />
@@ -561,8 +635,8 @@ export default function BenchmarksPage() {
                     <option value="tg" className="bg-background text-foreground">TG t/s</option>
                     <option value="pp" className="bg-background text-foreground">PP t/s</option>
                     <option value="model" className="bg-background text-foreground">Model Name</option>
-                    <option value="ngl" className="bg-background text-foreground">GPU Layers</option>
-                    <option value="batch" className="bg-background text-foreground">Batch Size</option>
+                    <option value="recipe" className="bg-background text-foreground">Recipe</option>
+                    <option value="ctx" className="bg-background text-foreground">Context Size</option>
                     <option value="date" className="bg-background text-foreground">Date</option>
                   </select>
                   <button
@@ -579,8 +653,8 @@ export default function BenchmarksPage() {
                     <TabsTrigger value="same_model" className="text-xs">Same Model</TabsTrigger>
                     <TabsTrigger value="same_preset" className="text-xs">Same Preset</TabsTrigger>
                     <TabsTrigger value="same_engine" className="text-xs">Same Engine</TabsTrigger>
-                    <TabsTrigger value="same_batch" className="text-xs">Same Batch</TabsTrigger>
-                    <TabsTrigger value="same_ngl" className="text-xs">Same GPU Layers</TabsTrigger>
+                    <TabsTrigger value="same_recipe" className="text-xs">Same Recipe</TabsTrigger>
+                    <TabsTrigger value="same_ctx" className="text-xs">Same Ctx</TabsTrigger>
                   </TabsList>
 
                   {/* Tab: All results bar chart */}
@@ -590,7 +664,7 @@ export default function BenchmarksPage() {
                         {chartPoints.map((row) => (
                           <div key={row.id} className="space-y-1">
                             <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                              <span className="truncate pr-2">{row.model_name} · {row.engine_type} · n{row.n_gpu_layers} · b{row.batch_size}</span>
+                              <span className="truncate pr-2">{row.model_name} · {row.engine_type} · n{row.n_gpu_layers} · b{row.batch_size}{row.preset_recipe ? ` · ${row.preset_recipe}` : ""}</span>
                               <span>{row.created_at ? new Date(row.created_at).toLocaleTimeString() : "—"}</span>
                             </div>
                             <div className="flex items-center gap-2">
@@ -760,62 +834,108 @@ export default function BenchmarksPage() {
                   </TabsContent>
 
                   {/* Tab: Same batch size, different models/engines */}
-                  <TabsContent value="same_batch">
+                  <TabsContent value="same_recipe">
                     <div className="mb-3">
                       <select
-                        value={compareBatch}
-                        onChange={(e) => setCompareBatch(e.target.value)}
+                        value={compareRecipe}
+                        onChange={(e) => setCompareRecipe(e.target.value)}
                         className="flex h-8 w-full rounded-md border border-input bg-background px-2 py-1 text-xs"
                       >
-                        <option value="all" className="bg-background text-foreground">-- Select Batch Size --</option>
-                        {batchOptions.map((batch) => (
-                          <option key={batch} value={batch} className="bg-background text-foreground">{batch}</option>
+                        <option value="all" className="bg-background text-foreground">-- Select Recipe --</option>
+                        {recipeOptions.map((recipe) => (
+                          <option key={recipe} value={recipe} className="bg-background text-foreground">{recipe}</option>
                         ))}
                       </select>
                     </div>
-                    {compareBatch !== "all" && groupedByBatch[compareBatch] ? (
-                      <div className="space-y-2 max-h-[45vh] overflow-y-auto pr-1 text-xs">
-                        <p className="text-muted-foreground mb-2">
-                          {groupedByBatch[compareBatch].length} result(s) with batch size <span className="font-semibold">{compareBatch}</span>
+                    {compareRecipe !== "all" && groupedByRecipe[compareRecipe] ? (
+                      <div className="space-y-2 max-h-[45vh] overflow-y-auto pr-1">
+                        <p className="text-xs text-muted-foreground mb-2">
+                          {groupedByRecipe[compareRecipe].length} result(s) with recipe <span className="font-semibold text-foreground">{compareRecipe}</span>
                         </p>
-                        {sortRecords(groupedByBatch[compareBatch]).slice(0, 10).map((row) => (
-                          <div key={row.id} className="p-2 rounded bg-muted/10 border border-border/20">
-                            <div className="text-[11px]">{row.model_name} · {row.engine_type} · NGL:{row.n_gpu_layers} · PP:{row.pp_tokens_per_second?.toFixed(1) ?? "—"} · TG:{row.tg_tokens_per_second?.toFixed(1) ?? "—"}</div>
-                          </div>
-                        ))}
+                        {sortRecords(groupedByRecipe[compareRecipe]).slice(0, 10).map((row) => {
+                          const localMax = Math.max(1, ...groupedByRecipe[compareRecipe].map((r) => Math.max(r.pp_tokens_per_second ?? 0, r.tg_tokens_per_second ?? 0)));
+                          return (
+                            <div key={row.id} className="space-y-1 p-2 rounded-md bg-muted/10 border border-border/20">
+                              <div className="flex items-center justify-between text-[11px]">
+                                <span className="font-semibold">{row.model_name}</span>
+                                <div className="flex gap-2 items-center">
+                                  <Badge variant="outline" className="text-[9px]">{row.engine_type}</Badge>
+                                  <span className="text-muted-foreground">NGL:{row.n_gpu_layers} · B:{row.batch_size} · Ctx:{row.ctx_size}</span>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="w-10 text-[10px] text-blue-300">PP</span>
+                                <div className="h-2 flex-1 rounded bg-muted/40 overflow-hidden">
+                                  <div className="h-full bg-gradient-to-r from-blue-500 to-cyan-400" style={{ width: `${((row.pp_tokens_per_second ?? 0) / localMax) * 100}%` }} />
+                                </div>
+                                <span className="w-16 text-right text-[10px] font-mono">{row.pp_tokens_per_second?.toFixed(1) ?? "—"} t/s</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="w-10 text-[10px] text-purple-300">TG</span>
+                                <div className="h-2 flex-1 rounded bg-muted/40 overflow-hidden">
+                                  <div className="h-full bg-gradient-to-r from-purple-500 to-pink-400" style={{ width: `${((row.tg_tokens_per_second ?? 0) / localMax) * 100}%` }} />
+                                </div>
+                                <span className="w-16 text-right text-[10px] font-mono">{row.tg_tokens_per_second?.toFixed(1) ?? "—"} t/s</span>
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     ) : (
-                      <p className="text-xs text-muted-foreground">Select a batch size to compare.</p>
+                      <p className="text-xs text-muted-foreground">Select a recipe to compare models across it.</p>
                     )}
                   </TabsContent>
 
-                  {/* Tab: Same GPU layers, different models/engines */}
-                  <TabsContent value="same_ngl">
+                  {/* Tab: Same context window size */}
+                  <TabsContent value="same_ctx">
                     <div className="mb-3">
                       <select
-                        value={compareNgl}
-                        onChange={(e) => setCompareNgl(e.target.value)}
+                        value={compareCtx}
+                        onChange={(e) => setCompareCtx(e.target.value)}
                         className="flex h-8 w-full rounded-md border border-input bg-background px-2 py-1 text-xs"
                       >
-                        <option value="all" className="bg-background text-foreground">-- Select GPU Layers --</option>
-                        {nglOptions.map((ngl)=> (
-                          <option key={ngl} value={ngl} className="bg-background text-foreground">{ngl}</option>
+                        <option value="all" className="bg-background text-foreground">-- Select Context Size --</option>
+                        {ctxOptions.map((ctx) => (
+                          <option key={ctx} value={ctx} className="bg-background text-foreground">{ctx.toLocaleString()} tokens</option>
                         ))}
                       </select>
                     </div>
-                    {compareNgl !== "all" && groupedByNgl[compareNgl] ? (
-                      <div className="space-y-2 max-h-[45vh] overflow-y-auto pr-1 text-xs">
-                        <p className="text-muted-foreground mb-2">
-                          {groupedByNgl[compareNgl].length} result(s) with <span className="font-semibold">{compareNgl}</span> GPU layers
+                    {compareCtx !== "all" && groupedByCtx[compareCtx] ? (
+                      <div className="space-y-2 max-h-[45vh] overflow-y-auto pr-1">
+                        <p className="text-xs text-muted-foreground mb-2">
+                          {groupedByCtx[compareCtx].length} result(s) with ctx <span className="font-semibold text-foreground">{Number(compareCtx).toLocaleString()}</span>
                         </p>
-                        {sortRecords(groupedByNgl[compareNgl]).slice(0, 10).map((row) => (
-                          <div key={row.id} className="p-2 rounded bg-muted/10 border border-border/20">
-                            <div className="text-[11px]">{row.model_name} · {row.engine_type} · B:{row.batch_size} · PP:{row.pp_tokens_per_second?.toFixed(1) ?? "—"} · TG:{row.tg_tokens_per_second?.toFixed(1) ?? "—"}</div>
-                          </div>
-                        ))}
+                        {sortRecords(groupedByCtx[compareCtx]).slice(0, 10).map((row) => {
+                          const localMax = Math.max(1, ...groupedByCtx[compareCtx].map((r) => Math.max(r.pp_tokens_per_second ?? 0, r.tg_tokens_per_second ?? 0)));
+                          return (
+                            <div key={row.id} className="space-y-1 p-2 rounded-md bg-muted/10 border border-border/20">
+                              <div className="flex items-center justify-between text-[11px]">
+                                <span className="font-semibold">{row.model_name}</span>
+                                <div className="flex gap-2 items-center">
+                                  <Badge variant="outline" className="text-[9px]">{row.engine_type}</Badge>
+                                  {row.preset_recipe && <span className="text-muted-foreground text-[9px]">{row.preset_recipe}</span>}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="w-10 text-[10px] text-blue-300">PP</span>
+                                <div className="h-2 flex-1 rounded bg-muted/40 overflow-hidden">
+                                  <div className="h-full bg-gradient-to-r from-blue-500 to-cyan-400" style={{ width: `${((row.pp_tokens_per_second ?? 0) / localMax) * 100}%` }} />
+                                </div>
+                                <span className="w-16 text-right text-[10px] font-mono">{row.pp_tokens_per_second?.toFixed(1) ?? "—"} t/s</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="w-10 text-[10px] text-purple-300">TG</span>
+                                <div className="h-2 flex-1 rounded bg-muted/40 overflow-hidden">
+                                  <div className="h-full bg-gradient-to-r from-purple-500 to-pink-400" style={{ width: `${((row.tg_tokens_per_second ?? 0) / localMax) * 100}%` }} />
+                                </div>
+                                <span className="w-16 text-right text-[10px] font-mono">{row.tg_tokens_per_second?.toFixed(1) ?? "—"} t/s</span>
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     ) : (
-                      <p className="text-xs text-muted-foreground">Select GPU layers to compare.</p>
+                      <p className="text-xs text-muted-foreground">Select a context window size to compare.</p>
                     )}
                   </TabsContent>
                 </Tabs>
@@ -862,6 +982,7 @@ export default function BenchmarksPage() {
                         <tr>
                           <th className="px-4 py-2.5 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Model</th>
                           <th className="px-4 py-2.5 text-center text-xs font-medium text-muted-foreground uppercase tracking-wider">Engine</th>
+                          <th className="px-4 py-2.5 text-center text-xs font-medium text-muted-foreground uppercase tracking-wider">Recipe</th>
                           <th className="px-4 py-2.5 text-center text-xs font-medium text-muted-foreground uppercase tracking-wider">NGL</th>
                           <th className="px-4 py-2.5 text-center text-xs font-medium text-muted-foreground uppercase tracking-wider">Batch</th>
                           <th className="px-4 py-2.5 text-center text-xs font-medium text-muted-foreground uppercase tracking-wider">Ctx</th>
@@ -876,6 +997,7 @@ export default function BenchmarksPage() {
                           <tr key={r.id} className="hover:bg-accent/30 transition-colors group">
                             <td className="px-4 py-3 font-medium text-xs">{r.model_name}</td>
                             <td className="px-4 py-3 text-center"><Badge variant="outline" className="uppercase text-[10px]">{r.engine_type}</Badge></td>
+                            <td className="px-4 py-3 text-center text-xs text-purple-400">{r.preset_recipe || <span className="text-muted-foreground">—</span>}</td>
                             <td className="px-4 py-3 text-center text-xs font-mono">{r.n_gpu_layers}</td>
                             <td className="px-4 py-3 text-center text-xs font-mono">{r.batch_size}</td>
                             <td className="px-4 py-3 text-center text-xs font-mono">{r.ctx_size}</td>

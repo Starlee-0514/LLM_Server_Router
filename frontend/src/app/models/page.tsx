@@ -21,6 +21,7 @@ import {
   getModelGroups,
   getRuntimes,
   getSettings,
+  updateSettings,
   createModelGroup,
   updateModelGroup,
   deleteModelGroup,
@@ -39,17 +40,24 @@ import {
 import {
   PRESET_RECIPES,
   PRESET_FAMILY_OPTIONS,
+  PRESET_RECIPE_GROUPS,
+  MODEL_CLASSIFICATION_OPTIONS,
+  MODEL_MODALITY_OPTIONS,
   applyPresetRecipe,
   buildExtraArgs,
   buildLaunchPreview,
   createDefaultLaunchOptions,
   getPresetRecipe,
-  groupPresetRecipes,
+  groupRecipesForFamily,
   inferPresetFamily,
   inferPresetRecipeKey,
+  inferModelClassification,
+  inferModality,
+  inferThinkingCapable,
   parseExtraArgs,
   type LaunchOptionDraft,
   type PresetFamily,
+  type PresetRecipe,
 } from "@/lib/model-preset-recipes";
 
 type ModelSortKey = "filename" | "param_size" | "quantize" | "size_bytes" | "arch";
@@ -115,10 +123,21 @@ export default function ModelsPage() {
   const [workbenchOptions, setWorkbenchOptions] = useState<LaunchOptionDraft>(createDefaultLaunchOptions());
   const [savingWorkbench, setSavingWorkbench] = useState(false);
 
+  // Custom recipes (user-defined, persisted in backend settings)
+  const [customRecipes, setCustomRecipes] = useState<PresetRecipe[]>([]);
+  const [recipeManagerOpen, setRecipeManagerOpen] = useState(false);
+  const [editingRecipe, setEditingRecipe] = useState<PresetRecipe | null>(null);
+  const [recipeForm, setRecipeForm] = useState<PresetRecipe>({
+    key: "", label: "", family: "universal", description: "", tags: [],
+    ngl: 999, batch: 1024, ubatch: 512, ctx: 8192,
+    options: { flashAttn: true, contBatching: false, parallelSlots: 1 },
+  });
+  const [savingRecipes, setSavingRecipes] = useState(false);
+
   const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : "Unknown error";
   const compiledExtraArgs = buildExtraArgs(launchOptions);
   const selectedRecipe = getPresetRecipe(selectedRecipeKey);
-  const recipeGroups = groupPresetRecipes();
+  const allRecipes = [...PRESET_RECIPES, ...customRecipes];
   const selectedWorkbenchGroup = groups.find((group) => group.id === selectedWorkbenchId) ?? null;
   const workbenchExtraArgs = buildExtraArgs(workbenchOptions);
   const workbenchRecipe = getPresetRecipe(workbenchRecipeKey);
@@ -323,6 +342,9 @@ export default function ModelsPage() {
 
       const savedDefaultRuntime = settingsItems.find((item) => item.key === "default_engine")?.value ?? "";
       setDefaultRuntimeName(savedDefaultRuntime || runtimeItems[0]?.name || "");
+
+      const customRecipesRaw = settingsItems.find((item) => item.key === "custom_preset_recipes")?.value ?? "[]";
+      try { setCustomRecipes(JSON.parse(customRecipesRaw)); } catch { setCustomRecipes([]); }
     } catch {}
   }, []);
 
@@ -351,6 +373,43 @@ export default function ModelsPage() {
     setOvTags(existing?.tags || "");
     setOvNotes(existing?.notes || "");
     setOverrideDialogOpen(true);
+  };
+
+  // --- Recipe CRUD helpers ---
+  const saveCustomRecipesList = async (next: PresetRecipe[]) => {
+    setSavingRecipes(true);
+    try {
+      await updateSettings([{ key: "custom_preset_recipes", value: JSON.stringify(next) }]);
+      setCustomRecipes(next);
+    } finally {
+      setSavingRecipes(false);
+    }
+  };
+
+  const openNewRecipeForm = () => {
+    setEditingRecipe(null);
+    setRecipeForm({ key: "", label: "", family: "universal", description: "", tags: [], ngl: 999, batch: 1024, ubatch: 512, ctx: 8192, options: { flashAttn: true, contBatching: false, parallelSlots: 1 } });
+  };
+
+  const openEditRecipeForm = (r: PresetRecipe) => {
+    setEditingRecipe(r);
+    setRecipeForm({ ...r });
+  };
+
+  const handleSaveRecipeForm = async () => {
+    const key = recipeForm.key.trim();
+    if (!key || !recipeForm.label.trim()) return;
+    const isBuiltIn = PRESET_RECIPES.some((r) => r.key === key);
+    if (isBuiltIn) return; // cannot overwrite built-ins
+    const next = editingRecipe
+      ? customRecipes.map((r) => (r.key === editingRecipe.key ? { ...recipeForm, key } : r))
+      : [...customRecipes.filter((r) => r.key !== key), { ...recipeForm, key }];
+    await saveCustomRecipesList(next);
+    setEditingRecipe(null);
+  };
+
+  const handleDeleteCustomRecipe = async (recipeKey: string) => {
+    await saveCustomRecipesList(customRecipes.filter((r) => r.key !== recipeKey));
   };
 
   const handleSaveOverride = async () => {
@@ -598,7 +657,7 @@ export default function ModelsPage() {
                               }}
                               className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                             >
-                              {PRESET_FAMILY_OPTIONS.map((option) => (
+                              {MODEL_CLASSIFICATION_OPTIONS.map((option) => (
                                 <option key={option.value} value={option.value}>{option.label}</option>
                               ))}
                             </select>
@@ -610,10 +669,10 @@ export default function ModelsPage() {
                               onChange={(e) => applyRecipe(e.target.value)}
                               className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                             >
-                              {recipeGroups.map((group) => (
+                              {groupRecipesForFamily(newModelFamily, allRecipes).map((group) => (
                                 <optgroup key={group.key} label={group.label}>
                                   {group.recipes.map((recipe) => (
-                                    <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
+                                    <option key={recipe.key} value={recipe.key}>{recipe.label}{recipe.family === "universal" && newModelFamily !== "universal" ? " ✦" : ""}</option>
                                   ))}
                                 </optgroup>
                               ))}
@@ -864,12 +923,6 @@ export default function ModelsPage() {
                     <div className="grid gap-3 max-h-[60vh] overflow-y-auto pr-1">
                       {groupedModels[gn].map((g) => {
                         const running = isRunning(g.name);
-                        const presetFamily = inferPresetFamily({
-                          model_family: g.model_family,
-                          filename: g.name,
-                          arch: g.description,
-                          model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text",
-                        });
                         return (
                           <Card
                             key={g.id}
@@ -881,7 +934,13 @@ export default function ModelsPage() {
                                 <div className="flex items-center gap-2">
                                   <p className="font-semibold text-sm truncate">{g.name}</p>
                                   <Badge variant="outline" className="uppercase text-[10px]">{g.engine_type}</Badge>
-                                  <Badge variant="secondary" className="uppercase text-[9px] tracking-[0.18em]">{presetFamily}</Badge>
+                                  <Badge variant="secondary" className="uppercase text-[9px] tracking-[0.18em]">{inferModelClassification({ ...g, filename: g.name, arch: g.description, model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text" })}</Badge>
+                                  {inferModality({ ...g, filename: g.name, arch: g.description, model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text" }) === "vision" && (
+                                    <Badge className="bg-cyan-500/20 text-cyan-300 border-cyan-400/30 text-[9px]">Vision</Badge>
+                                  )}
+                                  {inferThinkingCapable({ ...g, filename: g.name, arch: g.description }) && (
+                                    <Badge className="bg-violet-500/20 text-violet-300 border-violet-400/30 text-[9px]">Thinking</Badge>
+                                  )}
                                   {running && <Badge className="bg-emerald-500/20 text-emerald-400 text-[10px]">Running</Badge>}
                                 </div>
                                 {g.description && <p className="text-xs text-muted-foreground mt-0.5">{g.description}</p>}
@@ -889,16 +948,7 @@ export default function ModelsPage() {
                                 <div className="mt-2 grid gap-2 md:grid-cols-2">
                                   <div className="grid gap-1">
                                     <Label className="text-[10px] text-muted-foreground">Classification</Label>
-                                    <select
-                                      value={g.model_family || presetFamily}
-                                      onChange={(e) => void handleInlinePresetUpdate(g, { model_family: e.target.value as PresetFamily })}
-                                      disabled={savingPresetMetaId === g.id}
-                                      className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
-                                    >
-                                      {PRESET_FAMILY_OPTIONS.map((option) => (
-                                        <option key={option.value} value={option.value}>{option.label}</option>
-                                      ))}
-                                    </select>
+                                    <p className="text-xs font-medium px-2 py-1">{inferModelClassification({ ...g, filename: g.name, arch: g.description, model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text" }) === "moe" ? "Mixture of Experts" : "Dense"}</p>
                                   </div>
                                   <div className="grid gap-1">
                                     <Label className="text-[10px] text-muted-foreground">Recipe</Label>
@@ -908,7 +958,7 @@ export default function ModelsPage() {
                                       disabled={savingPresetMetaId === g.id}
                                       className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
                                     >
-                                      {recipeGroups.map((group) => (
+                                      {groupRecipesForFamily((g.model_family || inferPresetFamily(g)) as PresetFamily, allRecipes).map((group) => (
                                         <optgroup key={group.key} label={group.label}>
                                           {group.recipes.map((recipe) => (
                                             <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
@@ -1035,9 +1085,10 @@ export default function ModelsPage() {
                       <CardTitle className="text-sm flex items-center justify-between gap-2">
                         <span className="truncate">{m.arch || m.filename}</span>
                         <div className="flex items-center gap-2 shrink-0">
-                          <Badge variant="secondary" className="text-[9px] uppercase tracking-[0.18em]">{inferPresetFamily(m)}</Badge>
+                          <Badge variant="secondary" className="text-[9px] uppercase tracking-[0.18em]">{inferModelClassification(m)}</Badge>
+                          {inferModality(m) === "vision" && <Badge className="bg-cyan-500/20 text-cyan-300 border-cyan-400/30 text-[9px]">Vision</Badge>}
+                          {inferThinkingCapable(m) && <Badge className="bg-violet-500/20 text-violet-300 border-violet-400/30 text-[9px]">Thinking</Badge>}
                           {hasOverride(m.filepath) && <Badge className="bg-amber-500/20 text-amber-300 border-amber-400/30 text-[9px]">Custom</Badge>}
-                          {modelTypeBadge(m.model_type)}
                           {m.quantize ? <Badge variant="outline" className="text-[10px]">{m.quantize}</Badge> : null}
                         </div>
                       </CardTitle>
@@ -1117,147 +1168,152 @@ export default function ModelsPage() {
           <div className="min-w-0 xl:sticky xl:top-8 xl:self-start">
             <div className="mb-3 flex items-center justify-between gap-3">
               <h2 className="text-lg font-semibold">Recipe Setups</h2>
-              {selectedWorkbenchGroup && (
-                <Badge variant="secondary" className="uppercase text-[10px] tracking-[0.18em]">
-                  {selectedWorkbenchGroup.group_name}
-                </Badge>
-              )}
+              <Button variant="outline" size="sm" className="text-[11px] h-7 px-2" onClick={openNewRecipeForm}>
+                + New Recipe
+              </Button>
             </div>
             <Card className="border-cyan-400/20 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.14),transparent_42%),rgba(2,6,23,0.82)] text-slate-100 shadow-[0_18px_50px_-28px_rgba(34,211,238,0.55)]">
               <CardContent className="space-y-4 pt-6">
-                {selectedWorkbenchGroup ? (
-                  <>
-                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Focused preset</p>
-                      <p className="mt-2 text-base font-semibold text-white">{selectedWorkbenchGroup.name}</p>
-                      <p className="mt-1 text-xs text-slate-400">{selectedWorkbenchGroup.model_path}</p>
-                    </div>
-
-                    <div className="grid gap-2">
-                      <Label className="text-xs text-slate-300">Preset Target</Label>
-                      <select
-                        value={selectedWorkbenchGroup.id}
-                        onChange={(e) => {
-                          const nextGroup = groups.find((group) => group.id === Number(e.target.value));
-                          if (nextGroup) loadWorkbenchFromGroup(nextGroup);
-                        }}
-                        className="flex h-9 w-full rounded-md border border-white/10 bg-black/30 px-3 py-1 text-sm text-white shadow-xs"
-                      >
-                        {[...groups].sort((a, b) => a.group_name.localeCompare(b.group_name) || a.name.localeCompare(b.name)).map((group) => (
-                          <option key={group.id} value={group.id} className="bg-slate-950 text-white">
-                            {group.group_name} / {group.name}
-                          </option>
+                {/* Recipe list */}
+                <div className="max-h-[30vh] overflow-y-auto space-y-1 pr-1">
+                  <p className="text-[10px] uppercase tracking-widest text-slate-400 mb-2">Built-in</p>
+                  {PRESET_RECIPE_GROUPS.map((group) => {
+                    const builtIns = PRESET_RECIPES.filter((r) => r.family === group.key);
+                    if (!builtIns.length) return null;
+                    return (
+                      <div key={group.key}>
+                        <p className="text-[9px] uppercase tracking-widest text-slate-500 mt-2 mb-1 pl-1">{group.label}</p>
+                        {builtIns.map((r) => (
+                          <button
+                            key={r.key}
+                            type="button"
+                            onClick={() => openEditRecipeForm({ ...r })}
+                            className={`w-full text-left rounded-lg px-2 py-1.5 text-xs transition-colors ${editingRecipe?.key === r.key ? "bg-cyan-500/20 text-cyan-100" : "hover:bg-white/5 text-slate-300"}`}
+                          >
+                            {r.label}
+                            <span className="ml-1 text-[9px] opacity-50">built-in</span>
+                          </button>
                         ))}
+                      </div>
+                    );
+                  })}
+
+                  <p className="text-[10px] uppercase tracking-widest text-slate-400 mb-2 mt-4">Custom</p>
+                  {customRecipes.length === 0 && <p className="text-[11px] text-slate-500 pl-1">None yet.</p>}
+                  {customRecipes.map((r) => (
+                    <button
+                      key={r.key}
+                      type="button"
+                      onClick={() => openEditRecipeForm(r)}
+                      className={`w-full text-left rounded-lg px-2 py-1.5 text-xs transition-colors ${editingRecipe?.key === r.key ? "bg-cyan-500/20 text-cyan-100" : "hover:bg-white/5 text-slate-300"}`}
+                    >
+                      {r.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Recipe detail / edit form */}
+                {editingRecipe && PRESET_RECIPES.some((r) => r.key === editingRecipe.key) ? (
+                  <div className="space-y-3 border-t border-white/10 pt-4">
+                    <div className="flex items-center gap-2">
+                      <Badge className="bg-cyan-500/15 text-cyan-200 text-[10px]">Built-in · read-only</Badge>
+                      <Badge variant="outline" className="text-[10px] text-slate-300">{editingRecipe.family}</Badge>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-3 space-y-2 text-sm text-slate-200">
+                      <p><span className="text-slate-400 text-xs">Key:</span> <span className="font-mono text-xs">{editingRecipe.key}</span></p>
+                      <p><span className="text-slate-400 text-xs">Label:</span> {editingRecipe.label}</p>
+                      <p><span className="text-slate-400 text-xs">Description:</span> {editingRecipe.description}</p>
+                      <p><span className="text-slate-400 text-xs">NGL / Batch / UBatch / Ctx:</span> {editingRecipe.ngl} / {editingRecipe.batch} / {editingRecipe.ubatch} / {editingRecipe.ctx}</p>
+                      <p><span className="text-slate-400 text-xs">Tags:</span> {editingRecipe.tags.join(", ") || "—"}</p>
+                    </div>
+                    <Button variant="outline" size="sm" className="text-xs border-white/10 text-slate-200 hover:bg-white/10" onClick={() => {
+                      openNewRecipeForm();
+                      setRecipeForm({ ...editingRecipe, key: editingRecipe.key + "-custom", label: editingRecipe.label + " (Custom)" });
+                    }}>Clone as Custom</Button>
+                  </div>
+                ) : (
+                  <div className="space-y-3 border-t border-white/10 pt-4">
+                    <div className="flex items-center gap-2">
+                      <Badge className="bg-cyan-500/15 text-cyan-200 text-[10px]">{editingRecipe ? "Edit" : "New recipe"}</Badge>
+                      {editingRecipe && (
+                        <Button variant="ghost" size="sm" className="text-xs h-6 text-red-400 hover:text-red-300 ml-auto" onClick={() => { void handleDeleteCustomRecipe(editingRecipe.key); openNewRecipeForm(); }}>
+                          Delete
+                        </Button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid gap-1">
+                        <Label className="text-xs text-slate-300">Key</Label>
+                        <Input value={recipeForm.key} onChange={(e) => setRecipeForm((f) => ({ ...f, key: e.target.value.replace(/\s/g, "-") }))} placeholder="my-dense-heavy" className="text-xs font-mono border-white/10 bg-black/30 text-white" disabled={!!editingRecipe} />
+                      </div>
+                      <div className="grid gap-1">
+                        <Label className="text-xs text-slate-300">Label</Label>
+                        <Input value={recipeForm.label} onChange={(e) => setRecipeForm((f) => ({ ...f, label: e.target.value }))} placeholder="My Dense Heavy" className="text-xs border-white/10 bg-black/30 text-white" />
+                      </div>
+                    </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs text-slate-300">Family</Label>
+                      <select value={recipeForm.family} onChange={(e) => setRecipeForm((f) => ({ ...f, family: e.target.value as PresetFamily }))} className="flex h-9 w-full rounded-md border border-white/10 bg-black/30 px-3 py-1 text-sm text-white shadow-xs">
+                        {PRESET_FAMILY_OPTIONS.map((opt) => <option key={opt.value} value={opt.value} className="bg-slate-950 text-white">{opt.label}</option>)}
                       </select>
                     </div>
-
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div className="grid gap-2">
-                        <Label className="text-xs text-slate-300">Model Classification</Label>
-                        <select
-                          value={workbenchFamily}
-                          onChange={(e) => {
-                            setWorkbenchFamily(e.target.value as PresetFamily);
-                          }}
-                          className="flex h-9 w-full rounded-md border border-white/10 bg-black/30 px-3 py-1 text-sm text-white shadow-xs"
-                        >
-                          {PRESET_FAMILY_OPTIONS.map((option) => (
-                            <option key={option.value} value={option.value} className="bg-slate-950 text-white">{option.label}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="grid gap-2">
-                        <Label className="text-xs text-slate-300">Recipe Setup</Label>
-                        <select
-                          value={workbenchRecipeKey}
-                          onChange={(e) => applyWorkbenchRecipe(e.target.value)}
-                          className="flex h-9 w-full rounded-md border border-white/10 bg-black/30 px-3 py-1 text-sm text-white shadow-xs"
-                        >
-                          {recipeGroups.map((group) => (
-                            <optgroup key={group.key} label={group.label}>
-                              {group.recipes.map((recipe) => (
-                                <option key={recipe.key} value={recipe.key} className="bg-slate-950 text-white">{recipe.label}</option>
-                              ))}
-                            </optgroup>
-                          ))}
-                        </select>
-                      </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs text-slate-300">Description</Label>
+                      <Input value={recipeForm.description} onChange={(e) => setRecipeForm((f) => ({ ...f, description: e.target.value }))} placeholder="Short description" className="text-xs border-white/10 bg-black/30 text-white" />
                     </div>
-
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <div className="grid gap-2">
-                        <Label className="text-xs text-slate-300">GPU Layers</Label>
-                        <Input type="number" value={workbenchNgl} onChange={(e) => setWorkbenchNgl(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
-                      </div>
-                      <div className="grid gap-2">
-                        <Label className="text-xs text-slate-300">Batch</Label>
-                        <Input type="number" value={workbenchBatch} onChange={(e) => setWorkbenchBatch(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
-                      </div>
-                      <div className="grid gap-2">
-                        <Label className="text-xs text-slate-300">UBatch</Label>
-                        <Input type="number" value={workbenchUbatch} onChange={(e) => setWorkbenchUbatch(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
-                      </div>
-                      <div className="grid gap-2">
-                        <Label className="text-xs text-slate-300">Context</Label>
-                        <Input type="number" value={workbenchCtx} onChange={(e) => setWorkbenchCtx(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
-                      </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs text-slate-300">Tags <span className="text-slate-500">(comma-separated)</span></Label>
+                      <Input value={recipeForm.tags.join(", ")} onChange={(e) => setRecipeForm((f) => ({ ...f, tags: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) }))} placeholder="dense, fast, custom" className="text-xs border-white/10 bg-black/30 text-white" />
                     </div>
-
-                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <p className="text-sm font-semibold text-white">{workbenchRecipe.label}</p>
-                          <p className="mt-1 text-[11px] text-slate-400">{workbenchRecipe.description}</p>
+                    <div className="grid grid-cols-4 gap-2">
+                      {(["ngl", "batch", "ubatch", "ctx"] as const).map((field) => (
+                        <div key={field} className="grid gap-1">
+                          <Label className="text-xs uppercase text-slate-300">{field}</Label>
+                          <Input type="number" value={recipeForm[field]} onChange={(e) => setRecipeForm((f) => ({ ...f, [field]: +e.target.value }))} className="text-xs border-white/10 bg-black/30 text-white" />
                         </div>
-                        <Badge variant="outline" className="uppercase text-[10px] tracking-[0.18em] text-cyan-100">
-                          {workbenchFamily}
-                        </Badge>
-                      </div>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {workbenchRecipe.tags.map((tag) => (
-                          <Badge key={tag} className="bg-cyan-500/15 text-cyan-200">{tag}</Badge>
+                      ))}
+                    </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs text-slate-300">Options</Label>
+                      <div className="flex flex-wrap gap-3 text-xs text-slate-200">
+                        {(["flashAttn", "contBatching", "mlock", "noMmap", "noKvOffload"] as const).map((opt) => (
+                          <label key={opt} className="flex items-center gap-1 cursor-pointer">
+                            <input type="checkbox" checked={!!(recipeForm.options as Record<string, unknown>)[opt]} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, [opt]: e.target.checked } }))} />
+                            {opt}
+                          </label>
                         ))}
+                        <label className="flex items-center gap-1 text-xs cursor-pointer">
+                          parallelSlots:
+                          <Input type="number" className="w-16 h-6 text-xs px-1 border-white/10 bg-black/30 text-white" value={recipeForm.options.parallelSlots ?? 1} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, parallelSlots: +e.target.value } }))} />
+                        </label>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <label className="grid gap-1 text-xs">
+                          <span className="text-slate-400">KV Cache Type K</span>
+                          <Input value={recipeForm.options.cacheTypeK ?? ""} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, cacheTypeK: e.target.value } }))} placeholder="e.g. q8_0" className="h-6 text-xs px-1 border-white/10 bg-black/30 text-white font-mono" />
+                        </label>
+                        <label className="grid gap-1 text-xs">
+                          <span className="text-slate-400">KV Cache Type V</span>
+                          <Input value={recipeForm.options.cacheTypeV ?? ""} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, cacheTypeV: e.target.value } }))} placeholder="e.g. q8_0" className="h-6 text-xs px-1 border-white/10 bg-black/30 text-white font-mono" />
+                        </label>
                       </div>
                     </div>
-
-                    <div className="grid gap-2">
-                      <Label className="text-xs text-slate-300">Generated CLI Args</Label>
-                      <Textarea value={workbenchExtraArgs} readOnly className="min-h-24 border-white/10 bg-black/30 font-mono text-xs text-slate-200" />
-                    </div>
-
-                    <div className="rounded-2xl border border-cyan-400/20 bg-cyan-500/8 p-4">
-                      <p className="text-[11px] uppercase tracking-[0.18em] text-cyan-200">Launch Preview</p>
-                      <p className="mt-2 break-all font-mono text-[10px] text-cyan-100/85">{workbenchPreview}</p>
-                    </div>
-
-                    <div className="flex gap-2">
-                      <Button
-                        variant="outline"
-                        className="flex-1 border-white/10 bg-black/20 text-white hover:bg-white/10"
-                        onClick={() => loadWorkbenchFromGroup(selectedWorkbenchGroup)}
-                        disabled={savingWorkbench}
-                      >
-                        Reset
-                      </Button>
-                      <Button
-                        className="flex-1 bg-gradient-to-r from-cyan-500 to-blue-500 text-white shadow-lg shadow-cyan-500/20"
-                        onClick={handleSaveWorkbench}
-                        disabled={savingWorkbench}
-                      >
-                        {savingWorkbench ? "Saving..." : "Save Recipe Setup"}
-                      </Button>
-                    </div>
-
-                    <p className="text-[11px] text-slate-400">
-                      Use the dialog for advanced launch switches. This column keeps model classification, recipe setup, and tuning edits visible without mixing them together.
-                    </p>
-                  </>
-                ) : (
-                  <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 p-6 text-center">
-                    <p className="text-sm text-slate-300">Select a model group to tune its recipe.</p>
-                    <p className="mt-1 text-xs text-slate-500">The workbench follows the active group tab automatically.</p>
+                    <Button
+                      className="w-full bg-gradient-to-r from-cyan-500 to-blue-500 text-white shadow-lg shadow-cyan-500/20"
+                      onClick={() => void handleSaveRecipeForm()}
+                      disabled={savingRecipes || !recipeForm.key.trim() || !recipeForm.label.trim() || PRESET_RECIPES.some((r) => r.key === recipeForm.key.trim())}
+                    >
+                      {savingRecipes ? "Saving..." : (editingRecipe ? "Update Recipe" : "Create Recipe")}
+                    </Button>
+                    {PRESET_RECIPES.some((r) => r.key === recipeForm.key.trim()) && (
+                      <p className="text-xs text-red-400">Key conflicts with a built-in recipe. Choose a different key.</p>
+                    )}
                   </div>
                 )}
+
+                <p className="text-[11px] text-slate-400">
+                  Recipe setups are independent templates. Apply them to any model group via the group&#39;s Recipe dropdown.
+                </p>
               </CardContent>
             </Card>
           </div>
@@ -1300,7 +1356,7 @@ export default function ModelsPage() {
                 <div className="grid gap-2">
                   <Label className="text-xs">Model Classification</Label>
                   <select value={ovModelFamily} onChange={(e) => setOvModelFamily(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs">
-                    {PRESET_FAMILY_OPTIONS.map((option) => (
+                    {MODEL_CLASSIFICATION_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>{option.label}</option>
                     ))}
                   </select>
@@ -1321,6 +1377,159 @@ export default function ModelsPage() {
                 </div>
               </div>
             )}
+          </DialogContent>
+        </Dialog>
+
+        {/* Recipe Manager Dialog */}
+        <Dialog open={recipeManagerOpen} onOpenChange={setRecipeManagerOpen}>
+          <DialogContent className="sm:max-w-2xl max-h-[88vh] overflow-hidden flex flex-col">
+            <DialogHeader>
+              <DialogTitle>Manage Recipes</DialogTitle>
+            </DialogHeader>
+            <div className="flex flex-1 gap-4 overflow-hidden min-h-0">
+              {/* Left: recipe list */}
+              <div className="w-52 shrink-0 overflow-y-auto space-y-1 pr-1">
+                <p className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2">Built-in</p>
+                {PRESET_RECIPE_GROUPS.map((group) => {
+                  const builtIns = PRESET_RECIPES.filter((r) => r.family === group.key);
+                  if (!builtIns.length) return null;
+                  return (
+                    <div key={group.key}>
+                      <p className="text-[9px] uppercase tracking-widest text-muted-foreground/60 mt-2 mb-1 pl-1">{group.label}</p>
+                      {builtIns.map((r) => (
+                        <button
+                          key={r.key}
+                          type="button"
+                          onClick={() => openEditRecipeForm({ ...r })}
+                          className={`w-full text-left rounded-lg px-2 py-1.5 text-xs transition-colors ${editingRecipe?.key === r.key ? "bg-accent text-accent-foreground" : "hover:bg-accent/50 text-muted-foreground"}`}
+                        >
+                          {r.label}
+                          <span className="ml-1 text-[9px] opacity-50">built-in</span>
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })}
+
+                <p className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 mt-4">Custom</p>
+                {customRecipes.length === 0 && <p className="text-[11px] text-muted-foreground pl-1">None yet.</p>}
+                {customRecipes.map((r) => (
+                  <button
+                    key={r.key}
+                    type="button"
+                    onClick={() => openEditRecipeForm(r)}
+                    className={`w-full text-left rounded-lg px-2 py-1.5 text-xs transition-colors ${editingRecipe?.key === r.key ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"}`}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+                <Button variant="outline" size="sm" className="w-full mt-3 text-xs h-7" onClick={openNewRecipeForm}>+ New Recipe</Button>
+              </div>
+
+              {/* Right: edit/view form */}
+              <div className="flex-1 overflow-y-auto space-y-3 pl-2">
+                {editingRecipe && PRESET_RECIPES.some((r) => r.key === editingRecipe.key) ? (
+                  // Built-in: read-only view
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <Badge variant="secondary" className="text-[10px]">Built-in · read-only</Badge>
+                      <Badge variant="outline" className="text-[10px]">{editingRecipe.family}</Badge>
+                    </div>
+                    <div className="rounded-lg border border-border/50 bg-card/40 p-3 space-y-2 text-sm">
+                      <p><span className="text-muted-foreground text-xs">Key:</span> <span className="font-mono text-xs">{editingRecipe.key}</span></p>
+                      <p><span className="text-muted-foreground text-xs">Label:</span> {editingRecipe.label}</p>
+                      <p><span className="text-muted-foreground text-xs">Description:</span> {editingRecipe.description}</p>
+                      <p><span className="text-muted-foreground text-xs">NGL / Batch / UBatch / Ctx:</span> {editingRecipe.ngl} / {editingRecipe.batch} / {editingRecipe.ubatch} / {editingRecipe.ctx}</p>
+                      <p><span className="text-muted-foreground text-xs">Tags:</span> {editingRecipe.tags.join(", ") || "—"}</p>
+                      <p className="text-xs text-muted-foreground mt-2">Built-in recipes cannot be modified. Create a custom recipe to override behaviour.</p>
+                    </div>
+                    <Button variant="outline" size="sm" className="text-xs" onClick={() => {
+                      openNewRecipeForm();
+                      setRecipeForm({ ...editingRecipe, key: editingRecipe.key + "-custom", label: editingRecipe.label + " (Custom)" });
+                    }}>Clone as Custom</Button>
+                  </div>
+                ) : (
+                  // New / custom: full edit form
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <Badge variant="secondary" className="text-[10px]">{editingRecipe ? "Edit" : "New recipe"}</Badge>
+                      {editingRecipe && (
+                        <Button variant="ghost" size="sm" className="text-xs h-6 text-destructive hover:text-destructive ml-auto" onClick={() => { void handleDeleteCustomRecipe(editingRecipe.key); openNewRecipeForm(); }}>
+                          Delete
+                        </Button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid gap-1">
+                        <Label className="text-xs">Key <span className="text-muted-foreground">(unique, no spaces)</span></Label>
+                        <Input value={recipeForm.key} onChange={(e) => setRecipeForm((f) => ({ ...f, key: e.target.value.replace(/\s/g, "-") }))} placeholder="my-dense-heavy" className="text-xs font-mono" disabled={!!editingRecipe} />
+                      </div>
+                      <div className="grid gap-1">
+                        <Label className="text-xs">Label</Label>
+                        <Input value={recipeForm.label} onChange={(e) => setRecipeForm((f) => ({ ...f, label: e.target.value }))} placeholder="My Dense Heavy" className="text-xs" />
+                      </div>
+                    </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs">Family</Label>
+                      <select value={recipeForm.family} onChange={(e) => setRecipeForm((f) => ({ ...f, family: e.target.value as PresetFamily }))} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                        {PRESET_FAMILY_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs">Description</Label>
+                      <Input value={recipeForm.description} onChange={(e) => setRecipeForm((f) => ({ ...f, description: e.target.value }))} placeholder="Short description of this recipe" className="text-xs" />
+                    </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs">Tags <span className="text-muted-foreground">(comma-separated)</span></Label>
+                      <Input value={recipeForm.tags.join(", ")} onChange={(e) => setRecipeForm((f) => ({ ...f, tags: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) }))} placeholder="dense, fast, custom" className="text-xs" />
+                    </div>
+                    <div className="grid grid-cols-4 gap-2">
+                      {(["ngl", "batch", "ubatch", "ctx"] as const).map((field) => (
+                        <div key={field} className="grid gap-1">
+                          <Label className="text-xs uppercase">{field}</Label>
+                          <Input type="number" value={recipeForm[field]} onChange={(e) => setRecipeForm((f) => ({ ...f, [field]: +e.target.value }))} className="text-xs" />
+                        </div>
+                      ))}
+                    </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs">Options</Label>
+                      <div className="flex flex-wrap gap-3 text-xs">
+                        {(["flashAttn", "contBatching", "mlock", "noMmap", "noKvOffload"] as const).map((opt) => (
+                          <label key={opt} className="flex items-center gap-1 cursor-pointer">
+                            <input type="checkbox" checked={!!(recipeForm.options as Record<string, unknown>)[opt]} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, [opt]: e.target.checked } }))} />
+                            {opt}
+                          </label>
+                        ))}
+                        <label className="flex items-center gap-1 text-xs cursor-pointer">
+                          parallelSlots:
+                          <Input type="number" className="w-16 h-6 text-xs px-1" value={recipeForm.options.parallelSlots ?? 1} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, parallelSlots: +e.target.value } }))} />
+                        </label>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <label className="grid gap-1 text-xs">
+                          <span className="text-muted-foreground">KV Cache Type K</span>
+                          <Input value={recipeForm.options.cacheTypeK ?? ""} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, cacheTypeK: e.target.value } }))} placeholder="e.g. q8_0" className="h-6 text-xs px-1 font-mono" />
+                        </label>
+                        <label className="grid gap-1 text-xs">
+                          <span className="text-muted-foreground">KV Cache Type V</span>
+                          <Input value={recipeForm.options.cacheTypeV ?? ""} onChange={(e) => setRecipeForm((f) => ({ ...f, options: { ...f.options, cacheTypeV: e.target.value } }))} placeholder="e.g. q8_0" className="h-6 text-xs px-1 font-mono" />
+                        </label>
+                      </div>
+                    </div>
+                    <Button
+                      className="w-full"
+                      onClick={() => void handleSaveRecipeForm()}
+                      disabled={savingRecipes || !recipeForm.key.trim() || !recipeForm.label.trim() || PRESET_RECIPES.some((r) => r.key === recipeForm.key.trim())}
+                    >
+                      {savingRecipes ? "Saving..." : (editingRecipe ? "Update Recipe" : "Create Recipe")}
+                    </Button>
+                    {PRESET_RECIPES.some((r) => r.key === recipeForm.key.trim()) && (
+                      <p className="text-xs text-destructive">Key conflicts with a built-in recipe. Choose a different key.</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
           </DialogContent>
         </Dialog>
       </main>
