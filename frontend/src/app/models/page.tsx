@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Sidebar from "@/components/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -18,16 +19,39 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   scanModels,
   getModelGroups,
+  getRuntimes,
+  getSettings,
   createModelGroup,
   updateModelGroup,
   deleteModelGroup,
   launchModelGroup,
   stopProcess,
   getAllProcessStatus,
+  getModelOverrides,
+  upsertModelOverride,
+  deleteModelOverride,
   type GGUFFileInfo,
   type ModelGroup,
   type AllProcessesStatus,
+  type ModelPropertyOverride,
+  type Runtime,
 } from "@/lib/api";
+import {
+  PRESET_RECIPES,
+  PRESET_FAMILY_OPTIONS,
+  applyPresetRecipe,
+  buildExtraArgs,
+  buildLaunchPreview,
+  createDefaultLaunchOptions,
+  getPresetRecipe,
+  inferPresetFamily,
+  inferPresetRecipeKey,
+  parseExtraArgs,
+  type LaunchOptionDraft,
+  type PresetFamily,
+} from "@/lib/model-preset-recipes";
+
+type ModelSortKey = "filename" | "param_size" | "quantize" | "size_bytes" | "arch";
 
 export default function ModelsPage() {
   const [models, setModels] = useState<GGUFFileInfo[]>([]);
@@ -42,37 +66,93 @@ export default function ModelsPage() {
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [newPath, setNewPath] = useState("");
-  const [newEngine, setNewEngine] = useState("rocm");
+  const [newEngine, setNewEngine] = useState("");
   const [newNgl, setNewNgl] = useState(999);
   const [newBatch, setNewBatch] = useState(2048);
   const [newUbatch, setNewUbatch] = useState(512);
   const [newCtx, setNewCtx] = useState(8192);
+  const [newModelFamily, setNewModelFamily] = useState<PresetFamily>("universal");
+  const [selectedRecipeKey, setSelectedRecipeKey] = useState("universal-balanced");
+  const [launchOptions, setLaunchOptions] = useState<LaunchOptionDraft>(createDefaultLaunchOptions());
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingGroupId, setEditingGroupId] = useState<number | null>(null);
+  const [runtimes, setRuntimes] = useState<Runtime[]>([]);
+  const [defaultRuntimeName, setDefaultRuntimeName] = useState("");
 
   // Filters
   const [searchQuery, setSearchQuery] = useState("");
   const [filterQuant, setFilterQuant] = useState("");
   const [filterParamSize, setFilterParamSize] = useState("");
+  const [filterArch, setFilterArch] = useState("");
+  const [filterPublisher, setFilterPublisher] = useState("");
+  const [filterModelType, setFilterModelType] = useState("");
+  const [activeGroupTab, setActiveGroupTab] = useState<string | null>(null);
+
+  // Model property override state
+  const [overrides, setOverrides] = useState<ModelPropertyOverride[]>([]);
+  const [overrideDialogOpen, setOverrideDialogOpen] = useState(false);
+  const [overrideTarget, setOverrideTarget] = useState<GGUFFileInfo | null>(null);
+  const [ovDisplayName, setOvDisplayName] = useState("");
+  const [ovPublisher, setOvPublisher] = useState("");
+  const [ovQuantize, setOvQuantize] = useState("");
+  const [ovParamSize, setOvParamSize] = useState("");
+  const [ovArch, setOvArch] = useState("");
+  const [ovModelFamily, setOvModelFamily] = useState("");
+  const [ovTags, setOvTags] = useState("");
+  const [ovNotes, setOvNotes] = useState("");
+  const [savingPresetMetaId, setSavingPresetMetaId] = useState<number | null>(null);
+
+  const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : "Unknown error";
+  const compiledExtraArgs = buildExtraArgs(launchOptions);
+  const selectedRecipe = getPresetRecipe(selectedRecipeKey);
+  const recipeOptions = PRESET_RECIPES.filter((recipe) => recipe.family === newModelFamily || (newModelFamily === "universal" && recipe.family === "universal"));
+  const launchPreview = buildLaunchPreview({
+    runtimeName: newEngine,
+    modelPath: newPath,
+    ngl: newNgl,
+    batch: newBatch,
+    ubatch: newUbatch,
+    ctx: newCtx,
+    extraArgs: compiledExtraArgs,
+  });
+
+  const applyRecipe = (recipeKey: string, baseOptions?: LaunchOptionDraft) => {
+    const { recipe, options } = applyPresetRecipe(recipeKey, baseOptions ?? launchOptions);
+    setNewModelFamily(recipe.family);
+    setSelectedRecipeKey(recipe.key);
+    setNewNgl(recipe.ngl);
+    setNewBatch(recipe.batch);
+    setNewUbatch(recipe.ubatch);
+    setNewCtx(recipe.ctx);
+    setLaunchOptions(options);
+  };
+
+  const updateLaunchOption = <K extends keyof LaunchOptionDraft>(key: K, value: LaunchOptionDraft[K]) => {
+    setLaunchOptions((prev) => ({ ...prev, [key]: value }));
+  };
 
   const resetForm = () => {
     setNewGroupName("Default");
     setNewName("");
     setNewDesc("");
     setNewPath("");
-    setNewEngine("rocm");
+    setNewEngine(defaultRuntimeName || runtimes[0]?.name || "");
+    const defaultOptions = createDefaultLaunchOptions();
+    setNewModelFamily("universal");
+    setSelectedRecipeKey("universal-balanced");
+    setLaunchOptions(defaultOptions);
     setNewNgl(999);
-    setNewBatch(2048);
+    setNewBatch(1024);
     setNewUbatch(512);
     setNewCtx(8192);
     setEditingGroupId(null);
   };
 
   // Sorting state
-  const [sortKey, setSortKey] = useState<keyof GGUFFileInfo>("filename");
+  const [sortKey, setSortKey] = useState<ModelSortKey>("filename");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
 
-  const handleSort = (key: keyof GGUFFileInfo) => {
+  const handleSort = (key: ModelSortKey) => {
     if (sortKey === key) {
       setSortOrder(sortOrder === "asc" ? "desc" : "asc");
     } else {
@@ -81,29 +161,63 @@ export default function ModelsPage() {
     }
   };
 
-  // Get unique filter options
-  const allQuants = [...new Set(models.map(m => m.quantize).filter(Boolean))].sort();
-  const allParamSizes = [...new Set(models.map(m => m.param_size).filter(Boolean))].sort((a, b) => {
+  // Get unique filter options (exclude mmproj files from filter option sources)
+  const filterableModels = models.filter(m => m.model_type !== "multimodal_projector");
+  const allQuants = [...new Set(filterableModels.map(m => m.quantize).filter(Boolean))].sort();
+  const allParamSizes = [...new Set(filterableModels.map(m => m.param_size).filter(Boolean))].sort((a, b) => {
     const na = parseFloat(a); const nb = parseFloat(b);
     return na - nb;
   });
+  const allArchs = [...new Set(filterableModels.map(m => m.arch).filter(Boolean))].sort();
+  const allPublishers = [...new Set(filterableModels.map(m => m.publisher).filter(Boolean))].sort();
+  const allModelTypes = [...new Set(filterableModels.map(m => m.model_type).filter(Boolean))].sort();
+
+  const selectedGroupPaths = new Set(
+    groups
+      .filter((g) => (g.group_name || "Default") === activeGroupTab)
+      .map((g) => g.model_path)
+  );
 
   const sortedModels = [...models]
     .filter((m) => {
-      if (groups.some((g) => g.model_path === m.filepath)) return false;
+      // Always hide mmproj files — they are not independently usable
+      if (m.model_type === "multimodal_projector") return false;
+      // Hide models only if they belong to the SELECTED group tab
+      if (
+        activeGroupTab &&
+        (
+          selectedGroupPaths.has(m.filepath) ||
+          (!!m.related_base_model_path && selectedGroupPaths.has(m.related_base_model_path)) ||
+          (!!m.related_mmproj_path && selectedGroupPaths.has(m.related_mmproj_path))
+        )
+      ) {
+        return false;
+      }
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
-        if (!m.filename.toLowerCase().includes(q) && !m.parent_dir.toLowerCase().includes(q) && !m.arch.toLowerCase().includes(q)) return false;
+        const ov = overrides.find((o) => o.filepath === m.filepath);
+        const displayName = ov?.display_name || "";
+        if (!m.filename.toLowerCase().includes(q) && !m.parent_dir.toLowerCase().includes(q) && !m.arch.toLowerCase().includes(q) && !m.publisher.toLowerCase().includes(q) && !displayName.toLowerCase().includes(q)) return false;
       }
       if (filterQuant && m.quantize !== filterQuant) return false;
       if (filterParamSize && m.param_size !== filterParamSize) return false;
+      if (filterArch && m.arch !== filterArch) return false;
+      if (filterPublisher && m.publisher !== filterPublisher) return false;
+      if (filterModelType && m.model_type !== filterModelType) return false;
       return true;
     })
     .sort((a, b) => {
-      let valA = a[sortKey];
-      let valB = b[sortKey];
-      if (valA < valB) return sortOrder === "asc" ? -1 : 1;
-      if (valA > valB) return sortOrder === "asc" ? 1 : -1;
+      const valA = a[sortKey];
+      const valB = b[sortKey];
+      if (typeof valA === "number" && typeof valB === "number") {
+        if (valA < valB) return sortOrder === "asc" ? -1 : 1;
+        if (valA > valB) return sortOrder === "asc" ? 1 : -1;
+        return 0;
+      }
+      const sA = String(valA || "").toLowerCase();
+      const sB = String(valB || "").toLowerCase();
+      if (sA < sB) return sortOrder === "asc" ? -1 : 1;
+      if (sA > sB) return sortOrder === "asc" ? 1 : -1;
       return 0;
     });
 
@@ -122,27 +236,111 @@ export default function ModelsPage() {
     return acc;
   }, {} as Record<string, ModelGroup[]>);
   const groupNames = Object.keys(groupedModels);
+  const runtimeNames = runtimes.map((runtime) => runtime.name);
 
-  const refreshAll = async () => {
-    try {
-      const [g, p] = await Promise.all([getModelGroups(), getAllProcessStatus()]);
-      setGroups(g);
-      setProcesses(p);
-    } catch {}
+  const hydratePresetFromModel = (model: GGUFFileInfo) => {
+    const recipeKey = inferPresetRecipeKey(model);
+    const seededOptions = createDefaultLaunchOptions();
+
+    if (model.model_type === "multimodal_base" && model.related_mmproj_path) {
+      seededOptions.mmprojPath = model.related_mmproj_path;
+    }
+
+    const { recipe, options } = applyPresetRecipe(recipeKey, seededOptions);
+
+    setNewModelFamily(inferPresetFamily(model));
+    setSelectedRecipeKey(recipe.key);
+    setLaunchOptions(options);
+    setNewNgl(recipe.ngl);
+    setNewBatch(recipe.batch);
+    setNewUbatch(recipe.ubatch);
+    setNewCtx(recipe.ctx);
   };
 
-  const handleScan = async () => {
+  const refreshAll = useCallback(async () => {
+    try {
+      const [g, p, runtimeItems, settingsItems] = await Promise.all([
+        getModelGroups(),
+        getAllProcessStatus(),
+        getRuntimes(),
+        getSettings(),
+      ]);
+      setGroups(g);
+      setProcesses(p);
+      setRuntimes(runtimeItems);
+
+      const savedDefaultRuntime = settingsItems.find((item) => item.key === "default_engine")?.value ?? "";
+      setDefaultRuntimeName(savedDefaultRuntime || runtimeItems[0]?.name || "");
+    } catch {}
+  }, []);
+
+  const handleScan = useCallback(async () => {
     setScanning(true);
     try {
       const res = await scanModels();
       setModels(res.models);
       setErrors(res.errors);
-    } catch (e: any) {
-      setErrors([e.message]);
+    } catch (error: unknown) {
+      setErrors([getErrorMessage(error)]);
     } finally {
       setScanning(false);
     }
+  }, []);
+
+  const openOverrideDialog = (m: GGUFFileInfo) => {
+    setOverrideTarget(m);
+    const existing = overrides.find((o) => o.filepath === m.filepath);
+    setOvDisplayName(existing?.display_name || "");
+    setOvPublisher(existing?.publisher || m.publisher || "");
+    setOvQuantize(existing?.quantize || m.quantize || "");
+    setOvParamSize(existing?.param_size || m.param_size || "");
+    setOvArch(existing?.arch || m.arch || "");
+    setOvModelFamily(existing?.model_family || m.model_family || inferPresetFamily(m));
+    setOvTags(existing?.tags || "");
+    setOvNotes(existing?.notes || "");
+    setOverrideDialogOpen(true);
   };
+
+  const handleSaveOverride = async () => {
+    if (!overrideTarget) return;
+    try {
+      await upsertModelOverride({
+        filepath: overrideTarget.filepath,
+        display_name: ovDisplayName,
+        publisher: ovPublisher,
+        quantize: ovQuantize,
+        param_size: ovParamSize,
+        arch: ovArch,
+        model_family: ovModelFamily,
+        tags: ovTags,
+        notes: ovNotes,
+      });
+      setOverrideDialogOpen(false);
+      // Refresh overrides and rescan to apply
+      const [ovs] = await Promise.all([getModelOverrides()]);
+      setOverrides(ovs);
+      await handleScan();
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
+    }
+  };
+
+  const handleClearOverride = async () => {
+    if (!overrideTarget) return;
+    const existing = overrides.find((o) => o.filepath === overrideTarget.filepath);
+    if (!existing) return;
+    try {
+      await deleteModelOverride(existing.id);
+      setOverrideDialogOpen(false);
+      const ovs = await getModelOverrides();
+      setOverrides(ovs);
+      await handleScan();
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
+    }
+  };
+
+  const hasOverride = (filepath: string) => overrides.some((o) => o.filepath === filepath);
 
   const handleCreateOrUpdateGroup = async () => {
     setCreating(true);
@@ -150,7 +348,8 @@ export default function ModelsPage() {
       const payload = {
         group_name: newGroupName, name: newName, description: newDesc,
         model_path: newPath, engine_type: newEngine, n_gpu_layers: newNgl,
-        batch_size: newBatch, ubatch_size: newUbatch, ctx_size: newCtx, extra_args: "",
+        batch_size: newBatch, ubatch_size: newUbatch, ctx_size: newCtx,
+        model_family: newModelFamily, preset_recipe: selectedRecipeKey, extra_args: compiledExtraArgs,
       };
       if (editingGroupId) {
         await updateModelGroup(editingGroupId, payload);
@@ -160,33 +359,98 @@ export default function ModelsPage() {
       setDialogOpen(false);
       resetForm();
       await refreshAll();
-    } catch (e: any) {
-      alert(e.message);
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
     } finally {
       setCreating(false);
     }
   };
 
-  const handleLaunch = async (id: number) => { try { await launchModelGroup(id); await refreshAll(); } catch (e: any) { alert(e.message); } };
-  const handleStop = async (identifier: string) => { try { await stopProcess(identifier); await refreshAll(); } catch (e: any) { alert(e.message); } };
-  const handleDelete = async (id: number) => { if (!confirm("確定要刪除此群組？")) return; try { await deleteModelGroup(id); await refreshAll(); } catch (e: any) { alert(e.message); } };
+  const handleLaunch = async (id: number) => { try { await launchModelGroup(id); await refreshAll(); } catch (error: unknown) { alert(getErrorMessage(error)); } };
+  const handleStop = async (identifier: string) => { try { await stopProcess(identifier); await refreshAll(); } catch (error: unknown) { alert(getErrorMessage(error)); } };
+  const handleDelete = async (id: number) => { if (!confirm("確定要刪除此群組？")) return; try { await deleteModelGroup(id); await refreshAll(); } catch (error: unknown) { alert(getErrorMessage(error)); } };
+  const handleInlinePresetUpdate = async (
+    group: ModelGroup,
+    patch: Partial<Pick<ModelGroup, "model_family" | "preset_recipe">>,
+  ) => {
+    setSavingPresetMetaId(group.id);
+    try {
+      const parsedOptions = parseExtraArgs(group.extra_args || "");
+      const nextFamily = (patch.model_family ?? group.model_family ?? inferPresetFamily(group)) as PresetFamily;
+      const nextRecipe = patch.preset_recipe ?? group.preset_recipe ?? inferPresetRecipeKey({ ...group, model_family: nextFamily });
+      const { recipe, options } = applyPresetRecipe(nextRecipe, parsedOptions);
+
+      await updateModelGroup(group.id, {
+        group_name: group.group_name,
+        name: group.name,
+        description: group.description,
+        model_path: group.model_path,
+        engine_type: group.engine_type,
+        n_gpu_layers: recipe.ngl,
+        batch_size: recipe.batch,
+        ubatch_size: recipe.ubatch,
+        ctx_size: recipe.ctx,
+        model_family: nextFamily,
+        preset_recipe: recipe.key,
+        extra_args: buildExtraArgs(options),
+      });
+      await refreshAll();
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
+    } finally {
+      setSavingPresetMetaId(null);
+    }
+  };
   const isRunning = (name: string) => processes.processes.some((p) => p.identifier === name && p.is_running);
 
   useEffect(() => {
     refreshAll();
     handleScan();
+    getModelOverrides().then(setOverrides).catch(() => {});
     const interval = setInterval(refreshAll, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [handleScan, refreshAll]);
+
+  // Set initial tab when groups are loaded
+  useEffect(() => {
+    if (groupNames.length > 0 && (!activeGroupTab || !groupNames.includes(activeGroupTab))) {
+      setActiveGroupTab(groupNames[0]);
+    }
+  }, [groupNames, activeGroupTab]);
+
+  useEffect(() => {
+    if (editingGroupId) return;
+
+    const nextRuntime = defaultRuntimeName || runtimes[0]?.name || "";
+    if (nextRuntime && !runtimeNames.includes(newEngine)) {
+      setNewEngine(nextRuntime);
+    }
+  }, [defaultRuntimeName, editingGroupId, newEngine, runtimeNames, runtimes]);
+
+  const shortName = (path: string) => {
+    if (!path) return "";
+    const parts = path.split("/");
+    return parts[parts.length - 1] || path;
+  };
+
+  const modelTypeBadge = (modelType: GGUFFileInfo["model_type"]) => {
+    if (modelType === "multimodal_base") {
+      return <Badge className="bg-cyan-500/20 text-cyan-300 border-cyan-400/30">Multimodal</Badge>;
+    }
+    if (modelType === "multimodal_projector") {
+      return <Badge className="bg-orange-500/20 text-orange-300 border-orange-400/30">mmproj</Badge>;
+    }
+    return <Badge variant="outline">Text</Badge>;
+  };
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex min-h-screen bg-[radial-gradient(circle_at_top_right,rgba(56,189,248,0.14),transparent_42%),radial-gradient(circle_at_20%_20%,rgba(14,165,233,0.12),transparent_38%)]">
       <Sidebar />
       <main className="ml-56 flex-1 p-8">
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">Model Manager</h1>
-            <p className="text-sm text-muted-foreground mt-1">管理 GGUF 模型與預設群組</p>
+            <h1 className="text-3xl font-bold tracking-tight">Model Studio</h1>
+            <p className="text-sm text-muted-foreground mt-1">LM Studio-style local model management with multimodal pairing</p>
           </div>
           <div className="flex gap-2">
             <Button variant="outline" onClick={handleScan} disabled={scanning}>
@@ -198,58 +462,248 @@ export default function ModelsPage() {
                   + New Group
                 </Button>
               </DialogTrigger>
-              <DialogContent className="sm:max-w-lg">
+              <DialogContent className="sm:max-w-4xl max-h-[88vh] overflow-hidden">
                 <DialogHeader>
                   <DialogTitle>{editingGroupId ? "編輯模型群組" : "建立模型群組"}</DialogTitle>
                 </DialogHeader>
-                <div className="grid gap-4 py-4">
-                  <div className="grid gap-2">
-                    <Label>Group Category</Label>
-                    <Input value={newGroupName} onChange={(e) => setNewGroupName(e.target.value)} placeholder="Default" />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>Preset Identifier</Label>
-                    <Input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Llama-3.1-8B-Q4" />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>Description</Label>
-                    <Input value={newDesc} onChange={(e) => setNewDesc(e.target.value)} placeholder="Daily use model" />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>Model Path (.gguf)</Label>
-                    <Input value={newPath} onChange={(e) => setNewPath(e.target.value)} placeholder="/path/to/model.gguf" className="font-mono text-xs" />
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
+                <div className="grid gap-4 overflow-y-auto py-4 pr-2">
+                  <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
+                    <Tabs defaultValue="identity" className="min-w-0">
+                      <TabsList className="grid w-full grid-cols-3 bg-muted/40">
+                        <TabsTrigger value="identity" className="text-xs">Identity</TabsTrigger>
+                        <TabsTrigger value="tuning" className="text-xs">Tuning</TabsTrigger>
+                        <TabsTrigger value="advanced" className="text-xs">Advanced</TabsTrigger>
+                      </TabsList>
+                      <TabsContent value="identity" className="mt-4 grid gap-4">
+                        <div className="grid gap-2">
+                          <Label>Group Category</Label>
+                          <Input value={newGroupName} onChange={(e) => setNewGroupName(e.target.value)} placeholder="Default" />
+                        </div>
+                        <div className="grid gap-2">
+                          <Label>Preset Identifier</Label>
+                          <Input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Llama-3.1-8B-Q4" />
+                        </div>
+                        <div className="grid gap-2">
+                          <Label>Description</Label>
+                          <Input value={newDesc} onChange={(e) => setNewDesc(e.target.value)} placeholder="Daily use model" />
+                        </div>
+                        <div className="grid gap-2">
+                          <Label>Model Path (.gguf)</Label>
+                          <Input value={newPath} onChange={(e) => setNewPath(e.target.value)} placeholder="/path/to/model.gguf" className="font-mono text-xs" />
+                        </div>
+                        <div className="grid gap-4 sm:grid-cols-2">
+                          <div className="grid gap-2">
+                            <Label>Model Family</Label>
+                            <select
+                              value={newModelFamily}
+                              onChange={(e) => {
+                                const nextFamily = e.target.value as PresetFamily;
+                                setNewModelFamily(nextFamily);
+                                const fallbackRecipe = PRESET_RECIPES.find((recipe) => recipe.family === nextFamily) ?? PRESET_RECIPES[0];
+                                applyRecipe(fallbackRecipe.key);
+                              }}
+                              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            >
+                              {PRESET_FAMILY_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>{option.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="grid gap-2">
+                            <Label>Preset Recipe</Label>
+                            <select
+                              value={selectedRecipeKey}
+                              onChange={(e) => applyRecipe(e.target.value)}
+                              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            >
+                              {(recipeOptions.length > 0 ? recipeOptions : PRESET_RECIPES).map((recipe) => (
+                                <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                        <div className="grid gap-2">
+                          <Label>Engine</Label>
+                          <select value={newEngine} onChange={(e) => setNewEngine(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                            {newEngine && !runtimeNames.includes(newEngine) && (
+                              <option value={newEngine} className="bg-background text-foreground">{newEngine}</option>
+                            )}
+                            {runtimes.length > 0 ? (
+                              runtimes.map((runtime) => (
+                                <option key={runtime.id} value={runtime.name} className="bg-background text-foreground">{runtime.name}</option>
+                              ))
+                            ) : (
+                              <option value="" className="bg-background text-foreground">No runtimes configured</option>
+                            )}
+                          </select>
+                        </div>
+                      </TabsContent>
+                      <TabsContent value="tuning" className="mt-4 grid gap-4">
+                        <div className="grid grid-cols-4 gap-4">
+                          <div className="grid gap-2">
+                            <Label>GPU Layers</Label>
+                            <Input type="number" value={newNgl} onChange={(e) => setNewNgl(+e.target.value)} />
+                          </div>
+                          <div className="grid gap-2">
+                            <Label>Batch</Label>
+                            <Input type="number" value={newBatch} onChange={(e) => setNewBatch(+e.target.value)} />
+                          </div>
+                          <div className="grid gap-2">
+                            <Label>UBatch</Label>
+                            <Input type="number" value={newUbatch} onChange={(e) => setNewUbatch(+e.target.value)} />
+                          </div>
+                          <div className="grid gap-2">
+                            <Label>Context</Label>
+                            <Input type="number" value={newCtx} onChange={(e) => setNewCtx(+e.target.value)} />
+                          </div>
+                        </div>
+                        <div className="rounded-2xl border border-border/50 bg-card/35 p-4">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-semibold">{selectedRecipe.label}</p>
+                              <p className="mt-1 text-[11px] text-muted-foreground">{selectedRecipe.description}</p>
+                            </div>
+                            <Badge variant="outline" className="uppercase text-[10px] tracking-[0.18em]">{newModelFamily}</Badge>
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {selectedRecipe.tags.map((tag) => (
+                              <Badge key={tag} variant="secondary" className="text-[10px]">{tag}</Badge>
+                            ))}
+                          </div>
+                        </div>
+                      </TabsContent>
+                      <TabsContent value="advanced" className="mt-4 grid gap-4">
+                        <div className="grid gap-4 rounded-2xl border border-border/50 bg-card/35 p-4">
                     <div className="grid gap-2">
-                      <Label>Engine</Label>
-                      <select value={newEngine} onChange={(e) => setNewEngine(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
-                        <option value="rocm" className="bg-background text-foreground">ROCm</option>
-                        <option value="vulkan" className="bg-background text-foreground">Vulkan</option>
-                      </select>
+                      <div className="flex items-center justify-between">
+                        <Label>Attention and Cache</Label>
+                        <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">shared</span>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="flex items-center justify-between rounded-xl border border-border/50 px-3 py-2 text-xs">
+                          <span>Flash Attention</span>
+                          <input type="checkbox" checked={launchOptions.flashAttn} onChange={(e) => updateLaunchOption("flashAttn", e.target.checked)} />
+                        </label>
+                        <label className="flex items-center justify-between rounded-xl border border-border/50 px-3 py-2 text-xs">
+                          <span>No KV Offload</span>
+                          <input type="checkbox" checked={launchOptions.noKvOffload} onChange={(e) => updateLaunchOption("noKvOffload", e.target.checked)} />
+                        </label>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="grid gap-2">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">KV Cache Type K</Label>
+                            <span className="text-[9px] uppercase tracking-[0.18em] text-muted-foreground">moe hint</span>
+                          </div>
+                          <Input value={launchOptions.cacheTypeK} onChange={(e) => updateLaunchOption("cacheTypeK", e.target.value)} placeholder="q8_0" className="text-xs" />
+                        </div>
+                        <div className="grid gap-2">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">KV Cache Type V</Label>
+                            <span className="text-[9px] uppercase tracking-[0.18em] text-muted-foreground">moe hint</span>
+                          </div>
+                          <Input value={launchOptions.cacheTypeV} onChange={(e) => updateLaunchOption("cacheTypeV", e.target.value)} placeholder="q8_0" className="text-xs" />
+                        </div>
+                      </div>
                     </div>
                     <div className="grid gap-2">
-                      <Label>GPU Layers</Label>
-                      <Input type="number" value={newNgl} onChange={(e) => setNewNgl(+e.target.value)} />
+                      <div className="flex items-center justify-between">
+                        <Label>Launch Behavior</Label>
+                        <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">advanced</span>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="flex items-center justify-between rounded-xl border border-border/50 px-3 py-2 text-xs">
+                          <span>Continuous Batching</span>
+                          <input type="checkbox" checked={launchOptions.contBatching} onChange={(e) => updateLaunchOption("contBatching", e.target.checked)} />
+                        </label>
+                        <label className="flex items-center justify-between rounded-xl border border-border/50 px-3 py-2 text-xs">
+                          <span>Lock Model in RAM</span>
+                          <input type="checkbox" checked={launchOptions.mlock} onChange={(e) => updateLaunchOption("mlock", e.target.checked)} />
+                        </label>
+                        <label className="flex items-center justify-between rounded-xl border border-border/50 px-3 py-2 text-xs">
+                          <span>Disable mmap</span>
+                          <input type="checkbox" checked={launchOptions.noMmap} onChange={(e) => updateLaunchOption("noMmap", e.target.checked)} />
+                        </label>
+                        <div className="grid gap-2 rounded-xl border border-border/50 px-3 py-2">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Parallel Slots</Label>
+                            <span className="text-[9px] uppercase tracking-[0.18em] text-muted-foreground">moe hint</span>
+                          </div>
+                          <Input type="number" min={1} value={launchOptions.parallelSlots} onChange={(e) => updateLaunchOption("parallelSlots", Math.max(1, Number(e.target.value) || 1))} className="text-xs" />
+                        </div>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="grid gap-2">
+                          <Label className="text-xs">Threads</Label>
+                          <Input type="number" min={0} value={launchOptions.threads} onChange={(e) => updateLaunchOption("threads", Math.max(0, Number(e.target.value) || 0))} className="text-xs" />
+                        </div>
+                        <div className="grid gap-2">
+                          <Label className="text-xs">Threads Batch</Label>
+                          <Input type="number" min={0} value={launchOptions.threadsBatch} onChange={(e) => updateLaunchOption("threadsBatch", Math.max(0, Number(e.target.value) || 0))} className="text-xs" />
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                  <div className="grid grid-cols-3 gap-4">
-                    <div className="grid gap-2">
-                      <Label>Batch</Label>
-                      <Input type="number" value={newBatch} onChange={(e) => setNewBatch(+e.target.value)} />
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="grid gap-2">
+                        <Label className="text-xs">Tensor Split</Label>
+                        <Input value={launchOptions.tensorSplit} onChange={(e) => updateLaunchOption("tensorSplit", e.target.value)} placeholder="4,4" className="text-xs font-mono" />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label className="text-xs">mmproj Path</Label>
+                        <Input value={launchOptions.mmprojPath} onChange={(e) => updateLaunchOption("mmprojPath", e.target.value)} placeholder="/path/to/mmproj.gguf" className="text-xs font-mono" />
+                      </div>
                     </div>
                     <div className="grid gap-2">
-                      <Label>UBatch</Label>
-                      <Input type="number" value={newUbatch} onChange={(e) => setNewUbatch(+e.target.value)} />
+                      <Label>Custom Extra Args</Label>
+                      <Textarea
+                        value={launchOptions.customArgs}
+                        onChange={(e) => updateLaunchOption("customArgs", e.target.value)}
+                        placeholder="--rope-scaling yarn --temp 0.7"
+                        className="min-h-20 font-mono text-xs"
+                      />
                     </div>
                     <div className="grid gap-2">
-                      <Label>Context</Label>
-                      <Input type="number" value={newCtx} onChange={(e) => setNewCtx(+e.target.value)} />
+                      <Label>Generated CLI Args</Label>
+                      <Textarea value={compiledExtraArgs} readOnly className="min-h-20 font-mono text-xs opacity-90" />
+                    </div>
+                    <div className="rounded-xl border border-cyan-400/20 bg-cyan-500/5 p-3">
+                      <p className="text-[11px] font-semibold text-cyan-200">Launch Preview</p>
+                      <p className="mt-1 break-all font-mono text-[10px] text-cyan-100/80">{launchPreview}</p>
+                    </div>
+                        </div>
+                      </TabsContent>
+                    </Tabs>
+
+                    <div className="rounded-3xl border border-cyan-400/20 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.14),transparent_42%),rgba(2,6,23,0.82)] p-5">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-sm font-semibold text-cyan-100">Preset Summary</p>
+                        <Badge className="bg-cyan-500/15 text-cyan-200">{selectedRecipe.label}</Badge>
+                      </div>
+                      <div className="mt-4 grid gap-3 text-sm text-slate-200">
+                        <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Family</p>
+                          <p className="mt-1 font-medium">{newModelFamily}</p>
+                        </div>
+                        <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Core tuning</p>
+                          <p className="mt-1">NGL {newNgl} · Batch {newBatch} · UBatch {newUbatch} · Ctx {newCtx}</p>
+                        </div>
+                        <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">CLI</p>
+                          <p className="mt-1 break-all font-mono text-[10px] text-slate-300">{compiledExtraArgs || "No extra args"}</p>
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          Dense and MoE are editable fields now. Recipe selection is stored with each preset and exposed directly in the group list.
+                        </p>
+                      </div>
                     </div>
                   </div>
                 </div>
-                <Button onClick={handleCreateOrUpdateGroup} disabled={creating || !newName || !newPath} className="w-full">
-                  {creating ? "Saving..." : (editingGroupId ? "Update Group" : "Create Group")}
-                </Button>
+                <div className="border-t border-border/50 pt-4">
+                  <Button onClick={handleCreateOrUpdateGroup} disabled={creating || !newName || !newPath || !newEngine} className="w-full">
+                    {creating ? "Saving..." : (editingGroupId ? "Update Group" : "Create Group")}
+                  </Button>
+                </div>
               </DialogContent>
             </Dialog>
           </div>
@@ -262,7 +716,7 @@ export default function ModelsPage() {
             <Input
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search by filename, arch, group..."
+              placeholder="Search by filename, arch, publisher, path..."
               className="pl-9 h-10 border-border/40 bg-card/40"
             />
           </div>
@@ -280,6 +734,27 @@ export default function ModelsPage() {
               {allParamSizes.map(p => <option key={p} value={p} className="bg-background text-foreground">{p}</option>)}
             </select>
           </div>
+          <div className="grid gap-1">
+            <Label className="text-[10px] text-muted-foreground">Architecture</Label>
+            <select value={filterArch} onChange={e => setFilterArch(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring max-w-[150px]">
+              <option value="" className="bg-background text-foreground">All</option>
+              {allArchs.map(a => <option key={a} value={a} className="bg-background text-foreground">{a}</option>)}
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <Label className="text-[10px] text-muted-foreground">Publisher</Label>
+            <select value={filterPublisher} onChange={e => setFilterPublisher(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+              <option value="" className="bg-background text-foreground">All</option>
+              {allPublishers.map(p => <option key={p} value={p} className="bg-background text-foreground">{p}</option>)}
+            </select>
+          </div>
+          <div className="grid gap-1">
+            <Label className="text-[10px] text-muted-foreground">Model Type</Label>
+            <select value={filterModelType} onChange={e => setFilterModelType(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+              <option value="" className="bg-background text-foreground">All</option>
+              {allModelTypes.map(t => <option key={t} value={t} className="bg-background text-foreground">{t}</option>)}
+            </select>
+          </div>
         </div>
 
         {/* Two-Column Layout */}
@@ -289,7 +764,7 @@ export default function ModelsPage() {
           <div>
             <h2 className="text-lg font-semibold mb-3">Model Groups</h2>
             {groupNames.length > 0 ? (
-              <Tabs defaultValue={groupNames[0]} className="w-full">
+              <Tabs value={activeGroupTab || groupNames[0]} onValueChange={setActiveGroupTab} className="w-full">
                 <TabsList className="mb-4 flex flex-wrap h-auto bg-muted/40 p-1">
                   {groupNames.map((gn) => (
                     <TabsTrigger key={gn} value={gn} className="px-3 py-1.5 text-xs">
@@ -303,22 +778,59 @@ export default function ModelsPage() {
                     <div className="grid gap-3 max-h-[60vh] overflow-y-auto pr-1">
                       {groupedModels[gn].map((g) => {
                         const running = isRunning(g.name);
+                        const presetFamily = inferPresetFamily({
+                          model_family: g.model_family,
+                          filename: g.name,
+                          arch: g.description,
+                          model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text",
+                        });
                         return (
-                          <Card key={g.id} className="border-border/40 bg-card/60 backdrop-blur-sm">
+                          <Card key={g.id} className="border-border/40 bg-card/60 backdrop-blur-sm shadow-[0_8px_20px_-12px_rgba(56,189,248,0.4)]">
                             <CardContent className="flex items-center justify-between py-3">
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2">
                                   <p className="font-semibold text-sm truncate">{g.name}</p>
                                   <Badge variant="outline" className="uppercase text-[10px]">{g.engine_type}</Badge>
+                                  <Badge variant="secondary" className="uppercase text-[9px] tracking-[0.18em]">{presetFamily}</Badge>
                                   {running && <Badge className="bg-emerald-500/20 text-emerald-400 text-[10px]">Running</Badge>}
                                 </div>
                                 {g.description && <p className="text-xs text-muted-foreground mt-0.5">{g.description}</p>}
                                 <p className="text-[10px] text-muted-foreground font-mono mt-1 truncate">{g.model_path}</p>
-                                <div className="flex gap-3 mt-1 text-[10px] text-muted-foreground">
+                                <div className="mt-2 grid gap-2 md:grid-cols-2">
+                                  <div className="grid gap-1">
+                                    <Label className="text-[10px] text-muted-foreground">Family</Label>
+                                    <select
+                                      value={g.model_family || presetFamily}
+                                      onChange={(e) => void handleInlinePresetUpdate(g, { model_family: e.target.value as PresetFamily })}
+                                      disabled={savingPresetMetaId === g.id}
+                                      className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
+                                    >
+                                      {PRESET_FAMILY_OPTIONS.map((option) => (
+                                        <option key={option.value} value={option.value}>{option.label}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                  <div className="grid gap-1">
+                                    <Label className="text-[10px] text-muted-foreground">Recipe</Label>
+                                    <select
+                                      value={g.preset_recipe || inferPresetRecipeKey({ ...g, model_family: g.model_family })}
+                                      onChange={(e) => void handleInlinePresetUpdate(g, { preset_recipe: e.target.value })}
+                                      disabled={savingPresetMetaId === g.id}
+                                      className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
+                                    >
+                                      {PRESET_RECIPES.filter((recipe) => recipe.family === (g.model_family || presetFamily) || ((g.model_family || presetFamily) === "universal" && recipe.family === "universal")).map((recipe) => (
+                                        <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                </div>
+                                <div className="flex gap-3 mt-1 text-[10px] text-muted-foreground flex-wrap">
                                   <span>NGL: {g.n_gpu_layers}</span>
                                   <span>Batch: {g.batch_size}</span>
+                                  <span>UBatch: {g.ubatch_size}</span>
                                   <span>Ctx: {g.ctx_size}</span>
                                 </div>
+                                {g.extra_args && <p className="text-[10px] text-cyan-300/80 font-mono mt-1 truncate">Args: {g.extra_args}</p>}
                               </div>
                               <div className="flex gap-1.5 ml-2 shrink-0">
                                 {running ? (
@@ -327,10 +839,19 @@ export default function ModelsPage() {
                                   <Button size="sm" onClick={() => handleLaunch(g.id)} className="bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-md">Launch</Button>
                                 )}
                                 <Button variant="outline" size="sm" onClick={() => {
+                                  const parsedOptions = parseExtraArgs(g.extra_args || "");
+                                  const inferredRecipe = g.preset_recipe || inferPresetRecipeKey({
+                                    model_family: g.model_family,
+                                    filename: g.name,
+                                    arch: g.description,
+                                    model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text",
+                                  });
+                                  const hydrated = applyPresetRecipe(inferredRecipe, parsedOptions);
                                   setEditingGroupId(g.id); setNewGroupName(g.group_name); setNewName(g.name);
                                   setNewDesc(g.description); setNewPath(g.model_path); setNewEngine(g.engine_type);
+                                  setNewModelFamily((g.model_family || hydrated.recipe.family) as PresetFamily);
                                   setNewNgl(g.n_gpu_layers); setNewBatch(g.batch_size); setNewUbatch(g.ubatch_size);
-                                  setNewCtx(g.ctx_size); setDialogOpen(true);
+                                  setNewCtx(g.ctx_size); setSelectedRecipeKey(hydrated.recipe.key); setLaunchOptions(hydrated.options); setDialogOpen(true);
                                 }}>Edit</Button>
                                 <Button variant="ghost" size="sm" onClick={() => handleDelete(g.id)} className="text-destructive hover:bg-destructive/10">✕</Button>
                               </div>
@@ -354,59 +875,94 @@ export default function ModelsPage() {
 
           {/* RIGHT: Discovered Files */}
           <div>
-            <h2 className="text-lg font-semibold mb-3">Discovered GGUF Files <Badge variant="secondary" className="ml-2">{sortedModels.length}</Badge></h2>
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-lg font-semibold">Discovered GGUF Files <Badge variant="secondary" className="ml-2">{sortedModels.length}</Badge></h2>
+              <div className="flex gap-2 text-xs">
+                <Button variant="ghost" size="sm" onClick={() => handleSort("filename")}>Name {sortKey === "filename" ? (sortOrder === "asc" ? "↑" : "↓") : ""}</Button>
+                <Button variant="ghost" size="sm" onClick={() => handleSort("size_bytes")}>Size {sortKey === "size_bytes" ? (sortOrder === "asc" ? "↑" : "↓") : ""}</Button>
+              </div>
+            </div>
             {errors.length > 0 && (
               <div className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 text-xs text-yellow-400">
                 {errors.map((e, i) => <p key={i}>⚠ {e}</p>)}
               </div>
             )}
             {sortedModels.length > 0 ? (
-              <div className="rounded-lg border border-border/40 overflow-hidden max-h-[70vh] overflow-y-auto">
-                <table className="w-full text-sm">
-                  <thead className="bg-muted/30 sticky top-0 z-10">
-                    <tr>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-muted-foreground uppercase tracking-wider cursor-pointer hover:bg-muted/50 transition-colors" onClick={() => handleSort("filename")}>
-                        Filename {sortKey === "filename" && (sortOrder === "asc" ? "↑" : "↓")}
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-muted-foreground uppercase tracking-wider cursor-pointer hover:bg-muted/50 transition-colors" onClick={() => handleSort("param_size")}>
-                        Size {sortKey === "param_size" && (sortOrder === "asc" ? "↑" : "↓")}
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-muted-foreground uppercase tracking-wider cursor-pointer hover:bg-muted/50 transition-colors" onClick={() => handleSort("quantize")}>
-                        Quant {sortKey === "quantize" && (sortOrder === "asc" ? "↑" : "↓")}
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-muted-foreground uppercase tracking-wider cursor-pointer hover:bg-muted/50 transition-colors" onClick={() => handleSort("size_bytes")}>
-                        File {sortKey === "size_bytes" && (sortOrder === "asc" ? "↑" : "↓")}
-                      </th>
-                      <th className="px-3 py-2 text-right text-[10px] font-medium text-muted-foreground uppercase tracking-wider">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-border/20">
-                    {sortedModels.map((m) => (
-                      <tr key={m.filepath} className="hover:bg-accent/30 transition-colors">
-                        <td className="px-3 py-2.5">
-                          <p className="font-mono text-xs truncate max-w-[180px]" title={m.filename}>{m.arch || m.filename}</p>
-                          <p className="text-[10px] text-muted-foreground truncate max-w-[180px]">{m.publisher}</p>
-                        </td>
-                        <td className="px-3 py-2.5 text-xs text-muted-foreground whitespace-nowrap">{m.param_size || "—"}</td>
-                        <td className="px-3 py-2.5">
-                          {m.quantize ? <Badge variant="outline" className="text-[10px]">{m.quantize}</Badge> : <span className="text-xs text-muted-foreground">—</span>}
-                        </td>
-                        <td className="px-3 py-2.5 text-xs text-muted-foreground whitespace-nowrap">{m.size_human}</td>
-                        <td className="px-3 py-2.5 text-right">
-                          <Button variant="ghost" size="sm" className="text-xs" onClick={() => {
-                            setNewPath(m.filepath); setNewName(m.filename.replace(".gguf", ""));
-                            const dirParts = m.parent_dir.split('/');
+              <div className="space-y-2 max-h-[70vh] overflow-y-auto pr-1">
+                {sortedModels.map((m) => (
+                  <Card key={m.filepath} className="border-border/50 bg-card/70 backdrop-blur-sm">
+                    <CardHeader className="pb-2 pt-3">
+                      <CardTitle className="text-sm flex items-center justify-between gap-2">
+                        <span className="truncate">{m.arch || m.filename}</span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <Badge variant="secondary" className="text-[9px] uppercase tracking-[0.18em]">{inferPresetFamily(m)}</Badge>
+                          {hasOverride(m.filepath) && <Badge className="bg-amber-500/20 text-amber-300 border-amber-400/30 text-[9px]">Custom</Badge>}
+                          {modelTypeBadge(m.model_type)}
+                          {m.quantize ? <Badge variant="outline" className="text-[10px]">{m.quantize}</Badge> : null}
+                        </div>
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="pt-0 pb-3">
+                      <p className="text-[11px] text-muted-foreground truncate">{m.filename}</p>
+                      <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+                        <Badge variant="secondary">Param: {m.param_size || "unknown"}</Badge>
+                        <Badge variant="secondary">File: {m.size_human}</Badge>
+                        <Badge variant="secondary">Publisher: {m.publisher || "unknown"}</Badge>
+                        <Badge variant="outline">Suggested: {getPresetRecipe(inferPresetRecipeKey(m)).label}</Badge>
+                      </div>
+                      {m.model_type === "multimodal_base" && m.related_mmproj_path && (
+                        <p className="mt-2 text-[10px] text-cyan-300/90 font-mono truncate">mmproj linked: {shortName(m.related_mmproj_path)}</p>
+                      )}
+                      {m.model_type === "multimodal_projector" && m.related_base_model_path && (
+                        <p className="mt-2 text-[10px] text-orange-300/90 font-mono truncate">base linked: {shortName(m.related_base_model_path)}</p>
+                      )}
+                      <p className="mt-1 text-[10px] text-muted-foreground font-mono truncate">{m.parent_dir}</p>
+                      {(() => {
+                        const ov = overrides.find((o) => o.filepath === m.filepath);
+                        if (!ov) return null;
+                        return (
+                          <>
+                            {ov.tags && (
+                              <div className="mt-1.5 flex flex-wrap gap-1">
+                                {ov.tags.split(",").map((t) => t.trim()).filter(Boolean).map((tag) => (
+                                  <Badge key={tag} className="bg-violet-500/15 text-violet-300 border-violet-400/20 text-[9px]">{tag}</Badge>
+                                ))}
+                              </div>
+                            )}
+                            {ov.notes && <p className="mt-1 text-[10px] text-amber-300/70 italic truncate">{ov.notes}</p>}
+                          </>
+                        );
+                      })()}
+                      <div className="mt-3 flex justify-end gap-1.5">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-xs text-muted-foreground hover:text-foreground"
+                          onClick={() => openOverrideDialog(m)}
+                        >
+                          {hasOverride(m.filepath) ? "✎ Overridden" : "✎ Edit Props"}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-xs"
+                          onClick={() => {
+                            setNewPath(m.filepath);
+                            setNewName(m.filename.replace(".gguf", ""));
+                            const dirParts = m.parent_dir.split("/");
                             const lastDir = dirParts[dirParts.length - 1];
                             if (lastDir) setNewGroupName(lastDir);
+                            setNewEngine(defaultRuntimeName || runtimes[0]?.name || "");
+                            hydratePresetFromModel(m);
                             setDialogOpen(true);
-                          }}>
-                            + Add
-                          </Button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                          }}
+                        >
+                          + Add Preset
+                        </Button>
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
               </div>
             ) : (
               <Card className="border-dashed border-border/40 bg-card/30">
@@ -419,6 +975,66 @@ export default function ModelsPage() {
           </div>
 
         </div>
+
+        {/* Model Property Override Dialog */}
+        <Dialog open={overrideDialogOpen} onOpenChange={setOverrideDialogOpen}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Edit Model Properties</DialogTitle>
+            </DialogHeader>
+            {overrideTarget && (
+              <div className="grid gap-3 py-3">
+                <p className="text-[11px] text-muted-foreground font-mono truncate">{overrideTarget.filename}</p>
+                <div className="grid gap-2">
+                  <Label className="text-xs">Display Name</Label>
+                  <Input value={ovDisplayName} onChange={(e) => setOvDisplayName(e.target.value)} placeholder={overrideTarget.arch || overrideTarget.filename} className="text-xs" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="grid gap-2">
+                    <Label className="text-xs">Publisher</Label>
+                    <Input value={ovPublisher} onChange={(e) => setOvPublisher(e.target.value)} placeholder={overrideTarget.publisher || "auto-detected"} className="text-xs" />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label className="text-xs">Param Size</Label>
+                    <Input value={ovParamSize} onChange={(e) => setOvParamSize(e.target.value)} placeholder={overrideTarget.param_size || "e.g. 9B"} className="text-xs" />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="grid gap-2">
+                    <Label className="text-xs">Quantize</Label>
+                    <Input value={ovQuantize} onChange={(e) => setOvQuantize(e.target.value)} placeholder={overrideTarget.quantize || "e.g. Q4_K_M"} className="text-xs" />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label className="text-xs">Architecture</Label>
+                    <Input value={ovArch} onChange={(e) => setOvArch(e.target.value)} placeholder={overrideTarget.arch || "e.g. Llama"} className="text-xs" />
+                  </div>
+                </div>
+                <div className="grid gap-2">
+                  <Label className="text-xs">Model Family</Label>
+                  <select value={ovModelFamily} onChange={(e) => setOvModelFamily(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs">
+                    {PRESET_FAMILY_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid gap-2">
+                  <Label className="text-xs">Tags (comma-separated)</Label>
+                  <Input value={ovTags} onChange={(e) => setOvTags(e.target.value)} placeholder="fast, daily-use, coding" className="text-xs" />
+                </div>
+                <div className="grid gap-2">
+                  <Label className="text-xs">Notes</Label>
+                  <Textarea value={ovNotes} onChange={(e) => setOvNotes(e.target.value)} placeholder="Personal notes about this model..." className="text-xs min-h-16" />
+                </div>
+                <div className="flex gap-2 mt-1">
+                  <Button onClick={handleSaveOverride} className="flex-1">Save Override</Button>
+                  {hasOverride(overrideTarget.filepath) && (
+                    <Button variant="outline" onClick={handleClearOverride} className="text-destructive hover:bg-destructive/10">Clear Override</Button>
+                  )}
+                </div>
+              </div>
+            )}
+          </DialogContent>
+        </Dialog>
       </main>
     </div>
   );

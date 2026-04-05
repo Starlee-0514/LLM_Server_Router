@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Sidebar from "@/components/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -12,11 +12,17 @@ import {
   checkProviderHealth,
   createProvider,
   deleteProvider,
+  getCommonProviderTemplates,
+  getProviderModels,
   getProviders,
+  registerCommonProvider,
+  startCommonProviderOAuth,
   updateProvider,
+  type CommonProviderTemplate,
   type ProviderCreatePayload,
   type ProviderEndpoint,
   type ProviderHealthResponse,
+  type ProviderModelItem,
 } from "@/lib/api";
 
 const emptyForm: ProviderCreatePayload = {
@@ -30,17 +36,47 @@ const emptyForm: ProviderCreatePayload = {
 
 export default function ProvidersPage() {
   const [providers, setProviders] = useState<ProviderEndpoint[]>([]);
+  const [commonTemplates, setCommonTemplates] = useState<CommonProviderTemplate[]>([]);
+  const [commonApiKey, setCommonApiKey] = useState("");
+  const [commonNameOverride, setCommonNameOverride] = useState("");
   const [form, setForm] = useState<ProviderCreatePayload>(emptyForm);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [healthMap, setHealthMap] = useState<Record<number, ProviderHealthResponse>>({});
+  const [modelMap, setModelMap] = useState<Record<number, ProviderModelItem[]>>({});
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<"name" | "type" | "recent">("recent");
+  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const filteredProviders = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const filtered = providers.filter((p) => {
+      if (!q) return true;
+      return (
+        p.name.toLowerCase().includes(q) ||
+        p.provider_type.toLowerCase().includes(q) ||
+        (p.base_url || "").toLowerCase().includes(q)
+      );
+    });
+
+    filtered.sort((a, b) => {
+      if (sortBy === "name") return a.name.localeCompare(b.name);
+      if (sortBy === "type") return a.provider_type.localeCompare(b.provider_type);
+      const aTime = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+      const bTime = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+      return bTime - aTime;
+    });
+
+    return filtered;
+  }, [providers, search, sortBy]);
 
   const refresh = async () => {
     setLoading(true);
     try {
-      const data = await getProviders();
-      setProviders(data);
+      const [providerData, templateData] = await Promise.all([getProviders(), getCommonProviderTemplates()]);
+      setProviders(providerData);
+      setCommonTemplates(templateData);
       setError(null);
     } catch (e: any) {
       setError(e.message ?? "Failed to load providers");
@@ -86,9 +122,9 @@ export default function ProvidersPage() {
   };
 
   const handleDelete = async (id: number) => {
-    if (!confirm("Delete this provider?")) return;
     try {
       await deleteProvider(id);
+      if (pendingDeleteId === id) setPendingDeleteId(null);
       await refresh();
     } catch (e: any) {
       setError(e.message ?? "Delete failed");
@@ -104,6 +140,48 @@ export default function ProvidersPage() {
     }
   };
 
+  const handleRegisterCommon = async (providerKey: string) => {
+    try {
+      if (providerKey === "github_models" || providerKey === "google_gemini_openai") {
+        const started = await startCommonProviderOAuth(providerKey, commonNameOverride);
+        const popup = window.open(started.auth_url, "provider-oauth", "width=640,height=800");
+        if (!popup) {
+          setError("Popup blocked. Please allow popups and try again.");
+          return;
+        }
+
+        const onMessage = (event: MessageEvent) => {
+          if (event?.data?.type === "provider-oauth-success") {
+            window.removeEventListener("message", onMessage);
+            refresh();
+          }
+        };
+        window.addEventListener("message", onMessage);
+        return;
+      }
+
+      await registerCommonProvider({
+        provider_key: providerKey,
+        api_key: commonApiKey,
+        enabled: true,
+        name_override: commonNameOverride,
+      });
+      setCommonNameOverride("");
+      await refresh();
+    } catch (e: any) {
+      setError(e.message ?? "Common provider registration failed");
+    }
+  };
+
+  const handleFetchModels = async (id: number) => {
+    try {
+      const models = await getProviderModels(id);
+      setModelMap((prev) => ({ ...prev, [id]: models }));
+    } catch (e: any) {
+      setError(e.message ?? "Fetch provider models failed");
+    }
+  };
+
   return (
     <div className="flex min-h-screen">
       <Sidebar />
@@ -114,6 +192,34 @@ export default function ProvidersPage() {
         </div>
 
         {error && <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
+
+        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">
+          <CardHeader>
+            <CardTitle className="text-base">Common Providers Quick Setup</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label className="text-xs">API Key / Token (OpenRouter only)</Label>
+                <Input value={commonApiKey} onChange={(e) => setCommonApiKey(e.target.value)} type="password" className="text-xs font-mono" placeholder="OpenRouter API key" />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">Name Override (optional)</Label>
+                <Input value={commonNameOverride} onChange={(e) => setCommonNameOverride(e.target.value)} className="text-xs" placeholder="custom-provider-name" />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              GitHub / Google providers use OAuth login flow and no manual token input is required.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {commonTemplates.map((tpl) => (
+                <Button key={tpl.provider_key} variant="outline" size="sm" onClick={() => handleRegisterCommon(tpl.provider_key)}>
+                  {tpl.provider_key === "github_models" || tpl.provider_key === "google_gemini_openai" ? `Login ${tpl.label}` : `Add ${tpl.label}`}
+                </Button>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
 
         <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">
           <CardHeader>
@@ -178,11 +284,30 @@ export default function ProvidersPage() {
             <CardTitle className="text-base">Provider List {loading ? "(Loading...)" : ""}</CardTitle>
           </CardHeader>
           <CardContent>
-            {providers.length === 0 ? (
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search by name, type, base URL"
+                className="h-8 w-72 text-xs"
+              />
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as "name" | "type" | "recent")}
+                className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
+              >
+                <option value="recent">Sort: Recently Updated</option>
+                <option value="name">Sort: Name</option>
+                <option value="type">Sort: Provider Type</option>
+              </select>
+              <span className="text-xs text-muted-foreground">{filteredProviders.length} result(s)</span>
+            </div>
+
+            {filteredProviders.length === 0 ? (
               <p className="text-sm text-muted-foreground">No providers configured.</p>
             ) : (
               <div className="space-y-3">
-                {providers.map((provider) => (
+                {filteredProviders.map((provider) => (
                   <div key={provider.id} className="rounded-md border border-border/40 bg-muted/20 p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
@@ -191,8 +316,16 @@ export default function ProvidersPage() {
                       </div>
                       <div className="flex gap-2">
                         <Button variant="outline" size="sm" onClick={() => handleHealth(provider.id)}>Health</Button>
+                        <Button variant="outline" size="sm" onClick={() => handleFetchModels(provider.id)}>Models</Button>
                         <Button variant="outline" size="sm" onClick={() => handleEdit(provider)}>Edit</Button>
-                        <Button variant="destructive" size="sm" onClick={() => handleDelete(provider.id)}>Delete</Button>
+                        {pendingDeleteId === provider.id ? (
+                          <>
+                            <Button variant="destructive" size="sm" onClick={() => handleDelete(provider.id)}>Confirm Delete</Button>
+                            <Button variant="outline" size="sm" onClick={() => setPendingDeleteId(null)}>Cancel</Button>
+                          </>
+                        ) : (
+                          <Button variant="destructive" size="sm" onClick={() => setPendingDeleteId(provider.id)}>Delete</Button>
+                        )}
                       </div>
                     </div>
                     {healthMap[provider.id] && (
@@ -201,6 +334,16 @@ export default function ProvidersPage() {
                         {healthMap[provider.id].status_code ? ` · status=${healthMap[provider.id].status_code}` : ""}
                         {healthMap[provider.id].error ? ` · error=${healthMap[provider.id].error}` : ""}
                       </p>
+                    )}
+                    {modelMap[provider.id] && (
+                      <div className="mt-2 rounded border border-border/40 bg-background/40 p-2">
+                        <p className="text-xs text-muted-foreground mb-1">models: {modelMap[provider.id].length}</p>
+                        <div className="max-h-32 overflow-y-auto space-y-1">
+                          {modelMap[provider.id].slice(0, 30).map((m) => (
+                            <p key={m.id} className="text-xs font-mono">{m.id}</p>
+                          ))}
+                        </div>
+                      </div>
                     )}
                   </div>
                 ))}

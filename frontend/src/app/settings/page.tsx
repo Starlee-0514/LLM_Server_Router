@@ -7,18 +7,21 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { getSettings, updateSettings, type SettingItem } from "@/lib/api";
+import { Textarea } from "@/components/ui/textarea";
+import { getSettings, updateSettings, getRuntimes, createRuntime, updateRuntime, deleteRuntime, type SettingItem, type Runtime } from "@/lib/api";
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<SettingItem[]>([]);
+  const [runtimes, setRuntimes] = useState<Runtime[]>([]);
   const [scanDirs, setScanDirs] = useState<string[]>([]);
   const [newDir, setNewDir] = useState("");
-  const [llamaRocmPath, setLlamaRocmPath] = useState("");
-  const [llamaVulkanPath, setLlamaVulkanPath] = useState("");
-  const [hsaOverrideGfxVersion, setHsaOverrideGfxVersion] = useState("");
-  const [defaultEngine, setDefaultEngine] = useState("rocm");
+  const [defaultEngine, setDefaultEngine] = useState("");
   const [openaiApiKey, setOpenaiApiKey] = useState("");
   const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [githubClientId, setGithubClientId] = useState("");
+  const [githubClientSecret, setGithubClientSecret] = useState("");
+  const [googleClientId, setGoogleClientId] = useState("");
+  const [googleClientSecret, setGoogleClientSecret] = useState("");
   const [listenHost, setListenHost] = useState("0.0.0.0");
   const [listenPort, setListenPort] = useState("8000");
   const [corsAllowOrigins, setCorsAllowOrigins] = useState("*");
@@ -26,10 +29,41 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
+  // Runtime management state
+  const [editingRuntimeId, setEditingRuntimeId] = useState<number | null>(null);
+  const [runtimeName, setRuntimeName] = useState("");
+  const [runtimePath, setRuntimePath] = useState("");
+  const [runtimeDesc, setRuntimeDesc] = useState("");
+  const [runtimeEnvJson, setRuntimeEnvJson] = useState("{}");
+  const [savingRuntime, setSavingRuntime] = useState(false);
+
+  const resetRuntimeForm = () => {
+    setEditingRuntimeId(null);
+    setRuntimeName("");
+    setRuntimePath("");
+    setRuntimeDesc("");
+    setRuntimeEnvJson("{}");
+  };
+
+  const getEnvVarCount = (environmentVars: string) => {
+    try {
+      const parsed = JSON.parse(environmentVars || "{}");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? Object.keys(parsed).length
+        : 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : "Unknown error";
+
   const refresh = async () => {
     try {
-      const data = await getSettings();
+      const [data, runtimesData] = await Promise.all([getSettings(), getRuntimes()]);
       setSettings(data);
+      setRuntimes(runtimesData);
+
       const dirs = data.find((s) => s.key === "model_scan_dirs");
       if (dirs) {
         try {
@@ -39,12 +73,13 @@ export default function SettingsPage() {
         }
       }
 
-      setLlamaRocmPath(data.find((s) => s.key === "llama_rocm_path")?.value ?? "");
-      setLlamaVulkanPath(data.find((s) => s.key === "llama_vulkan_path")?.value ?? "");
-      setHsaOverrideGfxVersion(data.find((s) => s.key === "hsa_override_gfx_version")?.value ?? "11.5.0");
-      setDefaultEngine(data.find((s) => s.key === "default_engine")?.value ?? "rocm");
+      setDefaultEngine(data.find((s) => s.key === "default_engine")?.value ?? runtimesData[0]?.name ?? "");
       setOpenaiApiKey(data.find((s) => s.key === "openai_api_key")?.value ?? "");
       setAnthropicApiKey(data.find((s) => s.key === "anthropic_api_key")?.value ?? "");
+      setGithubClientId(data.find((s) => s.key === "github_client_id")?.value ?? "");
+      setGithubClientSecret(data.find((s) => s.key === "github_client_secret")?.value ?? "");
+      setGoogleClientId(data.find((s) => s.key === "google_client_id")?.value ?? "");
+      setGoogleClientSecret(data.find((s) => s.key === "google_client_secret")?.value ?? "");
       setListenHost(data.find((s) => s.key === "listen_host")?.value ?? "0.0.0.0");
       setListenPort(data.find((s) => s.key === "listen_port")?.value ?? "8000");
       setCorsAllowOrigins(data.find((s) => s.key === "cors_allow_origins")?.value ?? "*");
@@ -55,6 +90,12 @@ export default function SettingsPage() {
   useEffect(() => {
     refresh();
   }, []);
+
+  useEffect(() => {
+    if (runtimes.length > 0 && !runtimes.some((runtime) => runtime.name === defaultEngine)) {
+      setDefaultEngine(runtimes[0].name);
+    }
+  }, [runtimes, defaultEngine]);
 
   const handleAddDir = () => {
     const trimmed = newDir.trim();
@@ -68,17 +109,82 @@ export default function SettingsPage() {
     setScanDirs(scanDirs.filter((d) => d !== dir));
   };
 
+  const handleEditRuntime = (runtime: Runtime) => {
+    setEditingRuntimeId(runtime.id);
+    setRuntimeName(runtime.name);
+    setRuntimePath(runtime.executable_path);
+    setRuntimeDesc(runtime.description);
+    setRuntimeEnvJson(runtime.environment_vars || "{}");
+  };
+
+  const handleSaveRuntime = async () => {
+    if (!runtimeName.trim() || !runtimePath.trim()) {
+      alert("Please enter both name and path");
+      return;
+    }
+
+    let parsedEnv: unknown;
+    try {
+      parsedEnv = JSON.parse(runtimeEnvJson || "{}");
+    } catch {
+      alert("Environment variables must be valid JSON");
+      return;
+    }
+
+    if (parsedEnv === null || Array.isArray(parsedEnv) || typeof parsedEnv !== "object") {
+      alert("Environment variables must be a JSON object");
+      return;
+    }
+
+    setSavingRuntime(true);
+    try {
+      const payload = {
+        name: runtimeName.trim(),
+        executable_path: runtimePath.trim(),
+        description: runtimeDesc.trim(),
+        environment_vars: JSON.stringify(parsedEnv),
+      };
+
+      if (editingRuntimeId) {
+        await updateRuntime(editingRuntimeId, payload);
+      } else {
+        await createRuntime(payload);
+      }
+
+      resetRuntimeForm();
+      await refresh();
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
+    } finally {
+      setSavingRuntime(false);
+    }
+  };
+
+  const handleDeleteRuntime = async (id: number, name: string) => {
+    if (!confirm(`Delete runtime "${name}"?`)) return;
+    try {
+      await deleteRuntime(id);
+      if (editingRuntimeId === id) {
+        resetRuntimeForm();
+      }
+      await refresh();
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
+    }
+  };
+
   const handleSave = async () => {
     setSaving(true);
     try {
       await updateSettings([
         { key: "model_scan_dirs", value: JSON.stringify(scanDirs) },
-        { key: "llama_rocm_path", value: llamaRocmPath.trim() },
-        { key: "llama_vulkan_path", value: llamaVulkanPath.trim() },
-        { key: "hsa_override_gfx_version", value: hsaOverrideGfxVersion.trim() },
         { key: "default_engine", value: defaultEngine },
         { key: "openai_api_key", value: openaiApiKey.trim() },
         { key: "anthropic_api_key", value: anthropicApiKey.trim() },
+        { key: "github_client_id", value: githubClientId.trim() },
+        { key: "github_client_secret", value: githubClientSecret.trim() },
+        { key: "google_client_id", value: googleClientId.trim() },
+        { key: "google_client_secret", value: googleClientSecret.trim() },
         { key: "listen_host", value: listenHost.trim() },
         { key: "listen_port", value: listenPort.trim() },
         { key: "cors_allow_origins", value: corsAllowOrigins.trim() },
@@ -87,8 +193,8 @@ export default function SettingsPage() {
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       await refresh();
-    } catch (e: any) {
-      alert(e.message);
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
     } finally {
       setSaving(false);
     }
@@ -140,34 +246,113 @@ export default function SettingsPage() {
             </CardContent>
           </Card>
 
+          {/* Runtime Management */}
           <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
             <CardHeader>
-              <CardTitle className="text-base">Runtime Settings</CardTitle>
+              <CardTitle className="text-base">Runtime Environments</CardTitle>
               <p className="text-xs text-muted-foreground">
-                設定 llama.cpp 執行檔與預設執行引擎
+                以名稱、執行路徑與環境變數管理所有運行時，模型預設會直接連結到這些物件
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {runtimes.length > 0 && (
+                <div className="space-y-2 mb-4">
+                  <p className="text-xs font-semibold text-muted-foreground mb-2">Available Runtimes:</p>
+                  {runtimes.map((runtime) => (
+                    <div key={runtime.id} className="flex items-center justify-between rounded-md border border-border/40 bg-muted/20 px-3 py-2">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 font-medium text-xs">
+                          <span>{runtime.name}</span>
+                          {runtime.name === defaultEngine && <Badge variant="secondary" className="text-[10px]">Default</Badge>}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground font-mono truncate">{runtime.executable_path}</div>
+                        {runtime.description && <div className="text-[10px] text-muted-foreground">{runtime.description}</div>}
+                        <div className="text-[10px] text-muted-foreground">Env: {getEnvVarCount(runtime.environment_vars)} variable(s)</div>
+                      </div>
+                      <div className="ml-2 flex gap-1.5">
+                        <Button variant="outline" size="sm" className="h-7 px-2 text-[10px]" onClick={() => handleEditRuntime(runtime)}>
+                          Edit
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={() => handleDeleteRuntime(runtime.id, runtime.name)} className="text-destructive hover:text-destructive h-7 w-7 p-0">
+                          ✕
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="border-t border-border/40 pt-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <p className="text-xs font-semibold text-muted-foreground">{editingRuntimeId ? "Edit Runtime:" : "Add New Runtime:"}</p>
+                  {editingRuntimeId && (
+                    <Button variant="ghost" size="sm" className="h-6 px-2 text-[10px]" onClick={resetRuntimeForm}>
+                      Cancel Edit
+                    </Button>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Input
+                    value={runtimeName}
+                    onChange={(e) => setRuntimeName(e.target.value)}
+                    placeholder="Runtime name (e.g., rocm, vulkan, cpu)"
+                    className="text-xs"
+                    onKeyDown={(e) => e.key === "Enter" && handleSaveRuntime()}
+                  />
+                  <Input
+                    value={runtimePath}
+                    onChange={(e) => setRuntimePath(e.target.value)}
+                    placeholder="Executable path (e.g., /usr/bin/llama-server)"
+                    className="font-mono text-xs"
+                    onKeyDown={(e) => e.key === "Enter" && handleSaveRuntime()}
+                  />
+                  <Input
+                    value={runtimeDesc}
+                    onChange={(e) => setRuntimeDesc(e.target.value)}
+                    placeholder="Description (optional)"
+                    className="text-xs"
+                    onKeyDown={(e) => e.key === "Enter" && handleSaveRuntime()}
+                  />
+                  <div className="space-y-2">
+                    <Label className="text-xs">Environment Variables JSON</Label>
+                    <Textarea
+                      value={runtimeEnvJson}
+                      onChange={(e) => setRuntimeEnvJson(e.target.value)}
+                      className="min-h-24 font-mono text-xs"
+                      placeholder='{"HSA_OVERRIDE_GFX_VERSION":"11.5.0"}'
+                    />
+                  </div>
+                  <Button variant="outline" onClick={handleSaveRuntime} disabled={savingRuntime || !runtimeName.trim() || !runtimePath.trim()}>
+                    {savingRuntime ? "Saving..." : editingRuntimeId ? "Update Runtime" : "Add Runtime"}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Execution Defaults</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                選擇新模型預設會優先使用的 runtime
               </p>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="space-y-2">
-                <Label className="text-xs">ROCm llama-server Path</Label>
-                <Input value={llamaRocmPath} onChange={(e) => setLlamaRocmPath(e.target.value)} className="font-mono text-xs" placeholder="/path/to/llama-server" />
-              </div>
-              <div className="space-y-2">
-                <Label className="text-xs">Vulkan llama-server Path</Label>
-                <Input value={llamaVulkanPath} onChange={(e) => setLlamaVulkanPath(e.target.value)} className="font-mono text-xs" placeholder="/path/to/llama-server-vulkan" />
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div className="space-y-2">
-                  <Label className="text-xs">HSA_OVERRIDE_GFX_VERSION</Label>
-                  <Input value={hsaOverrideGfxVersion} onChange={(e) => setHsaOverrideGfxVersion(e.target.value)} className="font-mono text-xs" placeholder="11.5.0" />
-                </div>
-                <div className="space-y-2">
-                  <Label className="text-xs">Default Engine</Label>
-                  <select value={defaultEngine} onChange={(e) => setDefaultEngine(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs">
-                    <option value="rocm" className="bg-background text-foreground">ROCm</option>
-                    <option value="vulkan" className="bg-background text-foreground">Vulkan</option>
-                  </select>
-                </div>
+                <Label className="text-xs">Default Runtime</Label>
+                <select value={defaultEngine} onChange={(e) => setDefaultEngine(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs" disabled={runtimes.length === 0}>
+                  {runtimes.length > 0 ? (
+                    runtimes.map((rt) => (
+                      <option key={rt.id} value={rt.name} className="bg-background text-foreground">
+                        {rt.name}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="" className="bg-background text-foreground">No runtimes configured</option>
+                  )}
+                </select>
+                <p className="text-[10px] text-muted-foreground">
+                  Rename operations keep linked model presets aligned automatically.
+                </p>
               </div>
             </CardContent>
           </Card>
@@ -187,6 +372,37 @@ export default function SettingsPage() {
               <div className="space-y-2">
                 <Label className="text-xs">Anthropic API Key</Label>
                 <Input value={anthropicApiKey} onChange={(e) => setAnthropicApiKey(e.target.value)} type="password" className="font-mono text-xs" placeholder="sk-ant-..." />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+            <CardHeader>
+              <CardTitle className="text-base">OAuth Clients (GitHub / Google)</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                設定 common providers OAuth 登入所需的 client_id / client_secret
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label className="text-xs">GitHub Client ID</Label>
+                  <Input value={githubClientId} onChange={(e) => setGithubClientId(e.target.value)} className="font-mono text-xs" placeholder="GitHub OAuth App Client ID" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">GitHub Client Secret</Label>
+                  <Input value={githubClientSecret} onChange={(e) => setGithubClientSecret(e.target.value)} type="password" className="font-mono text-xs" placeholder="GitHub OAuth App Client Secret" />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label className="text-xs">Google Client ID</Label>
+                  <Input value={googleClientId} onChange={(e) => setGoogleClientId(e.target.value)} className="font-mono text-xs" placeholder="Google OAuth Client ID" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">Google Client Secret</Label>
+                  <Input value={googleClientSecret} onChange={(e) => setGoogleClientSecret(e.target.value)} type="password" className="font-mono text-xs" placeholder="Google OAuth Client Secret" />
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -230,13 +446,13 @@ export default function SettingsPage() {
             </CardHeader>
             <CardContent>
               <div className="space-y-3">
-                {settings.filter(s => s.key !== "model_scan_dirs").map((s) => (
+                {settings.filter(s => s.key !== "model_scan_dirs" && s.key !== "runtime_objects_seeded").map((s) => (
                   <div key={s.key} className="flex items-center justify-between">
                     <span className="text-xs font-mono text-muted-foreground">{s.key}</span>
                     <Badge variant="secondary" className="font-mono text-[10px] max-w-xs truncate">{s.value}</Badge>
                   </div>
                 ))}
-                {settings.filter(s => s.key !== "model_scan_dirs").length === 0 && (
+                {settings.filter(s => s.key !== "model_scan_dirs" && s.key !== "runtime_objects_seeded").length === 0 && (
                   <p className="text-xs text-muted-foreground">No additional settings configured.</p>
                 )}
               </div>

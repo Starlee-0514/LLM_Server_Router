@@ -36,6 +36,10 @@ export interface GGUFFileInfo {
   quantize: string;
   param_size: string;
   arch: string;
+  model_family: string;
+  model_type: "text" | "multimodal_base" | "multimodal_projector";
+  related_mmproj_path: string;
+  related_base_model_path: string;
 }
 
 export interface ModelScanResponse {
@@ -63,6 +67,8 @@ export interface ModelGroup {
   batch_size: number;
   ubatch_size: number;
   ctx_size: number;
+  model_family: string;
+  preset_recipe: string;
   extra_args: string;
   created_at: string | null;
   updated_at: string | null;
@@ -130,6 +136,64 @@ export interface RecentBenchmarkItem {
   created_at: string | null;
 }
 
+export interface Runtime {
+  id: number;
+  name: string;
+  description: string;
+  executable_path: string;
+  environment_vars: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface OpenAIModelItem {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+}
+
+export interface OpenAIModelListResponse {
+  object: string;
+  data: OpenAIModelItem[];
+}
+
+export interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export interface ChatCompletionRequest {
+  model: string;
+  messages: ChatMessage[];
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+}
+
+export interface ChatCompletionResponse {
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    finish_reason: string | null;
+    message?: {
+      role: string;
+      content: string;
+    };
+    delta?: {
+      content?: string;
+    };
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
 export interface ProviderEndpoint {
   id: number;
   name: string;
@@ -159,6 +223,32 @@ export interface ProviderHealthResponse {
   url?: string;
   detail?: string;
   error?: string;
+}
+
+export interface CommonProviderTemplate {
+  provider_key: string;
+  label: string;
+  provider_type: string;
+  base_url: string;
+  auth_hint: string;
+  default_extra_headers: string;
+}
+
+export interface CommonProviderRegisterPayload {
+  provider_key: string;
+  api_key: string;
+  enabled: boolean;
+  name_override: string;
+}
+
+export interface CommonProviderOAuthStartResponse {
+  auth_url: string;
+}
+
+export interface ProviderModelItem {
+  id: string;
+  provider_name: string;
+  raw: Record<string, unknown>;
 }
 
 export interface ModelRouteItem {
@@ -224,6 +314,110 @@ export const updateSettings = (settings: { key: string; value: string }[]) =>
     body: JSON.stringify({ settings }),
   });
 
+// --- Runtimes ---
+export const getRuntimes = () => apiFetch<Runtime[]>("/api/runtimes");
+export const getRuntime = (id: number) => apiFetch<Runtime>(`/api/runtimes/${id}`);
+export const createRuntime = (runtime: Omit<Runtime, "id" | "created_at" | "updated_at">) =>
+  apiFetch<Runtime>("/api/runtimes", {
+    method: "POST",
+    body: JSON.stringify(runtime),
+  });
+export const updateRuntime = (id: number, runtime: Partial<Omit<Runtime, "id" | "created_at" | "updated_at">>) =>
+  apiFetch<Runtime>(`/api/runtimes/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(runtime),
+  });
+export const deleteRuntime = (id: number) =>
+  apiFetch(`/api/runtimes/${id}`, { method: "DELETE" });
+
+// --- OpenAI-compatible inference ---
+export const listInferenceModels = () => apiFetch<OpenAIModelListResponse>("/v1/models");
+
+const parseChatError = async (res: Response) => {
+  const body = await res.json().catch(async () => ({ detail: await res.text().catch(() => res.statusText) }));
+  throw new Error(body.detail || body.error?.message || `API Error: ${res.status}`);
+};
+
+export const createChatCompletion = async (
+  req: ChatCompletionRequest,
+  signal?: AbortSignal,
+): Promise<ChatCompletionResponse> => {
+  const base = getApiBase();
+  const res = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...req, stream: false }),
+    signal,
+  });
+
+  if (!res.ok) await parseChatError(res);
+  return res.json();
+};
+
+export const streamChatCompletion = async (
+  req: ChatCompletionRequest,
+  onDelta: (delta: string, accumulated: string) => void,
+  signal?: AbortSignal,
+): Promise<{ content: string; usage?: ChatCompletionResponse["usage"] }> => {
+  const base = getApiBase();
+  const res = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...req, stream: true }),
+    signal,
+  });
+
+  if (!res.ok) await parseChatError(res);
+
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const payload = (await res.json()) as ChatCompletionResponse;
+    const message = payload.choices[0]?.message?.content ?? "";
+    if (message) onDelta(message, message);
+    return { content: message, usage: payload.usage };
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let accumulated = "";
+  let usage: ChatCompletionResponse["usage"];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+
+    for (const event of events) {
+      const lines = event
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim());
+
+      if (lines.length === 0) continue;
+
+      for (const line of lines) {
+        if (!line || line === "[DONE]") continue;
+
+        const parsed = JSON.parse(line) as ChatCompletionResponse;
+        const delta = parsed.choices[0]?.delta?.content ?? parsed.choices[0]?.message?.content ?? "";
+        if (delta) {
+          accumulated += delta;
+          onDelta(delta, accumulated);
+        }
+        if (parsed.usage) usage = parsed.usage;
+      }
+    }
+  }
+
+  return { content: accumulated, usage };
+};
+
 // --- Models ---
 export const scanModels = () => apiFetch<ModelScanResponse>("/api/models/scan");
 export const scanCustomDirs = (directories: string[]) =>
@@ -276,6 +470,8 @@ export interface BenchmarkRunParams {
   n_gen?: number;
   flash_attn?: number;
   no_kv_offload?: number;
+  cache_type_k?: string;
+  cache_type_v?: string;
 }
 
 /**
@@ -304,7 +500,7 @@ export const runBenchmarkStream = async (
 
   const decoder = new TextDecoder();
   let buffer = "";
-  let finalResults: any = {};
+  let finalResults: { pp_tokens_per_second?: number; tg_tokens_per_second?: number; raw_output?: string; record_id?: number } = {};
 
   while (true) {
     const { done, value } = await reader.read();
@@ -331,16 +527,16 @@ export const runBenchmarkStream = async (
       if (!data) continue;
 
       try {
-        const parsed = JSON.parse(data);
+        const parsed = JSON.parse(data) as { line?: string; error?: string; pp_tokens_per_second?: number; tg_tokens_per_second?: number; raw_output?: string; record_id?: number };
         if (eventType === "log") {
-          onLog(parsed.line);
+          onLog(parsed.line ?? "");
         } else if (eventType === "done") {
           finalResults = parsed;
         } else if (eventType === "error") {
           throw new Error(parsed.error || "Benchmark failed");
         }
-      } catch (e: any) {
-        if (e.message && !e.message.includes("JSON")) throw e;
+      } catch (error: unknown) {
+        if (error instanceof Error && !error.message.includes("JSON")) throw error;
       }
     }
   }
@@ -351,7 +547,7 @@ export const runBenchmarkStream = async (
 export const getBenchmarkHistory = () => apiFetch<BenchmarkRecord[]>("/api/benchmarks/history");
 export const deleteBenchmark = (id: number) =>
   apiFetch(`/api/benchmarks/${id}`, { method: "DELETE" });
-export const importBenchmarks = (records: any[]) =>
+export const importBenchmarks = (records: BenchmarkRecord[] | Record<string, unknown>[]) =>
   apiFetch("/api/benchmarks/import", {
     method: "POST",
     body: JSON.stringify({ records }),
@@ -381,6 +577,17 @@ export const deleteProvider = (id: number) =>
   });
 export const checkProviderHealth = (id: number) =>
   apiFetch<ProviderHealthResponse>(`/api/providers/${id}/health`);
+export const getCommonProviderTemplates = () =>
+  apiFetch<CommonProviderTemplate[]>("/api/providers/common/templates");
+export const registerCommonProvider = (payload: CommonProviderRegisterPayload) =>
+  apiFetch<ProviderEndpoint>("/api/providers/common/register", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const startCommonProviderOAuth = (providerKey: string, nameOverride = "") =>
+  apiFetch<CommonProviderOAuthStartResponse>(`/api/providers/common/oauth/start/${providerKey}?name_override=${encodeURIComponent(nameOverride)}`);
+export const getProviderModels = (id: number) =>
+  apiFetch<ProviderModelItem[]>(`/api/providers/${id}/models`);
 
 // --- Model Routes ---
 export const getModelRoutes = () => apiFetch<ModelRouteItem[]>("/api/model-routes");
@@ -410,3 +617,114 @@ export const deleteMeshWorker = (id: number) =>
   apiFetch<{ message: string }>(`/api/mesh/workers/${id}`, {
     method: "DELETE",
   });
+
+// --- Model Property Overrides ---
+export interface ModelPropertyOverride {
+  id: number;
+  filepath: string;
+  display_name: string;
+  publisher: string;
+  quantize: string;
+  param_size: string;
+  arch: string;
+  model_family: string;
+  tags: string;
+  notes: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ModelPropertyOverridePayload {
+  filepath: string;
+  display_name: string;
+  publisher: string;
+  quantize: string;
+  param_size: string;
+  arch: string;
+  model_family: string;
+  tags: string;
+  notes: string;
+}
+
+export const getModelOverrides = () =>
+  apiFetch<ModelPropertyOverride[]>("/api/models/overrides");
+export const upsertModelOverride = (payload: ModelPropertyOverridePayload) =>
+  apiFetch<ModelPropertyOverride>("/api/models/overrides", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+export const deleteModelOverride = (id: number) =>
+  apiFetch<{ message: string }>(`/api/models/overrides/${id}`, {
+    method: "DELETE",
+  });
+
+// ==================
+// Reports
+// ==================
+export interface ReportSummary {
+  filename: string;
+  title: string;
+  report_type: string;
+  created_at: string;
+}
+
+export interface ReportDetail {
+  filename: string;
+  content: string;
+}
+
+export interface ReportCreatePayload {
+  report_type: string;
+  title: string;
+  component: string;
+  priority: string;
+  category: string;
+  description: string;
+  steps_to_reproduce?: string;
+  expected_behavior?: string;
+  actual_behavior?: string;
+  proposed_adjustment?: string;
+  benefits?: string;
+  technical_notes?: string;
+  effort?: string;
+  environment?: string;
+  console_errors?: string;
+  additional_context?: string;
+}
+
+export const getReports = () =>
+  apiFetch<ReportSummary[]>("/api/reports");
+
+export const getReport = (filename: string) =>
+  apiFetch<ReportDetail>(`/api/reports/${encodeURIComponent(filename)}`);
+
+export const createReport = (payload: ReportCreatePayload) =>
+  apiFetch<ReportSummary>("/api/reports", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+export const deleteReport = (filename: string) =>
+  apiFetch<{ ok: boolean }>(`/api/reports/${encodeURIComponent(filename)}`, {
+    method: "DELETE",
+  });
+
+export const uploadReportImage = async (file: File): Promise<{ filename: string }> => {
+  const base = getApiBase();
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${base}/api/reports/upload-image`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `Upload failed: ${res.status}`);
+  }
+  return res.json();
+};
+
+export const getReportImageUrl = (filename: string): string => {
+  const base = getApiBase();
+  return `${base}/api/reports/images/${encodeURIComponent(filename)}`;
+};

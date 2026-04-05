@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Sidebar from "@/components/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -33,8 +33,43 @@ export default function RoutesPage() {
   const [providers, setProviders] = useState<ProviderEndpoint[]>([]);
   const [form, setForm] = useState<ModelRoutePayload>(emptyForm);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<"priority" | "name" | "provider">("priority");
+  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const providerMap = useMemo(() => {
+    const map = new Map<number, ProviderEndpoint>();
+    for (const p of providers) map.set(p.id, p);
+    return map;
+  }, [providers]);
+
+  const filteredRoutes = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const filtered = routes.filter((item) => {
+      const providerName = providerMap.get(item.provider_id)?.name ?? "";
+      if (!q) return true;
+      return (
+        item.route_name.toLowerCase().includes(q) ||
+        item.match_value.toLowerCase().includes(q) ||
+        (item.target_model || "").toLowerCase().includes(q) ||
+        providerName.toLowerCase().includes(q)
+      );
+    });
+
+    filtered.sort((a, b) => {
+      if (sortBy === "name") return a.route_name.localeCompare(b.route_name);
+      if (sortBy === "provider") {
+        const aName = providerMap.get(a.provider_id)?.name ?? "";
+        const bName = providerMap.get(b.provider_id)?.name ?? "";
+        return aName.localeCompare(bName);
+      }
+      return a.priority - b.priority;
+    });
+
+    return filtered;
+  }, [routes, search, sortBy, providerMap]);
 
   const refresh = async () => {
     setLoading(true);
@@ -91,9 +126,9 @@ export default function RoutesPage() {
   };
 
   const handleDelete = async (id: number) => {
-    if (!confirm("Delete this model route?")) return;
     try {
       await deleteModelRoute(id);
+      if (pendingDeleteId === id) setPendingDeleteId(null);
       await refresh();
     } catch (e: any) {
       setError(e.message ?? "Delete failed");
@@ -180,22 +215,48 @@ export default function RoutesPage() {
             <CardTitle className="text-base">Route List {loading ? "(Loading...)" : ""}</CardTitle>
           </CardHeader>
           <CardContent>
-            {routes.length === 0 ? (
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search by route, match, target, provider"
+                className="h-8 w-72 text-xs"
+              />
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as "priority" | "name" | "provider")}
+                className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
+              >
+                <option value="priority">Sort: Priority</option>
+                <option value="name">Sort: Route Name</option>
+                <option value="provider">Sort: Provider</option>
+              </select>
+              <span className="text-xs text-muted-foreground">{filteredRoutes.length} result(s)</span>
+            </div>
+
+            {filteredRoutes.length === 0 ? (
               <p className="text-sm text-muted-foreground">No model routes configured.</p>
             ) : (
               <div className="space-y-3">
-                {routes.map((item) => (
+                {filteredRoutes.map((item) => (
                   <div key={item.id} className="rounded-md border border-border/40 bg-muted/20 p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <p className="text-sm font-semibold">{item.route_name}</p>
                         <p className="text-xs text-muted-foreground font-mono">
-                          {item.match_type}({item.match_value}) {"->"} {item.target_model || "(same model)"} · provider#{item.provider_id} · p={item.priority}
+                          {item.match_type}({item.match_value}) {"->"} {item.target_model || "(same model)"} · provider={providerMap.get(item.provider_id)?.name || `#${item.provider_id}`} · p={item.priority}
                         </p>
                       </div>
                       <div className="flex gap-2">
                         <Button variant="outline" size="sm" onClick={() => handleEdit(item)}>Edit</Button>
-                        <Button variant="destructive" size="sm" onClick={() => handleDelete(item.id)}>Delete</Button>
+                        {pendingDeleteId === item.id ? (
+                          <>
+                            <Button variant="destructive" size="sm" onClick={() => handleDelete(item.id)}>Confirm Delete</Button>
+                            <Button variant="outline" size="sm" onClick={() => setPendingDeleteId(null)}>Cancel</Button>
+                          </>
+                        ) : (
+                          <Button variant="destructive" size="sm" onClick={() => setPendingDeleteId(item.id)}>Delete</Button>
+                        )}
                       </div>
                     </div>
                   </div>

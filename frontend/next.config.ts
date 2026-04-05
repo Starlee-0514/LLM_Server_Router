@@ -1,14 +1,10 @@
 import type { NextConfig } from "next";
+const { getAllowedDevOrigins } = require("./lib/tailscale-origins");
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: [
-    "http://localhost:3000",
-    "http://192.168.50.106",
-    "http://100.120.202.82",
-    // 允許所有 192.168.x.x 和 100.x.x.x (Tailscale) 存取
-    "http://192.168.*",
-    "http://100.*",
-  ],
+  // Automatically includes localhost + all tailscale peer IPs from your account
+  // This allows development access from all devices in your tailscale network
+  allowedDevOrigins: getAllowedDevOrigins(),
 };
 
 export default nextConfig;

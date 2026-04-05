@@ -33,8 +33,17 @@ export default function MeshPage() {
   const [form, setForm] = useState<MeshWorkerHeartbeatPayload>(emptyForm);
   const [modelsText, setModelsText] = useState("");
   const [metadataText, setMetadataText] = useState("{}");
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<"recent" | "name" | "status">("recent");
+  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const providerMap = useMemo(() => {
+    const map = new Map<number, ProviderEndpoint>();
+    for (const p of providers) map.set(p.id, p);
+    return map;
+  }, [providers]);
 
   const refresh = async () => {
     setLoading(true);
@@ -55,16 +64,42 @@ export default function MeshPage() {
   }, []);
 
   const prettyWorkers = useMemo(
-    () =>
-      workers.map((w) => {
+    () => {
+      const decorated = workers.map((w) => {
         let modelCount = 0;
         try {
           const list = JSON.parse(w.models_json || "[]");
           if (Array.isArray(list)) modelCount = list.length;
         } catch {}
-        return { ...w, modelCount };
-      }),
-    [workers],
+        return {
+          ...w,
+          modelCount,
+          providerName: w.provider_id ? providerMap.get(w.provider_id)?.name ?? `#${w.provider_id}` : "(none)",
+        };
+      });
+
+      const q = search.trim().toLowerCase();
+      const filtered = decorated.filter((w) => {
+        if (!q) return true;
+        return (
+          w.node_name.toLowerCase().includes(q) ||
+          w.base_url.toLowerCase().includes(q) ||
+          w.status.toLowerCase().includes(q) ||
+          (w.providerName || "").toLowerCase().includes(q)
+        );
+      });
+
+      filtered.sort((a, b) => {
+        if (sortBy === "name") return a.node_name.localeCompare(b.node_name);
+        if (sortBy === "status") return a.status.localeCompare(b.status);
+        const aTime = a.last_seen_at ? new Date(a.last_seen_at).getTime() : 0;
+        const bTime = b.last_seen_at ? new Date(b.last_seen_at).getTime() : 0;
+        return bTime - aTime;
+      });
+
+      return filtered;
+    },
+    [workers, providerMap, search, sortBy],
   );
 
   const handleSubmitHeartbeat = async () => {
@@ -94,9 +129,9 @@ export default function MeshPage() {
   };
 
   const handleDelete = async (id: number) => {
-    if (!confirm("Delete this mesh worker?")) return;
     try {
       await deleteMeshWorker(id);
+      if (pendingDeleteId === id) setPendingDeleteId(null);
       await refresh();
     } catch (e: any) {
       setError(e.message ?? "Delete failed");
@@ -175,6 +210,25 @@ export default function MeshPage() {
             <CardTitle className="text-base">Worker List {loading ? "(Loading...)" : ""}</CardTitle>
           </CardHeader>
           <CardContent>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search by node, URL, status, provider"
+                className="h-8 w-72 text-xs"
+              />
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as "recent" | "name" | "status")}
+                className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
+              >
+                <option value="recent">Sort: Last Seen</option>
+                <option value="name">Sort: Node Name</option>
+                <option value="status">Sort: Status</option>
+              </select>
+              <span className="text-xs text-muted-foreground">{prettyWorkers.length} result(s)</span>
+            </div>
+
             {prettyWorkers.length === 0 ? (
               <p className="text-sm text-muted-foreground">No mesh workers registered.</p>
             ) : (
@@ -187,11 +241,21 @@ export default function MeshPage() {
                         <p className="text-xs text-muted-foreground font-mono">
                           {worker.base_url} · status={worker.status} · models={worker.modelCount}
                         </p>
+                        <p className="text-xs text-muted-foreground font-mono">provider={worker.providerName}</p>
                         <p className="text-xs text-muted-foreground">
                           last_seen={worker.last_seen_at ? new Date(worker.last_seen_at).toLocaleString() : "-"}
                         </p>
                       </div>
-                      <Button variant="destructive" size="sm" onClick={() => handleDelete(worker.id)}>Delete</Button>
+                      <div className="flex gap-2">
+                        {pendingDeleteId === worker.id ? (
+                          <>
+                            <Button variant="destructive" size="sm" onClick={() => handleDelete(worker.id)}>Confirm Delete</Button>
+                            <Button variant="outline" size="sm" onClick={() => setPendingDeleteId(null)}>Cancel</Button>
+                          </>
+                        ) : (
+                          <Button variant="destructive" size="sm" onClick={() => setPendingDeleteId(worker.id)}>Delete</Button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 ))}
