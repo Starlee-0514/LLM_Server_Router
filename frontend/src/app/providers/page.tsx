@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Sidebar from "@/components/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -15,8 +15,10 @@ import {
   getCommonProviderTemplates,
   getProviderModels,
   getProviders,
+  pollDeviceCodeFlow,
   registerCommonProvider,
   startCommonProviderOAuth,
+  startDeviceCodeFlow,
   updateProvider,
   type CommonProviderTemplate,
   type ProviderCreatePayload,
@@ -48,6 +50,13 @@ export default function ProvidersPage() {
   const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deviceCode, setDeviceCode] = useState<{
+    userCode: string;
+    verificationUri: string;
+    sessionId: string;
+  } | null>(null);
+  const [deviceCodePolling, setDeviceCodePolling] = useState(false);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const filteredProviders = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -142,7 +151,53 @@ export default function ProvidersPage() {
 
   const handleRegisterCommon = async (providerKey: string) => {
     try {
-      if (providerKey === "github_models" || providerKey === "google_gemini_openai") {
+      const tpl = commonTemplates.find((t) => t.provider_key === providerKey);
+
+      // Device Code Flow (GitHub Models)
+      if (tpl?.oauth_method === "device_code") {
+        const result = await startDeviceCodeFlow(providerKey, commonNameOverride);
+        setDeviceCode({
+          userCode: result.user_code,
+          verificationUri: result.verification_uri,
+          sessionId: result.session_id,
+        });
+        setDeviceCodePolling(true);
+
+        // Open verification URL
+        window.open(result.verification_uri, "_blank");
+
+        // Start polling
+        const poll = async (interval: number) => {
+          try {
+            const pollResult = await pollDeviceCodeFlow(result.session_id);
+            if (pollResult.status === "complete") {
+              setDeviceCode(null);
+              setDeviceCodePolling(false);
+              await refresh();
+              return;
+            }
+            if (pollResult.status === "expired" || pollResult.status === "error") {
+              setDeviceCode(null);
+              setDeviceCodePolling(false);
+              setError(pollResult.error || "Device code flow expired or failed");
+              return;
+            }
+            const nextInterval = pollResult.status === "slow_down"
+              ? (pollResult.interval || interval + 5) * 1000
+              : interval * 1000;
+            pollTimerRef.current = setTimeout(() => poll(nextInterval / 1000), nextInterval);
+          } catch (e: any) {
+            setDeviceCode(null);
+            setDeviceCodePolling(false);
+            setError(e.message ?? "Polling failed");
+          }
+        };
+        poll(result.interval);
+        return;
+      }
+
+      // PKCE Flow (Google Gemini)
+      if (tpl?.oauth_method === "pkce") {
         const started = await startCommonProviderOAuth(providerKey, commonNameOverride);
         const popup = window.open(started.auth_url, "provider-oauth", "width=640,height=800");
         if (!popup) {
@@ -160,6 +215,7 @@ export default function ProvidersPage() {
         return;
       }
 
+      // API Key flow (OpenRouter, etc.)
       await registerCommonProvider({
         provider_key: providerKey,
         api_key: commonApiKey,
@@ -185,7 +241,7 @@ export default function ProvidersPage() {
   return (
     <div className="flex min-h-screen">
       <Sidebar />
-      <main className="ml-56 flex-1 p-8">
+      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
         <div className="mb-8">
           <h1 className="text-2xl font-bold tracking-tight">Providers</h1>
           <p className="text-sm text-muted-foreground mt-1">管理 OpenAI-compatible / Anthropic / Local provider endpoints</p>
@@ -209,12 +265,50 @@ export default function ProvidersPage() {
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              GitHub / Google providers use OAuth login flow and no manual token input is required.
+              GitHub uses Device Code Flow (enter code in browser). Google uses OAuth with PKCE. OpenRouter uses API key.
             </p>
+
+            {deviceCode && (
+              <div className="rounded-md border border-blue-400/40 bg-blue-500/10 px-4 py-3">
+                <p className="text-sm font-medium mb-1">GitHub Device Code Flow</p>
+                <p className="text-xs text-muted-foreground mb-2">
+                  Go to <a href={deviceCode.verificationUri} target="_blank" rel="noopener noreferrer" className="underline text-blue-400">{deviceCode.verificationUri}</a> and enter this code:
+                </p>
+                <div className="flex items-center gap-3">
+                  <code className="text-lg font-bold tracking-widest bg-background/50 px-3 py-1 rounded border">{deviceCode.userCode}</code>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => navigator.clipboard.writeText(deviceCode.userCode)}
+                  >
+                    Copy
+                  </Button>
+                  {deviceCodePolling && <span className="text-xs text-muted-foreground animate-pulse">Waiting for authorization...</span>}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+                      setDeviceCode(null);
+                      setDeviceCodePolling(false);
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+
             <div className="flex flex-wrap gap-2">
               {commonTemplates.map((tpl) => (
-                <Button key={tpl.provider_key} variant="outline" size="sm" onClick={() => handleRegisterCommon(tpl.provider_key)}>
-                  {tpl.provider_key === "github_models" || tpl.provider_key === "google_gemini_openai" ? `Login ${tpl.label}` : `Add ${tpl.label}`}
+                <Button
+                  key={tpl.provider_key}
+                  variant="outline"
+                  size="sm"
+                  disabled={deviceCodePolling}
+                  onClick={() => handleRegisterCommon(tpl.provider_key)}
+                >
+                  {tpl.oauth_method === "device_code" || tpl.oauth_method === "pkce" ? `Login ${tpl.label}` : `Add ${tpl.label}`}
                 </Button>
               ))}
             </div>

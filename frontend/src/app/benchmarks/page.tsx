@@ -325,7 +325,7 @@ export default function BenchmarksPage() {
   return (
     <div className="flex min-h-screen">
       <Sidebar />
-      <main className="ml-56 flex-1 p-8">
+      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
         <div className="mb-6 flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">Benchmark Studio</h1>

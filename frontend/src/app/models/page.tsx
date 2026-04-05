@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import Sidebar from "@/components/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -44,6 +44,7 @@ import {
   buildLaunchPreview,
   createDefaultLaunchOptions,
   getPresetRecipe,
+  groupPresetRecipes,
   inferPresetFamily,
   inferPresetRecipeKey,
   parseExtraArgs,
@@ -101,11 +102,31 @@ export default function ModelsPage() {
   const [ovTags, setOvTags] = useState("");
   const [ovNotes, setOvNotes] = useState("");
   const [savingPresetMetaId, setSavingPresetMetaId] = useState<number | null>(null);
+  const [groupColumnWidth, setGroupColumnWidth] = useState(1.1);
+  const [fileColumnWidth, setFileColumnWidth] = useState(1.2);
+  const [recipeColumnWidth, setRecipeColumnWidth] = useState(0.9);
+  const [selectedWorkbenchId, setSelectedWorkbenchId] = useState<number | null>(null);
+  const [workbenchFamily, setWorkbenchFamily] = useState<PresetFamily>("universal");
+  const [workbenchRecipeKey, setWorkbenchRecipeKey] = useState("universal-balanced");
+  const [workbenchNgl, setWorkbenchNgl] = useState(999);
+  const [workbenchBatch, setWorkbenchBatch] = useState(1024);
+  const [workbenchUbatch, setWorkbenchUbatch] = useState(512);
+  const [workbenchCtx, setWorkbenchCtx] = useState(8192);
+  const [workbenchOptions, setWorkbenchOptions] = useState<LaunchOptionDraft>(createDefaultLaunchOptions());
+  const [savingWorkbench, setSavingWorkbench] = useState(false);
 
   const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : "Unknown error";
   const compiledExtraArgs = buildExtraArgs(launchOptions);
   const selectedRecipe = getPresetRecipe(selectedRecipeKey);
-  const recipeOptions = PRESET_RECIPES.filter((recipe) => recipe.family === newModelFamily || (newModelFamily === "universal" && recipe.family === "universal"));
+  const recipeGroups = groupPresetRecipes();
+  const selectedWorkbenchGroup = groups.find((group) => group.id === selectedWorkbenchId) ?? null;
+  const workbenchExtraArgs = buildExtraArgs(workbenchOptions);
+  const workbenchRecipe = getPresetRecipe(workbenchRecipeKey);
+  const modelsLayoutStyle = {
+    "--models-groups-col": `minmax(0, ${groupColumnWidth}fr)`,
+    "--models-files-col": `minmax(0, ${fileColumnWidth}fr)`,
+    "--models-recipes-col": `minmax(280px, ${recipeColumnWidth}fr)`,
+  } as CSSProperties;
   const launchPreview = buildLaunchPreview({
     runtimeName: newEngine,
     modelPath: newPath,
@@ -115,16 +136,34 @@ export default function ModelsPage() {
     ctx: newCtx,
     extraArgs: compiledExtraArgs,
   });
+  const workbenchPreview = buildLaunchPreview({
+    runtimeName: selectedWorkbenchGroup?.engine_type ?? "",
+    modelPath: selectedWorkbenchGroup?.model_path ?? "",
+    ngl: workbenchNgl,
+    batch: workbenchBatch,
+    ubatch: workbenchUbatch,
+    ctx: workbenchCtx,
+    extraArgs: workbenchExtraArgs,
+  });
 
   const applyRecipe = (recipeKey: string, baseOptions?: LaunchOptionDraft) => {
     const { recipe, options } = applyPresetRecipe(recipeKey, baseOptions ?? launchOptions);
-    setNewModelFamily(recipe.family);
     setSelectedRecipeKey(recipe.key);
     setNewNgl(recipe.ngl);
     setNewBatch(recipe.batch);
     setNewUbatch(recipe.ubatch);
     setNewCtx(recipe.ctx);
     setLaunchOptions(options);
+  };
+
+  const applyWorkbenchRecipe = (recipeKey: string, baseOptions?: LaunchOptionDraft) => {
+    const { recipe, options } = applyPresetRecipe(recipeKey, baseOptions ?? workbenchOptions);
+    setWorkbenchRecipeKey(recipe.key);
+    setWorkbenchNgl(recipe.ngl);
+    setWorkbenchBatch(recipe.batch);
+    setWorkbenchUbatch(recipe.ubatch);
+    setWorkbenchCtx(recipe.ctx);
+    setWorkbenchOptions(options);
   };
 
   const updateLaunchOption = <K extends keyof LaunchOptionDraft>(key: K, value: LaunchOptionDraft[K]) => {
@@ -223,19 +262,12 @@ export default function ModelsPage() {
 
   // Group models by group_name
   const groupedModels = groups.reduce((acc, g) => {
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      const match = g.name.toLowerCase().includes(q) ||
-                    g.group_name.toLowerCase().includes(q) ||
-                    g.description.toLowerCase().includes(q);
-      if (!match) return acc;
-    }
     const key = g.group_name || "Default";
     if (!acc[key]) acc[key] = [];
     acc[key].push(g);
     return acc;
   }, {} as Record<string, ModelGroup[]>);
-  const groupNames = Object.keys(groupedModels);
+  const groupNames = Object.keys(groupedModels).sort((a, b) => a.localeCompare(b));
   const runtimeNames = runtimes.map((runtime) => runtime.name);
 
   const hydratePresetFromModel = (model: GGUFFileInfo) => {
@@ -255,6 +287,26 @@ export default function ModelsPage() {
     setNewBatch(recipe.batch);
     setNewUbatch(recipe.ubatch);
     setNewCtx(recipe.ctx);
+  };
+
+  const loadWorkbenchFromGroup = (group: ModelGroup) => {
+    const parsedOptions = parseExtraArgs(group.extra_args || "");
+    const inferredRecipe = group.preset_recipe || inferPresetRecipeKey({
+      model_family: group.model_family,
+      filename: group.name,
+      arch: group.description,
+      model_type: group.extra_args.includes("--mmproj") ? "multimodal_base" : "text",
+    });
+    const hydrated = applyPresetRecipe(inferredRecipe, parsedOptions);
+
+    setSelectedWorkbenchId(group.id);
+    setWorkbenchFamily((group.model_family || hydrated.recipe.family) as PresetFamily);
+    setWorkbenchRecipeKey(hydrated.recipe.key);
+    setWorkbenchNgl(group.n_gpu_layers);
+    setWorkbenchBatch(group.batch_size);
+    setWorkbenchUbatch(group.ubatch_size);
+    setWorkbenchCtx(group.ctx_size);
+    setWorkbenchOptions(hydrated.options);
   };
 
   const refreshAll = useCallback(async () => {
@@ -401,6 +453,32 @@ export default function ModelsPage() {
       setSavingPresetMetaId(null);
     }
   };
+  const handleSaveWorkbench = async () => {
+    if (!selectedWorkbenchGroup) return;
+
+    setSavingWorkbench(true);
+    try {
+      await updateModelGroup(selectedWorkbenchGroup.id, {
+        group_name: selectedWorkbenchGroup.group_name,
+        name: selectedWorkbenchGroup.name,
+        description: selectedWorkbenchGroup.description,
+        model_path: selectedWorkbenchGroup.model_path,
+        engine_type: selectedWorkbenchGroup.engine_type,
+        n_gpu_layers: workbenchNgl,
+        batch_size: workbenchBatch,
+        ubatch_size: workbenchUbatch,
+        ctx_size: workbenchCtx,
+        model_family: workbenchFamily,
+        preset_recipe: workbenchRecipeKey,
+        extra_args: workbenchExtraArgs,
+      });
+      await refreshAll();
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
+    } finally {
+      setSavingWorkbench(false);
+    }
+  };
   const isRunning = (name: string) => processes.processes.some((p) => p.identifier === name && p.is_running);
 
   useEffect(() => {
@@ -417,6 +495,25 @@ export default function ModelsPage() {
       setActiveGroupTab(groupNames[0]);
     }
   }, [groupNames, activeGroupTab]);
+
+  useEffect(() => {
+    const activeGroups = activeGroupTab ? groupedModels[activeGroupTab] ?? [] : [];
+    if (activeGroups.length === 0) {
+      if (selectedWorkbenchId !== null) {
+        setSelectedWorkbenchId(null);
+      }
+      return;
+    }
+
+    if (!selectedWorkbenchId || !groups.some((group) => group.id === selectedWorkbenchId)) {
+      loadWorkbenchFromGroup(activeGroups[0]);
+      return;
+    }
+
+    if (activeGroups.every((group) => group.id !== selectedWorkbenchId)) {
+      loadWorkbenchFromGroup(activeGroups[0]);
+    }
+  }, [activeGroupTab, groupedModels, groups, selectedWorkbenchId]);
 
   useEffect(() => {
     if (editingGroupId) return;
@@ -446,7 +543,7 @@ export default function ModelsPage() {
   return (
     <div className="flex min-h-screen bg-[radial-gradient(circle_at_top_right,rgba(56,189,248,0.14),transparent_42%),radial-gradient(circle_at_20%_20%,rgba(14,165,233,0.12),transparent_38%)]">
       <Sidebar />
-      <main className="ml-56 flex-1 p-8">
+      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
         <div className="mb-6 flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Model Studio</h1>
@@ -462,11 +559,11 @@ export default function ModelsPage() {
                   + New Group
                 </Button>
               </DialogTrigger>
-              <DialogContent className="sm:max-w-4xl max-h-[88vh] overflow-hidden">
+              <DialogContent className="sm:max-w-4xl max-h-[88vh] overflow-hidden p-0">
                 <DialogHeader>
                   <DialogTitle>{editingGroupId ? "編輯模型群組" : "建立模型群組"}</DialogTitle>
                 </DialogHeader>
-                <div className="grid gap-4 overflow-y-auto py-4 pr-2">
+                <div className="grid max-h-[calc(88vh-6rem)] gap-4 overflow-y-auto px-6 py-4 pr-4">
                   <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
                     <Tabs defaultValue="identity" className="min-w-0">
                       <TabsList className="grid w-full grid-cols-3 bg-muted/40">
@@ -493,14 +590,11 @@ export default function ModelsPage() {
                         </div>
                         <div className="grid gap-4 sm:grid-cols-2">
                           <div className="grid gap-2">
-                            <Label>Model Family</Label>
+                            <Label>Model Classification</Label>
                             <select
                               value={newModelFamily}
                               onChange={(e) => {
-                                const nextFamily = e.target.value as PresetFamily;
-                                setNewModelFamily(nextFamily);
-                                const fallbackRecipe = PRESET_RECIPES.find((recipe) => recipe.family === nextFamily) ?? PRESET_RECIPES[0];
-                                applyRecipe(fallbackRecipe.key);
+                                  setNewModelFamily(e.target.value as PresetFamily);
                               }}
                               className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                             >
@@ -510,14 +604,18 @@ export default function ModelsPage() {
                             </select>
                           </div>
                           <div className="grid gap-2">
-                            <Label>Preset Recipe</Label>
+                            <Label>Recipe Setup</Label>
                             <select
                               value={selectedRecipeKey}
                               onChange={(e) => applyRecipe(e.target.value)}
                               className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                             >
-                              {(recipeOptions.length > 0 ? recipeOptions : PRESET_RECIPES).map((recipe) => (
-                                <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
+                              {recipeGroups.map((group) => (
+                                <optgroup key={group.key} label={group.label}>
+                                  {group.recipes.map((recipe) => (
+                                    <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
+                                  ))}
+                                </optgroup>
                               ))}
                             </select>
                           </div>
@@ -693,7 +791,7 @@ export default function ModelsPage() {
                           <p className="mt-1 break-all font-mono text-[10px] text-slate-300">{compiledExtraArgs || "No extra args"}</p>
                         </div>
                         <p className="text-[11px] text-slate-400">
-                          Dense and MoE are editable fields now. Recipe selection is stored with each preset and exposed directly in the group list.
+                          Recipe setup is stored separately from model classification, so changing one no longer forces the other.
                         </p>
                       </div>
                     </div>
@@ -709,59 +807,47 @@ export default function ModelsPage() {
           </div>
         </div>
 
-        {/* Search & Filter Bar */}
-        <div className="mb-6 flex gap-3 items-end flex-wrap">
-          <div className="flex-1 min-w-[200px] relative">
-            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">🔍</span>
-            <Input
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search by filename, arch, publisher, path..."
-              className="pl-9 h-10 border-border/40 bg-card/40"
-            />
+        <div className="mb-6 rounded-3xl border border-border/40 bg-card/55 p-4 backdrop-blur-sm">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold tracking-[0.16em] uppercase text-muted-foreground">Workspace Columns</h2>
+              <p className="mt-1 text-xs text-muted-foreground">Recipe setups now live on the root page. Tune the column widths to suit your screen.</p>
+            </div>
+            <Badge variant="outline" className="text-[10px] uppercase tracking-[0.18em]">3-column studio</Badge>
           </div>
-          <div className="grid gap-1">
-            <Label className="text-[10px] text-muted-foreground">Quantize</Label>
-            <select value={filterQuant} onChange={e => setFilterQuant(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
-              <option value="" className="bg-background text-foreground">All</option>
-              {allQuants.map(q => <option key={q} value={q} className="bg-background text-foreground">{q}</option>)}
-            </select>
-          </div>
-          <div className="grid gap-1">
-            <Label className="text-[10px] text-muted-foreground">Param Size</Label>
-            <select value={filterParamSize} onChange={e => setFilterParamSize(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
-              <option value="" className="bg-background text-foreground">All</option>
-              {allParamSizes.map(p => <option key={p} value={p} className="bg-background text-foreground">{p}</option>)}
-            </select>
-          </div>
-          <div className="grid gap-1">
-            <Label className="text-[10px] text-muted-foreground">Architecture</Label>
-            <select value={filterArch} onChange={e => setFilterArch(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring max-w-[150px]">
-              <option value="" className="bg-background text-foreground">All</option>
-              {allArchs.map(a => <option key={a} value={a} className="bg-background text-foreground">{a}</option>)}
-            </select>
-          </div>
-          <div className="grid gap-1">
-            <Label className="text-[10px] text-muted-foreground">Publisher</Label>
-            <select value={filterPublisher} onChange={e => setFilterPublisher(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
-              <option value="" className="bg-background text-foreground">All</option>
-              {allPublishers.map(p => <option key={p} value={p} className="bg-background text-foreground">{p}</option>)}
-            </select>
-          </div>
-          <div className="grid gap-1">
-            <Label className="text-[10px] text-muted-foreground">Model Type</Label>
-            <select value={filterModelType} onChange={e => setFilterModelType(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
-              <option value="" className="bg-background text-foreground">All</option>
-              {allModelTypes.map(t => <option key={t} value={t} className="bg-background text-foreground">{t}</option>)}
-            </select>
+          <div className="grid gap-4 xl:grid-cols-3">
+            <label className="grid gap-2 text-xs">
+              <span className="flex items-center justify-between text-muted-foreground">
+                <span>Groups</span>
+                <span>{groupColumnWidth.toFixed(1)}fr</span>
+              </span>
+              <input type="range" min="0.8" max="1.8" step="0.1" value={groupColumnWidth} onChange={(e) => setGroupColumnWidth(Number(e.target.value))} />
+            </label>
+            <label className="grid gap-2 text-xs">
+              <span className="flex items-center justify-between text-muted-foreground">
+                <span>Files</span>
+                <span>{fileColumnWidth.toFixed(1)}fr</span>
+              </span>
+              <input type="range" min="0.9" max="2.1" step="0.1" value={fileColumnWidth} onChange={(e) => setFileColumnWidth(Number(e.target.value))} />
+            </label>
+            <label className="grid gap-2 text-xs">
+              <span className="flex items-center justify-between text-muted-foreground">
+                <span>Recipes</span>
+                <span>{recipeColumnWidth.toFixed(1)}fr</span>
+              </span>
+              <input type="range" min="0.8" max="1.6" step="0.1" value={recipeColumnWidth} onChange={(e) => setRecipeColumnWidth(Number(e.target.value))} />
+            </label>
           </div>
         </div>
 
-        {/* Two-Column Layout */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Three-Column Layout */}
+        <div
+          className="grid grid-cols-1 gap-6 xl:grid-cols-[var(--models-groups-col)_var(--models-files-col)_var(--models-recipes-col)]"
+          style={modelsLayoutStyle}
+        >
 
           {/* LEFT: Model Groups */}
-          <div>
+          <div className="min-w-0">
             <h2 className="text-lg font-semibold mb-3">Model Groups</h2>
             {groupNames.length > 0 ? (
               <Tabs value={activeGroupTab || groupNames[0]} onValueChange={setActiveGroupTab} className="w-full">
@@ -785,7 +871,11 @@ export default function ModelsPage() {
                           model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text",
                         });
                         return (
-                          <Card key={g.id} className="border-border/40 bg-card/60 backdrop-blur-sm shadow-[0_8px_20px_-12px_rgba(56,189,248,0.4)]">
+                          <Card
+                            key={g.id}
+                            onClick={() => loadWorkbenchFromGroup(g)}
+                            className={`cursor-pointer border-border/40 bg-card/60 backdrop-blur-sm shadow-[0_8px_20px_-12px_rgba(56,189,248,0.4)] transition ${selectedWorkbenchId === g.id ? "ring-1 ring-cyan-400/45 shadow-[0_12px_26px_-16px_rgba(34,211,238,0.65)]" : "hover:border-cyan-400/25"}`}
+                          >
                             <CardContent className="flex items-center justify-between py-3">
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2">
@@ -798,7 +888,7 @@ export default function ModelsPage() {
                                 <p className="text-[10px] text-muted-foreground font-mono mt-1 truncate">{g.model_path}</p>
                                 <div className="mt-2 grid gap-2 md:grid-cols-2">
                                   <div className="grid gap-1">
-                                    <Label className="text-[10px] text-muted-foreground">Family</Label>
+                                    <Label className="text-[10px] text-muted-foreground">Classification</Label>
                                     <select
                                       value={g.model_family || presetFamily}
                                       onChange={(e) => void handleInlinePresetUpdate(g, { model_family: e.target.value as PresetFamily })}
@@ -818,8 +908,12 @@ export default function ModelsPage() {
                                       disabled={savingPresetMetaId === g.id}
                                       className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
                                     >
-                                      {PRESET_RECIPES.filter((recipe) => recipe.family === (g.model_family || presetFamily) || ((g.model_family || presetFamily) === "universal" && recipe.family === "universal")).map((recipe) => (
-                                        <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
+                                      {recipeGroups.map((group) => (
+                                        <optgroup key={group.key} label={group.label}>
+                                          {group.recipes.map((recipe) => (
+                                            <option key={recipe.key} value={recipe.key}>{recipe.label}</option>
+                                          ))}
+                                        </optgroup>
                                       ))}
                                     </select>
                                   </div>
@@ -874,12 +968,58 @@ export default function ModelsPage() {
           </div>
 
           {/* RIGHT: Discovered Files */}
-          <div>
+          <div className="min-w-0">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="text-lg font-semibold">Discovered GGUF Files <Badge variant="secondary" className="ml-2">{sortedModels.length}</Badge></h2>
               <div className="flex gap-2 text-xs">
                 <Button variant="ghost" size="sm" onClick={() => handleSort("filename")}>Name {sortKey === "filename" ? (sortOrder === "asc" ? "↑" : "↓") : ""}</Button>
                 <Button variant="ghost" size="sm" onClick={() => handleSort("size_bytes")}>Size {sortKey === "size_bytes" ? (sortOrder === "asc" ? "↑" : "↓") : ""}</Button>
+              </div>
+            </div>
+            <div className="mb-4 flex flex-wrap items-end gap-3 rounded-2xl border border-border/40 bg-card/40 p-3">
+              <div className="min-w-[220px] flex-1 relative">
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">🔍</span>
+                <Input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Filter discovered files by name, arch, publisher, path..."
+                  className="pl-9 h-10 border-border/40 bg-card/40"
+                />
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-[10px] text-muted-foreground">Quantize</Label>
+                <select value={filterQuant} onChange={e => setFilterQuant(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                  <option value="" className="bg-background text-foreground">All</option>
+                  {allQuants.map(q => <option key={q} value={q} className="bg-background text-foreground">{q}</option>)}
+                </select>
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-[10px] text-muted-foreground">Param Size</Label>
+                <select value={filterParamSize} onChange={e => setFilterParamSize(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                  <option value="" className="bg-background text-foreground">All</option>
+                  {allParamSizes.map(p => <option key={p} value={p} className="bg-background text-foreground">{p}</option>)}
+                </select>
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-[10px] text-muted-foreground">Architecture</Label>
+                <select value={filterArch} onChange={e => setFilterArch(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring max-w-[150px]">
+                  <option value="" className="bg-background text-foreground">All</option>
+                  {allArchs.map(a => <option key={a} value={a} className="bg-background text-foreground">{a}</option>)}
+                </select>
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-[10px] text-muted-foreground">Publisher</Label>
+                <select value={filterPublisher} onChange={e => setFilterPublisher(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                  <option value="" className="bg-background text-foreground">All</option>
+                  {allPublishers.map(p => <option key={p} value={p} className="bg-background text-foreground">{p}</option>)}
+                </select>
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-[10px] text-muted-foreground">Model Type</Label>
+                <select value={filterModelType} onChange={e => setFilterModelType(e.target.value)} className="flex h-9 rounded-md border border-input bg-background px-3 py-1 text-xs shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                  <option value="" className="bg-background text-foreground">All</option>
+                  {allModelTypes.map(t => <option key={t} value={t} className="bg-background text-foreground">{t}</option>)}
+                </select>
               </div>
             </div>
             {errors.length > 0 && (
@@ -974,16 +1114,164 @@ export default function ModelsPage() {
             )}
           </div>
 
+          <div className="min-w-0 xl:sticky xl:top-8 xl:self-start">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold">Recipe Setups</h2>
+              {selectedWorkbenchGroup && (
+                <Badge variant="secondary" className="uppercase text-[10px] tracking-[0.18em]">
+                  {selectedWorkbenchGroup.group_name}
+                </Badge>
+              )}
+            </div>
+            <Card className="border-cyan-400/20 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.14),transparent_42%),rgba(2,6,23,0.82)] text-slate-100 shadow-[0_18px_50px_-28px_rgba(34,211,238,0.55)]">
+              <CardContent className="space-y-4 pt-6">
+                {selectedWorkbenchGroup ? (
+                  <>
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Focused preset</p>
+                      <p className="mt-2 text-base font-semibold text-white">{selectedWorkbenchGroup.name}</p>
+                      <p className="mt-1 text-xs text-slate-400">{selectedWorkbenchGroup.model_path}</p>
+                    </div>
+
+                    <div className="grid gap-2">
+                      <Label className="text-xs text-slate-300">Preset Target</Label>
+                      <select
+                        value={selectedWorkbenchGroup.id}
+                        onChange={(e) => {
+                          const nextGroup = groups.find((group) => group.id === Number(e.target.value));
+                          if (nextGroup) loadWorkbenchFromGroup(nextGroup);
+                        }}
+                        className="flex h-9 w-full rounded-md border border-white/10 bg-black/30 px-3 py-1 text-sm text-white shadow-xs"
+                      >
+                        {[...groups].sort((a, b) => a.group_name.localeCompare(b.group_name) || a.name.localeCompare(b.name)).map((group) => (
+                          <option key={group.id} value={group.id} className="bg-slate-950 text-white">
+                            {group.group_name} / {group.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <div className="grid gap-2">
+                        <Label className="text-xs text-slate-300">Model Classification</Label>
+                        <select
+                          value={workbenchFamily}
+                          onChange={(e) => {
+                            setWorkbenchFamily(e.target.value as PresetFamily);
+                          }}
+                          className="flex h-9 w-full rounded-md border border-white/10 bg-black/30 px-3 py-1 text-sm text-white shadow-xs"
+                        >
+                          {PRESET_FAMILY_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value} className="bg-slate-950 text-white">{option.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label className="text-xs text-slate-300">Recipe Setup</Label>
+                        <select
+                          value={workbenchRecipeKey}
+                          onChange={(e) => applyWorkbenchRecipe(e.target.value)}
+                          className="flex h-9 w-full rounded-md border border-white/10 bg-black/30 px-3 py-1 text-sm text-white shadow-xs"
+                        >
+                          {recipeGroups.map((group) => (
+                            <optgroup key={group.key} label={group.label}>
+                              {group.recipes.map((recipe) => (
+                                <option key={recipe.key} value={recipe.key} className="bg-slate-950 text-white">{recipe.label}</option>
+                              ))}
+                            </optgroup>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="grid gap-2">
+                        <Label className="text-xs text-slate-300">GPU Layers</Label>
+                        <Input type="number" value={workbenchNgl} onChange={(e) => setWorkbenchNgl(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label className="text-xs text-slate-300">Batch</Label>
+                        <Input type="number" value={workbenchBatch} onChange={(e) => setWorkbenchBatch(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label className="text-xs text-slate-300">UBatch</Label>
+                        <Input type="number" value={workbenchUbatch} onChange={(e) => setWorkbenchUbatch(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label className="text-xs text-slate-300">Context</Label>
+                        <Input type="number" value={workbenchCtx} onChange={(e) => setWorkbenchCtx(Number(e.target.value) || 0)} className="border-white/10 bg-black/30 text-white" />
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-white">{workbenchRecipe.label}</p>
+                          <p className="mt-1 text-[11px] text-slate-400">{workbenchRecipe.description}</p>
+                        </div>
+                        <Badge variant="outline" className="uppercase text-[10px] tracking-[0.18em] text-cyan-100">
+                          {workbenchFamily}
+                        </Badge>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {workbenchRecipe.tags.map((tag) => (
+                          <Badge key={tag} className="bg-cyan-500/15 text-cyan-200">{tag}</Badge>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="grid gap-2">
+                      <Label className="text-xs text-slate-300">Generated CLI Args</Label>
+                      <Textarea value={workbenchExtraArgs} readOnly className="min-h-24 border-white/10 bg-black/30 font-mono text-xs text-slate-200" />
+                    </div>
+
+                    <div className="rounded-2xl border border-cyan-400/20 bg-cyan-500/8 p-4">
+                      <p className="text-[11px] uppercase tracking-[0.18em] text-cyan-200">Launch Preview</p>
+                      <p className="mt-2 break-all font-mono text-[10px] text-cyan-100/85">{workbenchPreview}</p>
+                    </div>
+
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        className="flex-1 border-white/10 bg-black/20 text-white hover:bg-white/10"
+                        onClick={() => loadWorkbenchFromGroup(selectedWorkbenchGroup)}
+                        disabled={savingWorkbench}
+                      >
+                        Reset
+                      </Button>
+                      <Button
+                        className="flex-1 bg-gradient-to-r from-cyan-500 to-blue-500 text-white shadow-lg shadow-cyan-500/20"
+                        onClick={handleSaveWorkbench}
+                        disabled={savingWorkbench}
+                      >
+                        {savingWorkbench ? "Saving..." : "Save Recipe Setup"}
+                      </Button>
+                    </div>
+
+                    <p className="text-[11px] text-slate-400">
+                      Use the dialog for advanced launch switches. This column keeps model classification, recipe setup, and tuning edits visible without mixing them together.
+                    </p>
+                  </>
+                ) : (
+                  <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 p-6 text-center">
+                    <p className="text-sm text-slate-300">Select a model group to tune its recipe.</p>
+                    <p className="mt-1 text-xs text-slate-500">The workbench follows the active group tab automatically.</p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
         </div>
 
         {/* Model Property Override Dialog */}
         <Dialog open={overrideDialogOpen} onOpenChange={setOverrideDialogOpen}>
-          <DialogContent className="sm:max-w-md">
+          <DialogContent className="sm:max-w-md max-h-[85vh] overflow-hidden">
             <DialogHeader>
               <DialogTitle>Edit Model Properties</DialogTitle>
             </DialogHeader>
             {overrideTarget && (
-              <div className="grid gap-3 py-3">
+              <div className="grid max-h-[calc(85vh-5rem)] gap-3 overflow-y-auto py-3 pr-2">
                 <p className="text-[11px] text-muted-foreground font-mono truncate">{overrideTarget.filename}</p>
                 <div className="grid gap-2">
                   <Label className="text-xs">Display Name</Label>
@@ -1010,7 +1298,7 @@ export default function ModelsPage() {
                   </div>
                 </div>
                 <div className="grid gap-2">
-                  <Label className="text-xs">Model Family</Label>
+                  <Label className="text-xs">Model Classification</Label>
                   <select value={ovModelFamily} onChange={(e) => setOvModelFamily(e.target.value)} className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs">
                     {PRESET_FAMILY_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>{option.label}</option>

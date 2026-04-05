@@ -1,6 +1,7 @@
 import type { GGUFFileInfo } from "@/lib/api";
 
 export type PresetFamily = "universal" | "dense" | "moe" | "multimodal";
+export type PresetRecipeGroupKey = "coverage" | "topology";
 
 export const PRESET_FAMILY_OPTIONS: Array<{ value: PresetFamily; label: string }> = [
   { value: "universal", label: "Universal" },
@@ -37,6 +38,19 @@ export interface PresetRecipe {
   ctx: number;
   options: Partial<LaunchOptionDraft>;
 }
+
+export const PRESET_RECIPE_GROUPS: Array<{ key: PresetRecipeGroupKey; label: string; description: string }> = [
+  {
+    key: "coverage",
+    label: "Universal / Multimodal",
+    description: "Recipes that describe whether the setup is general-purpose text or vision-capable.",
+  },
+  {
+    key: "topology",
+    label: "Dense / MoE",
+    description: "Recipes that describe how the model behaves under memory and routing pressure.",
+  },
+];
 
 export const createDefaultLaunchOptions = (): LaunchOptionDraft => ({
   flashAttn: true,
@@ -137,6 +151,15 @@ const FAMILY_KEYWORDS: Record<Exclude<PresetFamily, "universal">, RegExp> = {
 
 export const getPresetRecipe = (key: string) =>
   PRESET_RECIPES.find((recipe) => recipe.key === key) ?? PRESET_RECIPES[0];
+
+export const getPresetRecipeGroupKey = (recipe: PresetRecipe): PresetRecipeGroupKey =>
+  recipe.family === "universal" || recipe.family === "multimodal" ? "coverage" : "topology";
+
+export const groupPresetRecipes = (recipes: PresetRecipe[] = PRESET_RECIPES) =>
+  PRESET_RECIPE_GROUPS.map((group) => ({
+    ...group,
+    recipes: recipes.filter((recipe) => getPresetRecipeGroupKey(recipe) === group.key),
+  }));
 
 export const applyPresetRecipe = (
   key: string,

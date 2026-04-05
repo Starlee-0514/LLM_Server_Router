@@ -203,7 +203,7 @@ export default function SettingsPage() {
   return (
     <div className="flex min-h-screen">
       <Sidebar />
-      <main className="ml-56 flex-1 p-8">
+      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
         <div className="mb-8">
           <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
           <p className="text-sm text-muted-foreground mt-1">系統配置管理</p>

@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
-import Sidebar from "@/components/sidebar";
+import { useEffect, useState, useCallback } from "react";
+import Sidebar, { sidebarNavItems } from "@/components/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,17 +20,13 @@ import {
   type ReportCreatePayload,
 } from "@/lib/api";
 
-const COMPONENTS = [
-  "Dashboard",
-  "Models",
-  "Benchmarks",
-  "Providers",
-  "Routes",
-  "Mesh",
-  "Settings",
-  "Sidebar/Navigation",
-  "General/Global",
-];
+const COMPONENTS = Array.from(
+  new Set([
+    ...sidebarNavItems.map((item) => item.label),
+    "Sidebar/Navigation",
+    "General/Global",
+  ]),
+);
 
 const PRIORITIES_BUG = ["Critical", "High", "Medium", "Low"];
 const PRIORITIES_ADJ = ["P0 - Critical", "P1 - High", "P2 - Medium", "P3 - Low"];
@@ -56,6 +52,7 @@ const CATEGORIES_ADJ = [
 ];
 
 const EFFORTS = ["XS (< 1 hour)", "S (1-2 hours)", "M (2-4 hours)", "L (4-8 hours)", "XL (> 8 hours)"];
+const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : "Unknown error";
 
 export default function ReportsPage() {
   const [activeTab, setActiveTab] = useState("submit");
@@ -104,8 +101,8 @@ export default function ReportsPage() {
           const url = getReportImageUrl(filename);
           setUploadedImages((prev) => [...prev, { filename, url }]);
           setter((prev) => prev + (prev ? "\n" : "") + `![screenshot](${url})`);
-        } catch (err: any) {
-          alert("Image upload failed: " + err.message);
+        } catch (error: unknown) {
+          alert("Image upload failed: " + getErrorMessage(error));
         } finally {
           setUploading(false);
         }
@@ -170,8 +167,8 @@ export default function ReportsPage() {
       resetForm();
       await refresh();
       setTimeout(() => setSubmitted(false), 3000);
-    } catch (e: any) {
-      alert("Failed to submit: " + e.message);
+    } catch (error: unknown) {
+      alert("Failed to submit: " + getErrorMessage(error));
     } finally {
       setSubmitting(false);
     }
@@ -182,8 +179,8 @@ export default function ReportsPage() {
       const data = await getReport(filename);
       setViewContent(data.content);
       setViewFilename(data.filename);
-    } catch (e: any) {
-      alert(e.message);
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
     }
   };
 
@@ -196,17 +193,9 @@ export default function ReportsPage() {
         setViewFilename("");
       }
       await refresh();
-    } catch (e: any) {
-      alert(e.message);
+    } catch (error: unknown) {
+      alert(getErrorMessage(error));
     }
-  };
-
-  const priorityColor = (p: string) => {
-    const l = p.toLowerCase();
-    if (l.includes("critical") || l.includes("p0")) return "text-red-400 border-red-400/40";
-    if (l.includes("high") || l.includes("p1")) return "text-orange-400 border-orange-400/40";
-    if (l.includes("medium") || l.includes("p2")) return "text-yellow-400 border-yellow-400/40";
-    return "text-green-400 border-green-400/40";
   };
 
   const typeColor = (t: string) => {
@@ -221,7 +210,7 @@ export default function ReportsPage() {
   return (
     <div className="flex min-h-screen">
       <Sidebar />
-      <main className="ml-56 flex-1 p-8">
+      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
         <div className="mb-6">
           <h1 className="text-2xl font-bold tracking-tight">Debug Reports</h1>
           <p className="text-sm text-muted-foreground mt-1">
