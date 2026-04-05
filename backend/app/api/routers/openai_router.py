@@ -20,20 +20,40 @@ from backend.app.api.routers.provider_routes import (
     COPILOT_STATIC_HEADERS,
 )
 from backend.app.database import get_db
-from backend.app.models import ProviderEndpoint, ModelRoute, MeshWorker
+from backend.app.models import ProviderEndpoint, ModelRoute, MeshWorker, VirtualModel
+from backend.app.services.route_resolver import (
+    resolve_candidates,
+    DEFAULT_POLICY,
+    POLICY_LOCAL_ONLY,
+    POLICY_REMOTE_ONLY,
+)
+from backend.app.services.tool_normalizer import (
+    translate_tools,
+    translate_tools_for_anthropic,
+    validate_tool_call_arguments,
+    build_tool_validation_retry_message,
+    extract_tool_calls_from_response,
+    MAX_TOOL_ITERATIONS,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["openai"])
 
 # 建立重複使用的非同步 HTTP Client
-http_client = httpx.AsyncClient()
+# 預設 5s 超時太短 (Google Gemini 首個 chunk 可能 >5s)，改用寬鬆設定
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=15.0, read=5.0, write=30.0, pool=5.0)
+)
 
 
-def _log_completion_usage(body: dict, resp_json: dict, target_url: str, db: Session | None = None, elapsed: float | None = None):
+def _log_completion_usage(body: dict, resp_json: dict, target_url: str, db: Session | None = None, elapsed: float | None = None,
+                          model_resolved: str | None = None, provider_name: str | None = None,
+                          provider_type: str | None = None, conversation_id: str | None = None,
+                          tool_calls_count: int = 0):
     """Log prompt summary and token usage for every successful completion.
     
-    When db is provided, also record an auto-benchmark entry.
+    When db is provided, also record an auto-benchmark entry and CompletionLog row.
     """
     from backend.app.core.dev_logs import log_completion
 
@@ -57,29 +77,85 @@ def _log_completion_usage(body: dict, resp_json: dict, target_url: str, db: Sess
     log_completion(model, prompt_tokens, completion_tokens, total_tokens,
                    elapsed or 0, target_url, prompt_preview)
 
-    # Auto-record as benchmark entry when usage data available
-    if db and elapsed and elapsed > 0 and completion_tokens and completion_tokens > 0:
+    if db:
+        # Write CompletionLog row
         try:
-            from backend.app.models import BenchmarkRecord
-            pp_tps = prompt_tokens / elapsed if prompt_tokens else None
-            tg_tps = completion_tokens / elapsed if completion_tokens else None
-            record = BenchmarkRecord(
-                model_name=model,
-                model_path=target_url,
-                engine_type="api",
-                n_gpu_layers=0,
-                batch_size=0,
-                ubatch_size=0,
-                ctx_size=0,
-                pp_tokens_per_second=round(pp_tps, 2) if pp_tps else None,
-                tg_tokens_per_second=round(tg_tps, 2) if tg_tps else None,
-                raw_output=f"auto-recorded: prompt={prompt_tokens} completion={completion_tokens} elapsed={elapsed:.2f}s",
+            from backend.app.models import CompletionLog
+            latency_ms = round(elapsed * 1000, 1) if elapsed else None
+            log_row = CompletionLog(
+                model_requested=model,
+                model_resolved=model_resolved or model,
+                provider_name=provider_name or "",
+                provider_type=provider_type or "",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                latency_ms=latency_ms,
+                tool_calls_count=tool_calls_count,
+                success=1,
+                conversation_id=conversation_id,
             )
-            db.add(record)
+            db.add(log_row)
             db.commit()
-            logger.info("[AutoBench] Recorded benchmark for %s: pp=%.1f tg=%.1f t/s", model, pp_tps or 0, tg_tps or 0)
         except Exception as e:
-            logger.warning("[AutoBench] Failed to record: %s", e)
+            logger.warning("[CompletionLog] Failed to write log row: %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        # Auto-record as benchmark entry when usage data available
+        if elapsed and elapsed > 0 and completion_tokens and completion_tokens > 0:
+            try:
+                from backend.app.models import BenchmarkRecord
+                pp_tps = prompt_tokens / elapsed if prompt_tokens else None
+                tg_tps = completion_tokens / elapsed if completion_tokens else None
+                record = BenchmarkRecord(
+                    model_name=model,
+                    model_path=target_url,
+                    engine_type="api",
+                    n_gpu_layers=0,
+                    batch_size=0,
+                    ubatch_size=0,
+                    ctx_size=0,
+                    pp_tokens_per_second=round(pp_tps, 2) if pp_tps else None,
+                    tg_tokens_per_second=round(tg_tps, 2) if tg_tps else None,
+                    raw_output=f"auto-recorded: prompt={prompt_tokens} completion={completion_tokens} elapsed={elapsed:.2f}s",
+                )
+                db.add(record)
+                db.commit()
+                logger.info("[AutoBench] Recorded benchmark for %s: pp=%.1f tg=%.1f t/s", model, pp_tps or 0, tg_tps or 0)
+            except Exception as e:
+                logger.warning("[AutoBench] Failed to record: %s", e)
+
+
+def _write_completion_error_log(db: Session | None, model_requested: str, error_msg: str,
+                                 provider_name: str | None = None, conversation_id: str | None = None) -> None:
+    """Write a failure CompletionLog row."""
+    if not db:
+        return
+    try:
+        from backend.app.models import CompletionLog
+        log_row = CompletionLog(
+            model_requested=model_requested,
+            model_resolved="",
+            provider_name=provider_name or "",
+            provider_type="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            success=0,
+            error_message=error_msg[:500],
+            conversation_id=conversation_id,
+        )
+        db.add(log_row)
+        db.commit()
+    except Exception as e:
+        logger.warning("[CompletionLog] Failed to write error log: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _convert_openai_messages_to_anthropic(messages: list[dict]) -> tuple[str | None, list[dict]]:
@@ -167,6 +243,18 @@ def _is_gemini_cloudcode_provider(provider: ProviderEndpoint) -> bool:
     if "generativelanguage.googleapis.com" in base and has_oauth:
         return True
     if name in {"google_gemini_cli", "google-gemini-cli", "gemini-cli"}:
+        return True
+    return False
+
+
+def _is_lmstudio_provider(provider: ProviderEndpoint) -> bool:
+    """Return True if this provider points to a local or network LM Studio server."""
+    base = (provider.base_url or "").lower().rstrip("/")
+    name = (provider.name or "").lower()
+    # Port 1234 is LM Studio's default; accept both localhost and any IP/hostname
+    if ":1234" in base:
+        return True
+    if name in {"lm_studio", "lm studio", "lmstudio", "lm-studio"}:
         return True
     return False
 
@@ -509,12 +597,26 @@ def _find_provider_by_known_models(db: Session, model_name: str) -> ProviderEndp
     return None
 
 
-async def _proxy_openai_compatible(target_url: str, headers: dict[str, str], body: dict, db: Session | None = None):
+async def _proxy_openai_compatible(
+    target_url: str,
+    headers: dict[str, str],
+    body: dict,
+    db: Session | None = None,
+    model_resolved: str | None = None,
+    provider_name: str | None = None,
+    provider_type: str | None = None,
+    conversation_id: str | None = None,
+    tool_calls_count: int = 0,
+):
     is_streaming = body.get("stream", False)
     t0 = time.time()
     if is_streaming:
         req = http_client.build_request("POST", target_url, headers=headers, json=body)
-        response = await http_client.send(req, stream=True)
+        # 串流超時：連線 15s，每個 chunk 之間最多等 120s
+        response = await http_client.send(
+            req, stream=True,
+            timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=5.0),
+        )
 
         if response.status_code != 200:
             err_body = await response.aread()
@@ -535,18 +637,23 @@ async def _proxy_openai_compatible(target_url: str, headers: dict[str, str], bod
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    response = await http_client.post(target_url, headers=headers, json=body, timeout=60.0)
+    response = await http_client.post(target_url, headers=headers, json=body, timeout=120.0)
     elapsed = time.time() - t0
     if response.status_code != 200:
         logger.warning("Upstream error %s from %s: %s", response.status_code, target_url, response.text[:500])
     else:
-        _log_completion_usage(body, response.json(), target_url, db=db, elapsed=elapsed)
+        _log_completion_usage(
+            body, response.json(), target_url, db=db, elapsed=elapsed,
+            model_resolved=model_resolved, provider_name=provider_name,
+            provider_type=provider_type, conversation_id=conversation_id,
+            tool_calls_count=tool_calls_count,
+        )
     return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 @router.get("/models")
 async def list_models(db: Session = Depends(get_db)):
-    """Return aggregated model list from local processes and mesh workers."""
+    """Return aggregated model list from local processes, mesh workers, virtual models, and routes."""
     statuses = llama_process_manager.get_all_status()
 
     data = []
@@ -558,34 +665,43 @@ async def list_models(db: Session = Depends(get_db)):
                 "created": int(st.get("uptime_seconds", 0)),
                 "owned_by": "local",
             })
-            
-    workers = db.query(MeshWorker).all()
+
+    # Online mesh workers' advertised models
+    workers = db.query(MeshWorker).filter(MeshWorker.status == "online").all()
     for worker in workers:
         try:
             models = json.loads(worker.models_json or "[]")
         except Exception:
             models = []
         for model_name in models:
-            data.append(
-                {
-                    "id": model_name,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": f"mesh:{worker.node_name}",
-                }
-            )
+            data.append({
+                "id": model_name,
+                "object": "model",
+                "created": 0,
+                "owned_by": f"mesh:{worker.node_name}",
+            })
 
+    # Explicit route table
     rules = db.query(ModelRoute).filter(ModelRoute.enabled == 1).all()
     for rule in rules:
         exposed_id = rule.target_model or rule.match_value
-        data.append(
-            {
-                "id": exposed_id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "provider-route",
-            }
-        )
+        data.append({
+            "id": exposed_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "provider-route",
+        })
+
+    # Virtual model aliases (stable logical IDs)
+    virtual_models = db.query(VirtualModel).filter(VirtualModel.enabled == 1).all()
+    for vm in virtual_models:
+        data.append({
+            "id": vm.model_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "virtual",
+            "description": vm.display_name or vm.description,
+        })
 
     # Deduplicate by model id
     dedup = {item["id"]: item for item in data}
@@ -604,10 +720,34 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-        
+
     model_name = body.get("model", "")
     if not model_name:
         raise HTTPException(status_code=400, detail="Missing 'model' in request body")
+
+    # Read route policy from header (override) or fall back to default
+    policy = request.headers.get("x-route-policy", "").strip() or DEFAULT_POLICY
+    if policy not in {"local_first", "cheapest", "fastest", "highest_quality", "local_only", "remote_only"}:
+        policy = DEFAULT_POLICY
+
+    conversation_id = request.headers.get("x-conversation-id", "").strip() or None
+
+    # Resolve virtual model alias first
+    vm = db.query(VirtualModel).filter(VirtualModel.model_id == model_name, VirtualModel.enabled == 1).first()
+    if vm:
+        try:
+            hints = json.loads(vm.routing_hints_json or "{}")
+            if hints.get("preferred_policy"):
+                policy = hints["preferred_policy"]
+        except Exception:
+            pass
+
+    # Use the route resolver to get a priority-ordered list of candidates for mesh workers.
+    # (Local process and provider routing still uses legacy code paths below for compatibility
+    #  with OAuth token refresh, special provider types, etc.)
+    resolver_candidates = resolve_candidates(db, model_name, body, policy)
+    # Separate mesh candidates for use in section 2
+    mesh_candidates = [c for c in resolver_candidates if c.backend_type == "mesh"]
 
     # 1) Explicit model route table has highest priority.
     rule, provider = _find_model_route(db, model_name)
@@ -620,18 +760,28 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
         if routed_model != model_name:
             body = {**body, "model": routed_model}
 
-        if provider.provider_type == "local_process":
+        if policy == POLICY_REMOTE_ONLY and provider.provider_type == "local_process":
+            # Skip local process if policy says remote only
+            pass
+        elif provider.provider_type == "local_process":
             port = llama_process_manager.get_router_port_for_model(routed_model)
             if port is None:
                 raise HTTPException(status_code=503, detail=f"Local model '{routed_model}' is not currently running")
             request_stats.increment_local()
             target_url = f"http://127.0.0.1:{port}/v1/chat/completions"
-            return await _proxy_openai_compatible(target_url, {"Content-Type": "application/json"}, body, db=db)
+            return await _proxy_openai_compatible(
+                target_url, {"Content-Type": "application/json"}, body, db=db,
+                model_resolved=routed_model, provider_name="local", provider_type="local_process",
+                conversation_id=conversation_id,
+            )
 
         if provider.provider_type == "openai_compatible":
             if not provider.base_url:
                 raise HTTPException(status_code=500, detail=f"Provider '{provider.name}' base_url is empty")
             request_stats.increment_remote()
+
+            # Translate tools for the provider if needed
+            fwd_body = translate_tools(body, provider.provider_type)
 
             # Gemini Cloud Code: use native API translation
             if _is_gemini_cloudcode_provider(provider):
@@ -647,7 +797,11 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                     "Authorization": f"Bearer {copilot_token}",
                     **COPILOT_STATIC_HEADERS,
                 }
-                return await _proxy_openai_compatible(target_url, headers, body, db=db)
+                return await _proxy_openai_compatible(
+                    target_url, headers, fwd_body, db=db,
+                    model_resolved=routed_model, provider_name=provider.name,
+                    provider_type=provider.provider_type, conversation_id=conversation_id,
+                )
 
             # GitHub Models: uses same Copilot token exchange + Copilot headers
             if _is_github_models_provider(provider):
@@ -657,14 +811,26 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                     "Authorization": f"Bearer {gh_token}",
                     **COPILOT_STATIC_HEADERS,
                 }
-                return await _proxy_openai_compatible(target_url, headers, body, db=db)
+                return await _proxy_openai_compatible(
+                    target_url, headers, fwd_body, db=db,
+                    model_resolved=routed_model, provider_name=provider.name,
+                    provider_type=provider.provider_type, conversation_id=conversation_id,
+                )
 
             # Google OAuth: extract access_token from JSON-encoded api_key and auto-refresh
             if (provider.api_key or "").startswith("{"):
                 headers = await _build_oauth_provider_headers(provider, db)
-                return await _proxy_openai_compatible(target_url, headers, body, db=db)
+                return await _proxy_openai_compatible(
+                    target_url, headers, fwd_body, db=db,
+                    model_resolved=routed_model, provider_name=provider.name,
+                    provider_type=provider.provider_type, conversation_id=conversation_id,
+                )
 
-            return await _proxy_openai_compatible(target_url, _provider_headers(provider), body, db=db)
+            return await _proxy_openai_compatible(
+                target_url, _provider_headers(provider), fwd_body, db=db,
+                model_resolved=routed_model, provider_name=provider.name,
+                provider_type=provider.provider_type, conversation_id=conversation_id,
+            )
 
         if provider.provider_type == "anthropic":
             if body.get("stream", False):
@@ -678,6 +844,11 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                 raise HTTPException(status_code=500, detail=f"Anthropic API key for provider '{provider.name}' is missing")
 
             system_prompt, converted_messages = _convert_openai_messages_to_anthropic(messages)
+
+            # Translate OpenAI tools → Anthropic tool_use format
+            openai_tools = body.get("tools")
+            anthropic_tools = translate_tools_for_anthropic(openai_tools) if openai_tools else None
+
             anthropic_payload = {
                 "model": routed_model,
                 "messages": converted_messages,
@@ -686,9 +857,12 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             }
             if system_prompt:
                 anthropic_payload["system"] = system_prompt
+            if anthropic_tools:
+                anthropic_payload["tools"] = anthropic_tools
 
             request_stats.increment_remote()
             target_url = (provider.base_url.rstrip("/") if provider.base_url else "https://api.anthropic.com") + "/v1/messages"
+            t0_ant = time.time()
             try:
                 response = await http_client.post(
                     target_url,
@@ -703,12 +877,29 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                 payload = response.json()
                 if response.status_code >= 400:
                     return JSONResponse(status_code=response.status_code, content=payload)
-                return JSONResponse(status_code=200, content=_convert_anthropic_to_openai(payload, routed_model))
+                openai_resp = _convert_anthropic_to_openai(payload, routed_model)
+                _log_completion_usage(
+                    body, openai_resp, target_url, db=db,
+                    elapsed=time.time() - t0_ant,
+                    model_resolved=routed_model, provider_name=provider.name,
+                    provider_type="anthropic", conversation_id=conversation_id,
+                    tool_calls_count=len(openai_tools) if openai_tools else 0,
+                )
+                return JSONResponse(status_code=200, content=openai_resp)
             except httpx.RequestError as e:
                 logger.error("連線至 Anthropic provider 失敗: %s", e)
                 raise HTTPException(status_code=502, detail="Bad Gateway: Unable to reach Anthropic provider")
 
-    # 2) Mesh worker auto-discovery by advertised model list.
+    # 2) Mesh worker auto-discovery — use resolver's scored candidates first.
+    if mesh_candidates:
+        best = mesh_candidates[0]
+        request_stats.increment_remote()
+        return await _proxy_openai_compatible(
+            best.target_url, best.headers, body, db=db,
+            model_resolved=model_name, provider_name=best.display_name,
+            provider_type="mesh", conversation_id=conversation_id,
+        )
+    # Fallback: unscored discovery (handles stale / newly-joined workers)
     worker = _find_mesh_worker_for_model(db, model_name)
     if worker:
         headers = {"Content-Type": "application/json"}
@@ -716,13 +907,18 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             headers["Authorization"] = f"Bearer {worker.api_token}"
         request_stats.increment_remote()
         target_url = worker.base_url.rstrip("/") + "/v1/chat/completions"
-        return await _proxy_openai_compatible(target_url, headers, body, db=db)
+        return await _proxy_openai_compatible(
+            target_url, headers, body, db=db,
+            model_resolved=model_name, provider_name=f"mesh:{worker.node_name}",
+            provider_type="mesh", conversation_id=conversation_id,
+        )
 
     # 2.5) Auto-discovery: check if any configured provider's known model catalog
     # contains this model, even if no explicit route has been created.
     provider = _find_provider_by_known_models(db, model_name)
     if provider:
         request_stats.increment_remote()
+        fwd_body_cat = translate_tools(body, provider.provider_type)
 
         # Gemini Cloud Code: use native API translation
         if _is_gemini_cloudcode_provider(provider):
@@ -737,7 +933,11 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                 "Authorization": f"Bearer {copilot_token}",
                 **COPILOT_STATIC_HEADERS,
             }
-            return await _proxy_openai_compatible(target_url, headers, body, db=db)
+            return await _proxy_openai_compatible(
+                target_url, headers, fwd_body_cat, db=db,
+                model_resolved=model_name, provider_name=provider.name,
+                provider_type=provider.provider_type, conversation_id=conversation_id,
+            )
 
         if _is_github_models_provider(provider):
             gh_token = await _ensure_fresh_github_models_token(provider, db)
@@ -746,13 +946,25 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                 "Authorization": f"Bearer {gh_token}",
                 **COPILOT_STATIC_HEADERS,
             }
-            return await _proxy_openai_compatible(target_url, headers, body, db=db)
+            return await _proxy_openai_compatible(
+                target_url, headers, fwd_body_cat, db=db,
+                model_resolved=model_name, provider_name=provider.name,
+                provider_type=provider.provider_type, conversation_id=conversation_id,
+            )
 
         if (provider.api_key or "").startswith("{"):
             headers = await _build_oauth_provider_headers(provider, db)
-            return await _proxy_openai_compatible(target_url, headers, body, db=db)
+            return await _proxy_openai_compatible(
+                target_url, headers, fwd_body_cat, db=db,
+                model_resolved=model_name, provider_name=provider.name,
+                provider_type=provider.provider_type, conversation_id=conversation_id,
+            )
 
-        return await _proxy_openai_compatible(target_url, _provider_headers(provider), body, db=db)
+        return await _proxy_openai_compatible(
+            target_url, _provider_headers(provider), fwd_body_cat, db=db,
+            model_resolved=model_name, provider_name=provider.name,
+            provider_type=provider.provider_type, conversation_id=conversation_id,
+        )
 
     # 3) Backward-compatible default routing.
     is_remote_openai = model_name.startswith("gpt-") or model_name.startswith("o1-")
@@ -767,6 +979,8 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
             body,
             db=db,
+            model_resolved=model_name, provider_name="openai",
+            provider_type="openai_compatible", conversation_id=conversation_id,
         )
 
     if is_remote_anthropic:
@@ -781,6 +995,11 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail="Invalid or missing 'messages'")
 
         system_prompt, converted_messages = _convert_openai_messages_to_anthropic(messages)
+
+        # Translate tools for Anthropic default routing too
+        openai_tools_def = body.get("tools")
+        anthropic_tools_def = translate_tools_for_anthropic(openai_tools_def) if openai_tools_def else None
+
         anthropic_payload = {
             "model": model_name,
             "messages": converted_messages,
@@ -789,8 +1008,11 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
         }
         if system_prompt:
             anthropic_payload["system"] = system_prompt
+        if anthropic_tools_def:
+            anthropic_payload["tools"] = anthropic_tools_def
 
         request_stats.increment_remote()
+        t0_ant_def = time.time()
         try:
             response = await http_client.post(
                 "https://api.anthropic.com/v1/messages",
@@ -805,7 +1027,15 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             payload = response.json()
             if response.status_code >= 400:
                 return JSONResponse(status_code=response.status_code, content=payload)
-            return JSONResponse(status_code=200, content=_convert_anthropic_to_openai(payload, model_name))
+            openai_resp_def = _convert_anthropic_to_openai(payload, model_name)
+            _log_completion_usage(
+                body, openai_resp_def, "https://api.anthropic.com/v1/messages", db=db,
+                elapsed=time.time() - t0_ant_def,
+                model_resolved=model_name, provider_name="anthropic",
+                provider_type="anthropic", conversation_id=conversation_id,
+                tool_calls_count=len(openai_tools_def) if openai_tools_def else 0,
+            )
+            return JSONResponse(status_code=200, content=openai_resp_def)
         except httpx.RequestError as e:
             logger.error("連線至 Anthropic 失敗: %s", e)
             raise HTTPException(status_code=502, detail="Bad Gateway: Unable to reach Anthropic")
@@ -821,7 +1051,11 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
     target_url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
     try:
-        return await _proxy_openai_compatible(target_url, {"Content-Type": "application/json"}, body, db=db)
+        return await _proxy_openai_compatible(
+            target_url, {"Content-Type": "application/json"}, body, db=db,
+            model_resolved=model_name, provider_name="local",
+            provider_type="local_process", conversation_id=conversation_id,
+        )
     except httpx.RequestError as e:
         logger.error(f"連線至目標 {target_url} 失敗: {e}")
         raise HTTPException(status_code=502, detail="Bad Gateway: Unable to reach the model provider.")
