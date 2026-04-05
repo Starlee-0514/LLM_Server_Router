@@ -18,6 +18,9 @@ venv/
 # Database
 *.db
 *.db-shm
+
+# Logs
+logs/
 *.db-wal
 
 # IDE
@@ -40,3 +43,6 @@ bug_reports/*
 
 #Obsidian
 .obsidian/
+
+# other ref repo
+ref_repo/
