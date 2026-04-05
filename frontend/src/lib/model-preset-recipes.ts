@@ -1,13 +1,29 @@
 import type { GGUFFileInfo } from "@/lib/api";
 
 export type PresetFamily = "universal" | "dense" | "moe" | "multimodal";
-export type PresetRecipeGroupKey = "coverage" | "topology";
+export type PresetRecipeGroupKey = PresetFamily;
 
 export const PRESET_FAMILY_OPTIONS: Array<{ value: PresetFamily; label: string }> = [
   { value: "universal", label: "Universal" },
   { value: "dense", label: "Dense" },
   { value: "moe", label: "MoE" },
   { value: "multimodal", label: "Multimodal" },
+];
+
+/** Model architecture classification — Dense vs MoE only. */
+export type ModelClassification = "dense" | "moe";
+
+export const MODEL_CLASSIFICATION_OPTIONS: Array<{ value: ModelClassification; label: string }> = [
+  { value: "dense", label: "Dense" },
+  { value: "moe", label: "MoE" },
+];
+
+/** Input modalities accepted by the model. */
+export type ModelModality = "text" | "vision";
+
+export const MODEL_MODALITY_OPTIONS: Array<{ value: ModelModality; label: string }> = [
+  { value: "text", label: "Text" },
+  { value: "vision", label: "Vision" },
 ];
 
 export interface LaunchOptionDraft {
@@ -41,14 +57,24 @@ export interface PresetRecipe {
 
 export const PRESET_RECIPE_GROUPS: Array<{ key: PresetRecipeGroupKey; label: string; description: string }> = [
   {
-    key: "coverage",
-    label: "Universal / Multimodal",
-    description: "Recipes that describe whether the setup is general-purpose text or vision-capable.",
+    key: "universal",
+    label: "Universal",
+    description: "General-purpose recipes that work across all model families.",
   },
   {
-    key: "topology",
-    label: "Dense / MoE",
-    description: "Recipes that describe how the model behaves under memory and routing pressure.",
+    key: "dense",
+    label: "Dense",
+    description: "Optimised for dense transformer architectures (Llama, Mistral, Gemma, etc.).",
+  },
+  {
+    key: "moe",
+    label: "Mixture of Experts",
+    description: "Handles expert-routing overhead and memory spikes (Mixtral, DeepSeek-MoE, etc.).",
+  },
+  {
+    key: "multimodal",
+    label: "Multimodal",
+    description: "Vision-capable models that require mmproj wiring.",
   },
 ];
 
@@ -152,14 +178,23 @@ const FAMILY_KEYWORDS: Record<Exclude<PresetFamily, "universal">, RegExp> = {
 export const getPresetRecipe = (key: string) =>
   PRESET_RECIPES.find((recipe) => recipe.key === key) ?? PRESET_RECIPES[0];
 
-export const getPresetRecipeGroupKey = (recipe: PresetRecipe): PresetRecipeGroupKey =>
-  recipe.family === "universal" || recipe.family === "multimodal" ? "coverage" : "topology";
+export const getPresetRecipeGroupKey = (recipe: PresetRecipe): PresetRecipeGroupKey => recipe.family;
+
+/** All recipes that apply to a given family: the family's own recipes + universal recipes (universal always applies). */
+export const filterRecipesForFamily = (family: PresetFamily, recipes: PresetRecipe[] = PRESET_RECIPES): PresetRecipe[] =>
+  family === "universal"
+    ? recipes
+    : recipes.filter((r) => r.family === family || r.family === "universal");
 
 export const groupPresetRecipes = (recipes: PresetRecipe[] = PRESET_RECIPES) =>
   PRESET_RECIPE_GROUPS.map((group) => ({
     ...group,
-    recipes: recipes.filter((recipe) => getPresetRecipeGroupKey(recipe) === group.key),
-  }));
+    recipes: recipes.filter((recipe) => recipe.family === group.key),
+  })).filter((group) => group.recipes.length > 0);
+
+/** Grouped recipes filtered to a specific family (family-own + universal). Skips empty groups. */
+export const groupRecipesForFamily = (family: PresetFamily, recipes: PresetRecipe[] = PRESET_RECIPES) =>
+  groupPresetRecipes(filterRecipesForFamily(family, recipes));
 
 export const applyPresetRecipe = (
   key: string,
@@ -201,6 +236,32 @@ export const inferPresetRecipeKey = (model?: Partial<GGUFFileInfo> | null): stri
   if (Number.isFinite(paramSize) && paramSize >= 30) return "dense-long-context";
   if (family === "dense") return "dense-throughput";
   return "universal-balanced";
+};
+
+/** Infer architecture classification (Dense vs MoE) from GGUF metadata. */
+export const inferModelClassification = (model?: (Partial<GGUFFileInfo> & { model_family?: string }) | null): ModelClassification => {
+  if (!model) return "dense";
+  if (model.model_family === "moe") return "moe";
+  if (model.model_family === "dense") return "dense";
+  const haystack = `${model.filename ?? ""} ${model.arch ?? ""}`;
+  if (FAMILY_KEYWORDS.moe.test(haystack)) return "moe";
+  return "dense";
+};
+
+/** Infer input modality — text-only vs vision-capable. */
+export const inferModality = (model?: (Partial<GGUFFileInfo> & { model_family?: string }) | null): ModelModality => {
+  if (!model) return "text";
+  if (model.model_type === "multimodal_base") return "vision";
+  const haystack = `${model.filename ?? ""} ${model.arch ?? ""}`;
+  if (FAMILY_KEYWORDS.multimodal.test(haystack)) return "vision";
+  return "text";
+};
+
+/** Detect whether the model likely supports thinking / chain-of-thought toggling. */
+export const inferThinkingCapable = (model?: (Partial<GGUFFileInfo> & { model_family?: string }) | null): boolean => {
+  if (!model) return false;
+  const haystack = `${model.filename ?? ""} ${model.arch ?? ""}`;
+  return /deepseek-r1|qwq|qwen3|think/i.test(haystack);
 };
 
 const quoteIfNeeded = (value: string) => (value.includes(" ") ? `"${value}"` : value);

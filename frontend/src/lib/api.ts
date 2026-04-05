@@ -100,6 +100,7 @@ export interface BenchmarkRecord {
   batch_size: number;
   ubatch_size: number;
   ctx_size: number;
+  preset_recipe: string;
   pp_tokens_per_second: number | null;
   tg_tokens_per_second: number | null;
   raw_output?: string;
@@ -483,6 +484,7 @@ export interface BenchmarkRunParams {
   batch_size?: number;
   ubatch_size?: number;
   ctx_size?: number;
+  preset_recipe?: string;
   n_prompt?: number;
   n_gen?: number;
   flash_attn?: number;
@@ -866,3 +868,123 @@ export const getLogFiles = () =>
 
 export const getLogFileUrl = (filename: string) =>
   `${getApiBase()}/api/dev/logs/files/${encodeURIComponent(filename)}`;
+
+// ==================
+// Virtual Models (Forwarding / Alias Mapping)
+// ==================
+export interface RoutePolicyOption {
+  value: string;
+  label: string;
+}
+
+export interface RoutingHints {
+  preferred_policy?: string;
+  requires_tools?: boolean;
+  requires_vision?: boolean;
+  preferred_provider_ids?: number[];
+  fallback_provider_id?: number | null;
+}
+
+export interface VirtualModelItem {
+  id: number;
+  model_id: string;
+  display_name: string;
+  description: string;
+  routing_hints_json: string;
+  enabled: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface VirtualModelPayload {
+  model_id: string;
+  display_name: string;
+  description: string;
+  routing_hints: RoutingHints;
+  enabled: boolean;
+}
+
+export const getVirtualModels = () =>
+  apiFetch<VirtualModelItem[]>("/api/virtual-models");
+
+export const getRoutePolicies = () =>
+  apiFetch<RoutePolicyOption[]>("/api/virtual-models/policies");
+
+export const createVirtualModel = (payload: VirtualModelPayload) =>
+  apiFetch<VirtualModelItem>("/api/virtual-models", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+export const updateVirtualModel = (id: number, payload: VirtualModelPayload) =>
+  apiFetch<VirtualModelItem>(`/api/virtual-models/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+
+export const deleteVirtualModel = (id: number) =>
+  apiFetch<void>(`/api/virtual-models/${id}`, { method: "DELETE" });
+
+// ==================
+// LM Studio
+// ==================
+export interface LMStudioStatus {
+  running: boolean;
+  port: number;
+  host: string;
+  loaded_models: string[];
+  available_models: string[];
+  error: string;
+}
+
+export interface LMStudioCliCheck {
+  available: boolean;
+  message: string;
+}
+
+export interface LMStudioCommandResult {
+  success: boolean;
+  message: string;
+  stdout: string;
+  stderr: string;
+}
+
+export interface LMStudioProviderRegistered {
+  id: number;
+  name: string;
+  base_url: string;
+  created: boolean;
+}
+
+export const getLMStudioCliStatus = () =>
+  apiFetch<LMStudioCliCheck>("/api/lmstudio/cli");
+
+export const getLMStudioStatus = (host = "127.0.0.1", port = 1234) =>
+  apiFetch<LMStudioStatus>(`/api/lmstudio/status?host=${host}&port=${port}`);
+
+export const lmStudioServerStart = (port = 1234, bind?: string) =>
+  apiFetch<LMStudioCommandResult>("/api/lmstudio/server/start", {
+    method: "POST",
+    body: JSON.stringify({ port, bind: bind ?? null }),
+  });
+
+export const lmStudioServerStop = () =>
+  apiFetch<LMStudioCommandResult>("/api/lmstudio/server/stop", { method: "POST" });
+
+export const lmStudioModelLoad = (identifier: string, gpu?: number, ctx_length?: number) =>
+  apiFetch<LMStudioCommandResult>("/api/lmstudio/models/load", {
+    method: "POST",
+    body: JSON.stringify({ identifier, gpu: gpu ?? null, ctx_length: ctx_length ?? null }),
+  });
+
+export const lmStudioModelUnload = (identifier?: string, unload_all = false) =>
+  apiFetch<LMStudioCommandResult>("/api/lmstudio/models/unload", {
+    method: "POST",
+    body: JSON.stringify({ identifier: identifier ?? null, unload_all }),
+  });
+
+export const lmStudioRegisterProvider = (host = "127.0.0.1", port = 1234, name = "LM Studio") =>
+  apiFetch<LMStudioProviderRegistered>("/api/lmstudio/provider/register", {
+    method: "POST",
+    body: JSON.stringify({ host, port, name, enabled: true }),
+  });
