@@ -53,6 +53,8 @@ async def run_benchmark_sse(
             n_gen=request.n_gen,
             flash_attn=request.flash_attn,
             no_kv_offload=request.no_kv_offload,
+            cache_type_k=request.cache_type_k,
+            cache_type_v=request.cache_type_v,
         ):
             # Intercept 'done' event to save to DB before forwarding
             if event.startswith("event: done"):

@@ -2,6 +2,7 @@
 SQLAlchemy ORM 模型定義
 
 - Setting: 系統設定 (key/value)，持久化 UI 配置項目（如模型掃描目錄）
+- Runtime: 運行時環境配置（如 rocm, vulkan 等自訂執行環境）
 - ModelGroup: 模型群組預設參數
 - BenchmarkRecord: llama-bench 效能測試結果
 """
@@ -36,6 +37,32 @@ class Setting(Base):
         return f"<Setting(key={self.key!r}, value={self.value!r})>"
 
 
+class Runtime(Base):
+    """運行時環境配置 - 定義 llama-server 執行環境（如 rocm, vulkan, etc）。
+
+    允許使用者自訂和管理不同的運行時環境。
+    """
+    __tablename__ = "runtimes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), unique=True, nullable=False, index=True)
+    description = Column(Text, default="")
+    executable_path = Column(Text, nullable=False)  # 執行檔路徑或命令
+    environment_vars = Column(Text, default="{}")   # JSON 格式的環境變數
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Runtime(name={self.name!r}, path={self.executable_path!r})>"
+
+
 class ModelGroup(Base):
     """模型群組 - 封裝一組 llama-server 啟動參數。
 
@@ -48,11 +75,13 @@ class ModelGroup(Base):
     name = Column(String(255), unique=True, nullable=False)
     description = Column(Text, default="")
     model_path = Column(Text, nullable=False)          # .gguf 檔案路徑
-    engine_type = Column(String(50), default="rocm")   # "rocm" | "vulkan"
+    engine_type = Column(String(50), default="rocm")   # 運行時名稱（可自訂）
     n_gpu_layers = Column(Integer, default=999)         # -ngl 參數
     batch_size = Column(Integer, default=512)           # -b 參數
     ubatch_size = Column(Integer, default=512)          # -ub 參數
     ctx_size = Column(Integer, default=4096)            # -c 參數
+    model_family = Column(String(50), default="universal")
+    preset_recipe = Column(String(120), default="universal-balanced")
     extra_args = Column(Text, default="")               # 額外參數 (JSON 陣列)
     created_at = Column(
         DateTime,
@@ -63,13 +92,6 @@ class ModelGroup(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
-
-    @validates("engine_type")
-    def validate_engine_type(self, key, value):
-        allowed = {"rocm", "vulkan"}
-        if value not in allowed:
-            raise ValueError(f"engine_type 必須是 {allowed} 之一，收到: {value!r}")
-        return value
 
     def __repr__(self) -> str:
         return f"<ModelGroup(name={self.name!r}, engine={self.engine_type})>"
@@ -164,6 +186,33 @@ class ModelRoute(Base):
         if value not in allowed:
             raise ValueError(f"match_type 必須是 {allowed} 之一，收到: {value!r}")
         return value
+
+
+class ModelPropertyOverride(Base):
+    """使用者自訂模型屬性覆寫。
+
+    允許使用者覆寫 GGUF 掃描自動偵測的 metadata，
+    例如 param_size, quantize, arch, publisher 等欄位。
+    以 filepath 為 key 來識別唯一模型。
+    """
+    __tablename__ = "model_property_overrides"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    filepath = Column(Text, unique=True, nullable=False, index=True)
+    display_name = Column(String(255), nullable=True, default="")
+    publisher = Column(String(255), nullable=True, default="")
+    quantize = Column(String(50), nullable=True, default="")
+    param_size = Column(String(50), nullable=True, default="")
+    arch = Column(String(255), nullable=True, default="")
+    model_family = Column(String(50), nullable=True, default="")
+    tags = Column(Text, nullable=True, default="")      # comma-separated custom tags
+    notes = Column(Text, nullable=True, default="")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
 
 class MeshWorker(Base):

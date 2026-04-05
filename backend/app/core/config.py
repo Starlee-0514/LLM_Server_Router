@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     anthropic_api_key: str = ""
 
+    # === OAuth Client 設定 ===
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    google_client_id: str = ""
+    google_client_secret: str = ""
+
     # === 資料庫 ===
     database_url: str = "sqlite:///./llm_router.db"
 

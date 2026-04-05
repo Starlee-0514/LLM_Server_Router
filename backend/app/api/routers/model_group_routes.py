@@ -54,6 +54,8 @@ def create_model_group(request: ModelGroupCreate, db: Session = Depends(get_db))
         batch_size=request.batch_size,
         ubatch_size=request.ubatch_size,
         ctx_size=request.ctx_size,
+        model_family=request.model_family,
+        preset_recipe=request.preset_recipe,
         extra_args=request.extra_args,
     )
     db.add(group)
@@ -84,6 +86,8 @@ def update_model_group(
     group.batch_size = request.batch_size
     group.ubatch_size = request.ubatch_size
     group.ctx_size = request.ctx_size
+    group.model_family = request.model_family
+    group.preset_recipe = request.preset_recipe
     group.extra_args = request.extra_args
 
     db.commit()

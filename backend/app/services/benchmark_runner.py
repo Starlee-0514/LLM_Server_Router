@@ -7,17 +7,13 @@ llama-bench 效能測試執行器
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
 from typing import AsyncGenerator
 
-from backend.app.core.process_manager import EngineType
-from backend.app.core.runtime_settings import (
-    get_hsa_override_gfx_version,
-    get_llama_rocm_path,
-    get_llama_vulkan_path,
-)
+from backend.app.core.runtime_settings import get_runtime_command
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +29,9 @@ BENCH_ROW_REGEX = re.compile(
 )
 
 
-def _get_bench_binary(engine_type: EngineType) -> str:
-    """自動推導 llama-bench 的路徑。"""
-    if engine_type == EngineType.ROCM:
-        server_path = get_llama_rocm_path()
-    else:
-        server_path = get_llama_vulkan_path()
+def _get_bench_binary(runtime_name: str) -> tuple[str, dict[str, str]]:
+    """自動推導 llama-bench 的路徑與運行時環境變數。"""
+    server_path, runtime_env = get_runtime_command(runtime_name)
         
     bench_path = server_path.replace("llama-server", "llama-bench")
     
@@ -53,7 +46,7 @@ def _get_bench_binary(engine_type: EngineType) -> str:
         else:
             raise FileNotFoundError(f"找不到 llama-bench: {bench_path} (請確認在 PATH 內或輸入完整路徑)")
             
-    return bench_path
+    return bench_path, runtime_env
 
 
 def _build_cmd(
@@ -66,9 +59,11 @@ def _build_cmd(
     n_gen: int,
     flash_attn: int,
     no_kv_offload: int,
+    cache_type_k: str,
+    cache_type_v: str,
 ) -> list[str]:
     """Build the llama-bench command list."""
-    return [
+    cmd = [
         bench_path,
         "-m", model_path,
         "-n", str(n_gen),
@@ -80,6 +75,13 @@ def _build_cmd(
         "-nkvo", str(no_kv_offload),
         "--progress",
     ]
+
+    if cache_type_k and cache_type_k != "f16":
+        cmd.extend(["-ctk", cache_type_k])
+    if cache_type_v and cache_type_v != "f16":
+        cmd.extend(["-ctv", cache_type_v])
+
+    return cmd
 
 
 def parse_results(stdout_text: str) -> dict:
@@ -127,6 +129,8 @@ async def run_benchmark_stream(
     n_gen: int = 128,
     flash_attn: int = 0,
     no_kv_offload: int = 0,
+    cache_type_k: str = "f16",
+    cache_type_v: str = "f16",
 ) -> AsyncGenerator[str, None]:
     """串流執行 llama-bench，即時 yield SSE 事件。
 
@@ -135,20 +139,19 @@ async def run_benchmark_stream(
       event: done  data: {"results": {...}}     — 完成，含解析結果
       event: error data: {"error": "..."}       — 錯誤
     """
-    engine = EngineType(engine_type.lower())
+    runtime_name = engine_type.strip()
 
     try:
-        bench_path = _get_bench_binary(engine)
-    except FileNotFoundError as e:
+        bench_path, runtime_env = _get_bench_binary(runtime_name)
+    except (FileNotFoundError, ValueError) as e:
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         return
 
     cmd = _build_cmd(bench_path, model_path, n_gpu_layers, batch_size,
-                     ubatch_size, n_prompt, n_gen, flash_attn, no_kv_offload)
+                     ubatch_size, n_prompt, n_gen, flash_attn, no_kv_offload, cache_type_k, cache_type_v)
 
-    env = {}
-    if engine == EngineType.ROCM:
-        env["HSA_OVERRIDE_GFX_VERSION"] = get_hsa_override_gfx_version()
+    env = os.environ.copy()
+    env.update(runtime_env)
 
     cmd_str = " ".join(cmd)
     logger.info(f"執行 llama-bench (streaming): {cmd_str}")
@@ -240,17 +243,18 @@ async def run_benchmark_async(
     n_gen: int = 128,
     flash_attn: int = 0,
     no_kv_offload: int = 0,
+    cache_type_k: str = "f16",
+    cache_type_v: str = "f16",
 ) -> dict[str, float]:
     """非同步執行 llama-bench 並解析輸出（非串流版本）。"""
-    engine = EngineType(engine_type.lower())
-    bench_path = _get_bench_binary(engine)
+    runtime_name = engine_type.strip()
+    bench_path, runtime_env = _get_bench_binary(runtime_name)
 
     cmd = _build_cmd(bench_path, model_path, n_gpu_layers, batch_size,
-                     ubatch_size, n_prompt, n_gen, flash_attn, no_kv_offload)
+                     ubatch_size, n_prompt, n_gen, flash_attn, no_kv_offload, cache_type_k, cache_type_v)
 
-    env = {}
-    if engine == EngineType.ROCM:
-        env["HSA_OVERRIDE_GFX_VERSION"] = get_hsa_override_gfx_version()
+    env = os.environ.copy()
+    env.update(runtime_env)
 
     cmd_str = ' '.join(cmd)
     logger.info(f"執行 llama-bench: {cmd_str}")

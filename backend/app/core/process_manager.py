@@ -9,34 +9,23 @@ LlamaProcessManager - llama-server 進程管理器
 """
 import logging
 import os
-import signal
 import subprocess
 import time
 import shutil
 from pathlib import Path
-from enum import Enum
 from dataclasses import dataclass, field
 
 from backend.app.core.config import settings
-from backend.app.core.runtime_settings import (
-    get_hsa_override_gfx_version,
-    get_llama_rocm_path,
-    get_llama_vulkan_path,
-)
+from backend.app.core.runtime_settings import get_runtime_command
 
 logger = logging.getLogger(__name__)
-
-
-class EngineType(str, Enum):
-    ROCM = "rocm"
-    VULKAN = "vulkan"
 
 
 @dataclass
 class RunningProcess:
     """描述一個正在運行的 llama-server 進程。"""
     process: subprocess.Popen
-    engine_type: EngineType
+    engine_type: str
     model_path: str
     port: int
     started_at: float = field(default_factory=time.time)
@@ -72,14 +61,9 @@ class LlamaProcessManager:
             port += 1
         return port
 
-    def _get_binary_path(self, engine_type: EngineType) -> str:
-        """根據引擎類型取得對應的 llama-server 二進位檔案路徑。"""
-        if engine_type == EngineType.ROCM:
-            server_path = get_llama_rocm_path()
-        elif engine_type == EngineType.VULKAN:
-            server_path = get_llama_vulkan_path()
-        else:
-            raise ValueError(f"不支援的引擎類型: {engine_type}")
+    def _get_binary_path(self, runtime_name: str) -> tuple[str, dict[str, str]]:
+        """根據運行時名稱取得 llama-server 執行檔路徑與環境變數。"""
+        server_path, runtime_env = get_runtime_command(runtime_name)
 
         if server_path.startswith("~/"):
             server_path = str(Path(server_path).expanduser())
@@ -92,19 +76,15 @@ class LlamaProcessManager:
             else:
                 raise FileNotFoundError(f"找不到 llama-server: {server_path} (請確認在 PATH 內或輸入完整路徑)")
 
-        return server_path
+        return server_path, runtime_env
 
-    def _build_env(self, engine_type: EngineType) -> dict[str, str]:
+    def _build_env(self, runtime_env: dict[str, str]) -> dict[str, str]:
         """建構子進程的環境變數。"""
         env = os.environ.copy()
 
-        # ROCm 需要 HSA_OVERRIDE_GFX_VERSION
-        if engine_type == EngineType.ROCM:
-            hsa_override = get_hsa_override_gfx_version()
-            env["HSA_OVERRIDE_GFX_VERSION"] = hsa_override
-            logger.info(
-                f"注入環境變數: HSA_OVERRIDE_GFX_VERSION={hsa_override}"
-            )
+        for key, value in runtime_env.items():
+            env[key] = value
+            logger.info("注入運行時環境變數: %s=%s", key, value)
 
         return env
 
@@ -140,7 +120,7 @@ class LlamaProcessManager:
         self,
         identifier: str,
         model_path: str,
-        engine_type: EngineType | str = EngineType.ROCM,
+        engine_type: str = "rocm",
         n_gpu_layers: int = 999,
         batch_size: int = 512,
         ubatch_size: int = 512,
@@ -170,13 +150,13 @@ class LlamaProcessManager:
         if identifier in self._active_processes:
             raise ValueError(f"進程 {identifier} 已經在運行中，請勿重複啟動。")
 
-        # 確保 engine_type 是 Enum
-        if isinstance(engine_type, str):
-            engine_type = EngineType(engine_type.lower())
+        runtime_name = engine_type.strip()
+        if not runtime_name:
+            raise ValueError("運行時名稱不可為空")
 
         port = self._allocate_port()
-        binary_path = self._get_binary_path(engine_type)
-        env = self._build_env(engine_type)
+        binary_path, runtime_env = self._get_binary_path(runtime_name)
+        env = self._build_env(runtime_env)
         cmd = self._build_command(
             binary_path=binary_path,
             model_path=model_path,
@@ -203,7 +183,7 @@ class LlamaProcessManager:
 
         rp = RunningProcess(
             process=process,
-            engine_type=engine_type,
+            engine_type=runtime_name,
             model_path=model_path,
             port=port,
         )
@@ -211,7 +191,7 @@ class LlamaProcessManager:
 
         logger.info(
             f"[{identifier}] llama-server 已啟動 (PID={process.pid}, "
-            f"engine={engine_type.value}, port={port})"
+            f"engine={runtime_name}, port={port})"
         )
 
         return rp
@@ -285,7 +265,7 @@ class LlamaProcessManager:
             "identifier": identifier,
             "is_running": True,
             "pid": rp.pid,
-            "engine_type": rp.engine_type.value,
+            "engine_type": rp.engine_type,
             "model_path": rp.model_path,
             "port": rp.port,
             "uptime_seconds": round(uptime, 2),

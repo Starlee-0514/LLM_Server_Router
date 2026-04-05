@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.database import init_db
-from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes
+from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes
 from backend.app.core.process_manager import llama_process_manager
 from backend.app.database import SessionLocal
 from backend.app.models import Setting
@@ -58,6 +58,7 @@ app.add_middleware(
 # 掛載路由
 app.include_router(model_routes.router)
 app.include_router(settings_routes.router)
+app.include_router(runtime_routes.router)
 app.include_router(process_routes.router)
 app.include_router(benchmark_routes.router)
 app.include_router(openai_router.router)
@@ -66,6 +67,7 @@ app.include_router(metrics_routes.router)
 app.include_router(provider_routes.router)
 app.include_router(provider_routes.routes_router)
 app.include_router(provider_routes.mesh_router)
+app.include_router(report_routes.router)
 
 
 @app.middleware("http")

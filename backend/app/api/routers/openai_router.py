@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from backend.app.core.process_manager import llama_process_manager
 from backend.app.core.request_stats import request_stats
 from backend.app.core.runtime_settings import get_openai_api_key, get_anthropic_api_key
+from backend.app.core.provider_helpers import build_provider_headers, build_provider_chat_url
 from backend.app.database import get_db
 from backend.app.models import ProviderEndpoint, ModelRoute, MeshWorker
 
@@ -86,16 +87,7 @@ def _convert_anthropic_to_openai(resp: dict, model_name: str) -> dict:
 
 
 def _provider_headers(provider: ProviderEndpoint) -> dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    if provider.api_key:
-        headers["Authorization"] = f"Bearer {provider.api_key}"
-    if provider.extra_headers:
-        try:
-            parsed = json.loads(provider.extra_headers)
-            if isinstance(parsed, dict):
-                headers.update({str(k): str(v) for k, v in parsed.items()})
-        except Exception:
-            logger.warning("Provider extra_headers JSON parse failed: %s", provider.name)
+    headers = build_provider_headers(provider.api_key or "", provider.extra_headers or "")
     return headers
 
 
@@ -242,7 +234,7 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             if not provider.base_url:
                 raise HTTPException(status_code=500, detail=f"Provider '{provider.name}' base_url is empty")
             request_stats.increment_remote()
-            target_url = provider.base_url.rstrip("/") + "/v1/chat/completions"
+            target_url = build_provider_chat_url(provider.base_url)
             return await _proxy_openai_compatible(target_url, _provider_headers(provider), body)
 
         if provider.provider_type == "anthropic":

@@ -32,6 +32,38 @@ class SettingsBulkUpdate(BaseModel):
 
 
 # =====================
+# Runtimes
+# =====================
+class RuntimeResponse(BaseModel):
+    """運行時環境配置回應。"""
+    id: int
+    name: str
+    description: str = ""
+    executable_path: str
+    environment_vars: str = "{}"
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class RuntimeCreate(BaseModel):
+    """建立運行時環境的請求。"""
+    name: str
+    description: str = ""
+    executable_path: str
+    environment_vars: str = "{}"
+
+
+class RuntimeUpdate(BaseModel):
+    """更新運行時環境的請求。"""
+    name: str | None = None
+    description: str | None = None
+    executable_path: str | None = None
+    environment_vars: str | None = None
+
+
+# =====================
 # Model Scanner
 # =====================
 class GGUFFileInfo(BaseModel):
@@ -45,6 +77,10 @@ class GGUFFileInfo(BaseModel):
     quantize: str = ""      # e.g., "Q4_K_M"
     param_size: str = ""    # e.g., "9B"
     arch: str = ""          # e.g., "Qwen3.5"
+    model_family: str = ""
+    model_type: str = "text"  # text | multimodal_base | multimodal_projector
+    related_mmproj_path: str = ""
+    related_base_model_path: str = ""
 
 
 class ModelScanRequest(BaseModel):
@@ -78,6 +114,8 @@ class ModelGroupCreate(BaseModel):
     batch_size: int = 512
     ubatch_size: int = 512
     ctx_size: int = 4096
+    model_family: str = "universal"
+    preset_recipe: str = "universal-balanced"
     extra_args: str = ""
 
 
@@ -93,6 +131,8 @@ class ModelGroupResponse(BaseModel):
     batch_size: int
     ubatch_size: int
     ctx_size: int
+    model_family: str
+    preset_recipe: str
     extra_args: str
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -145,6 +185,8 @@ class BenchmarkRunRequest(BaseModel):
     n_gen: int = 128         # generation tokens count
     flash_attn: int = 0      # flash attention 0|1
     no_kv_offload: int = 0   # no kv offload 0|1
+    cache_type_k: str = "f16"
+    cache_type_v: str = "f16"
 
 class BenchmarkRecordResponse(BaseModel):
     """效能測試結果回應。"""
@@ -167,6 +209,40 @@ class BenchmarkRecordResponse(BaseModel):
 class BenchmarkImportRequest(BaseModel):
     """匯入效能測試紀錄的要求。"""
     records: list[BenchmarkRecordResponse]
+
+
+# =====================
+# Model Property Overrides
+# =====================
+class ModelPropertyOverrideCreate(BaseModel):
+    """建立/更新模型屬性覆寫。"""
+    filepath: str
+    display_name: str = ""
+    publisher: str = ""
+    quantize: str = ""
+    param_size: str = ""
+    arch: str = ""
+    model_family: str = ""
+    tags: str = ""
+    notes: str = ""
+
+
+class ModelPropertyOverrideResponse(BaseModel):
+    """模型屬性覆寫回應。"""
+    id: int
+    filepath: str
+    display_name: str
+    publisher: str
+    quantize: str
+    param_size: str
+    arch: str
+    model_family: str
+    tags: str
+    notes: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
 
 
 # =====================
@@ -244,3 +320,25 @@ class MeshWorkerResponse(BaseModel):
     updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class CommonProviderTemplate(BaseModel):
+    provider_key: str
+    label: str
+    provider_type: str
+    base_url: str
+    auth_hint: str
+    default_extra_headers: str = ""
+
+
+class CommonProviderRegisterRequest(BaseModel):
+    provider_key: str
+    api_key: str = ""
+    enabled: bool = True
+    name_override: str = ""
+
+
+class ProviderModelItem(BaseModel):
+    id: str
+    provider_name: str
+    raw: dict = Field(default_factory=dict)
