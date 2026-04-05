@@ -34,3 +34,9 @@ Thumbs.db
 node_modules/
 .next/
 out/
+
+#Inbox docs
+bug_reports/*
+
+#Obsidian
+.obsidian/
