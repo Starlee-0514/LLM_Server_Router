@@ -259,6 +259,9 @@ def resolve_candidates(
                 matched = True
             elif rule.match_type == "prefix" and model_name.startswith(rule.match_value):
                 matched = True
+            # Also match by route_name (the user-facing alias)
+            elif rule.route_name and model_name == rule.route_name:
+                matched = True
             if not matched:
                 continue
 
@@ -270,7 +273,7 @@ def resolve_candidates(
             if not provider:
                 continue
 
-            routed_model = rule.target_model or model_name
+            routed_model = rule.target_model or rule.match_value or model_name
             if not rule.target_model and rule.match_type == "prefix" and model_name.startswith(rule.match_value):
                 routed_model = model_name[len(rule.match_value):]
 

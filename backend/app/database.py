@@ -55,6 +55,8 @@ def init_db():
         MeshWorker,
         CompletionLog,
         VirtualModel,
+        SystemPromptProfile,
+        ChatSession,
     )
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)

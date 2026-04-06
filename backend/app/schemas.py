@@ -281,6 +281,9 @@ class ModelRouteCreate(BaseModel):
     provider_id: int
     priority: int = 100
     enabled: bool = True
+    supports_tools: bool = False
+    supports_vision: bool = False
+    supports_thinking: bool = False
 
 
 class ModelRouteResponse(BaseModel):
@@ -292,6 +295,9 @@ class ModelRouteResponse(BaseModel):
     provider_id: int
     priority: int
     enabled: bool
+    supports_tools: bool = False
+    supports_vision: bool = False
+    supports_thinking: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

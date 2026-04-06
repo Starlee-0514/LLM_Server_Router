@@ -167,13 +167,16 @@ class ModelRoute(Base):
     __tablename__ = "model_routes"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    route_name = Column(String(255), unique=True, nullable=False, index=True)
+    route_name = Column(String(255), nullable=False, index=True)
     match_type = Column(String(20), nullable=False, default="exact")  # exact | prefix
     match_value = Column(String(255), nullable=False, index=True)
     target_model = Column(String(255), nullable=True, default="")
     provider_id = Column(Integer, nullable=False, index=True)
     priority = Column(Integer, nullable=False, default=100)
     enabled = Column(Integer, nullable=False, default=1)
+    supports_tools = Column(Integer, nullable=False, default=0)
+    supports_vision = Column(Integer, nullable=False, default=0)
+    supports_thinking = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(
         DateTime,
@@ -293,6 +296,39 @@ class VirtualModel(Base):
     #   "fallback_provider_id": int, "preferred_provider_ids": [int] }
     routing_hints_json = Column(Text, nullable=False, default="{}")
     enabled = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class SystemPromptProfile(Base):
+    """User-defined system prompt profiles, synced across devices via the backend."""
+
+    __tablename__ = "system_prompt_profiles"
+
+    id = Column(String(64), primary_key=True)          # client-generated UUID
+    name = Column(String(255), nullable=False, unique=True, index=True)
+    content = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class ChatSession(Base):
+    """Persisted inference chat sessions, synced across devices via the backend."""
+
+    __tablename__ = "chat_sessions"
+
+    id = Column(String(64), primary_key=True)          # client-generated UUID
+    title = Column(String(512), nullable=False, default="New Chat")
+    model = Column(String(255), nullable=False, default="")
+    messages_json = Column(Text, nullable=False, default="[]")  # JSON array of ChatMessage
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(
         DateTime,
