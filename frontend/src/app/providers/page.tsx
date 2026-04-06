@@ -19,6 +19,7 @@ import {
   registerCommonProvider,
   startCommonProviderOAuth,
   startDeviceCodeFlow,
+  syncLocalProviders,
   updateProvider,
   type CommonProviderTemplate,
   type ProviderCreatePayload,
@@ -50,12 +51,14 @@ export default function ProvidersPage() {
   const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [expandedModels, setExpandedModels] = useState<Record<number, boolean>>({});
   const [deviceCode, setDeviceCode] = useState<{
     userCode: string;
     verificationUri: string;
     sessionId: string;
   } | null>(null);
   const [deviceCodePolling, setDeviceCodePolling] = useState(false);
+  const [syncingLocal, setSyncingLocal] = useState(false);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const filteredProviders = useMemo(() => {
@@ -242,14 +245,42 @@ export default function ProvidersPage() {
     <div className="flex min-h-screen">
       <Sidebar />
       <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
-        <div className="mb-8">
-          <h1 className="text-2xl font-bold tracking-tight">Providers</h1>
-          <p className="text-sm text-muted-foreground mt-1">管理 OpenAI-compatible / Anthropic / Local provider endpoints</p>
+        <div className="mb-8 flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight">Providers</h1>
+            <p className="text-sm text-muted-foreground mt-1">管理 OpenAI-compatible / Anthropic / Local provider endpoints</p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={syncingLocal}
+            onClick={async () => {
+              setSyncingLocal(true);
+              try {
+                const created = await syncLocalProviders();
+                if (created.length > 0) {
+                  await refresh();
+                } else {
+                  setError("No new local processes found (all already registered or none running).");
+                }
+              } catch (e: any) {
+                setError(e.message ?? "Sync local failed");
+              } finally {
+                setSyncingLocal(false);
+              }
+            }}
+          >
+            {syncingLocal ? "Scanning..." : "⚡ Sync Local Models"}
+          </Button>
         </div>
 
         {error && <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
 
-        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">
+        <div className="grid grid-cols-1 xl:grid-cols-[1fr_1.2fr] gap-6">
+          {/* Left column: Quick Setup + Create/Edit form */}
+          <div className="space-y-6">
+
+        <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
           <CardHeader>
             <CardTitle className="text-base">Common Providers Quick Setup</CardTitle>
           </CardHeader>
@@ -315,7 +346,7 @@ export default function ProvidersPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">
+        <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
           <CardHeader>
             <CardTitle className="text-base">{editingId !== null ? "Edit Provider" : "Create Provider"}</CardTitle>
           </CardHeader>
@@ -373,7 +404,10 @@ export default function ProvidersPage() {
           </CardContent>
         </Card>
 
-        <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+          </div>
+          {/* Right column: Provider List */}
+
+        <Card className="border-border/40 bg-card/60 backdrop-blur-sm h-fit">
           <CardHeader>
             <CardTitle className="text-base">Provider List {loading ? "(Loading...)" : ""}</CardTitle>
           </CardHeader>
@@ -400,7 +434,7 @@ export default function ProvidersPage() {
             {filteredProviders.length === 0 ? (
               <p className="text-sm text-muted-foreground">No providers configured.</p>
             ) : (
-              <div className="space-y-3">
+              <div className="grid grid-cols-1 gap-3">
                 {filteredProviders.map((provider) => (
                   <div key={provider.id} className="rounded-md border border-border/40 bg-muted/20 p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -431,12 +465,21 @@ export default function ProvidersPage() {
                     )}
                     {modelMap[provider.id] && (
                       <div className="mt-2 rounded border border-border/40 bg-background/40 p-2">
-                        <p className="text-xs text-muted-foreground mb-1">models: {modelMap[provider.id].length}</p>
-                        <div className="max-h-32 overflow-y-auto space-y-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-xs text-muted-foreground w-full justify-start p-0 h-auto"
+                          onClick={() => setExpandedModels((prev) => ({ ...prev, [provider.id]: !prev[provider.id] }))}
+                        >
+                          {expandedModels[provider.id] ? `▾ models: ${modelMap[provider.id].length}` : `▸ models: ${modelMap[provider.id].length}`}
+                        </Button>
+                        {expandedModels[provider.id] && (
+                        <div className="mt-1 max-h-32 overflow-y-auto space-y-1">
                           {modelMap[provider.id].slice(0, 30).map((m) => (
                             <p key={m.id} className="text-xs font-mono">{m.id}</p>
                           ))}
                         </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -445,6 +488,7 @@ export default function ProvidersPage() {
             )}
           </CardContent>
         </Card>
+        </div>
       </main>
     </div>
   );

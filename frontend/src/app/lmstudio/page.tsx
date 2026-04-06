@@ -7,17 +7,23 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   getLMStudioCliStatus,
   getLMStudioStatus,
+  getOllamaStatus,
   lmStudioModelLoad,
   lmStudioModelUnload,
   lmStudioRegisterProvider,
   lmStudioServerStart,
   lmStudioServerStop,
+  ollamaDeleteModel,
+  ollamaPullModel,
+  ollamaRegisterProvider,
   type LMStudioCliCheck,
   type LMStudioCommandResult,
   type LMStudioStatus,
+  type OllamaStatus,
 } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
@@ -58,6 +64,7 @@ function CmdOutput({ result }: { result: LMStudioCommandResult | null }) {
 // ---------------------------------------------------------------------------
 
 export default function LMStudioPage() {
+  // LM Studio state
   const [cliCheck, setCliCheck] = useState<LMStudioCliCheck | null>(null);
   const [status, setStatus] = useState<LMStudioStatus | null>(null);
   const [probing, setProbing] = useState(false);
@@ -72,8 +79,37 @@ export default function LMStudioPage() {
   const [busy, setBusy] = useState(false);
   const [regResult, setRegResult] = useState<string | null>(null);
   const [providerName, setProviderName] = useState("LM Studio");
+  const [providerNameEdited, setProviderNameEdited] = useState(false);
 
-  // ---- probe on mount + on demand ----
+  // Ollama state
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
+  const [ollamaProbing, setOllamaProbing] = useState(false);
+  const [ollamaHost, setOllamaHost] = useState("127.0.0.1");
+  const [ollamaPort, setOllamaPort] = useState(11434);
+  const [ollamaPullName, setOllamaPullName] = useState("");
+  const [ollamaBusy, setOllamaBusy] = useState(false);
+  const [ollamaResult, setOllamaResult] = useState<string | null>(null);
+  const [ollamaRegResult, setOllamaRegResult] = useState<string | null>(null);
+  const [ollamaProviderName, setOllamaProviderName] = useState("Ollama");
+  const [ollamaProviderNameEdited, setOllamaProviderNameEdited] = useState(false);
+  const [ollamaExpandModels, setOllamaExpandModels] = useState(false);
+
+  // Auto-derive provider name from host when user hasn't manually edited it
+  useEffect(() => {
+    if (!providerNameEdited) {
+      const isLocal = host === "127.0.0.1" || host === "localhost";
+      setProviderName(isLocal ? "LM Studio" : `LM Studio (${host}:${port})`);
+    }
+  }, [host, port, providerNameEdited]);
+
+  useEffect(() => {
+    if (!ollamaProviderNameEdited) {
+      const isLocal = ollamaHost === "127.0.0.1" || ollamaHost === "localhost";
+      setOllamaProviderName(isLocal ? "Ollama" : `Ollama (${ollamaHost}:${ollamaPort})`);
+    }
+  }, [ollamaHost, ollamaPort, ollamaProviderNameEdited]);
+
+  // ---- LM Studio probe ----
   const probe = useCallback(async () => {
     setProbing(true);
     try {
@@ -90,11 +126,25 @@ export default function LMStudioPage() {
     }
   }, [host, port]);
 
+  // ---- Ollama probe ----
+  const probeOllama = useCallback(async () => {
+    setOllamaProbing(true);
+    try {
+      const s = await getOllamaStatus(ollamaHost, ollamaPort);
+      setOllamaStatus(s);
+    } catch {
+      //
+    } finally {
+      setOllamaProbing(false);
+    }
+  }, [ollamaHost, ollamaPort]);
+
   useEffect(() => {
     probe();
+    probeOllama();
   }, []);
 
-  // ---- command wrapper ----
+  // ---- LM Studio command wrapper ----
   const run = async (fn: () => Promise<LMStudioCommandResult>) => {
     setBusy(true);
     setCmdResult(null);
@@ -122,30 +172,86 @@ export default function LMStudioPage() {
     }
   };
 
+  // ---- Ollama actions ----
+  const handleOllamaPull = async () => {
+    if (!ollamaPullName.trim()) return;
+    setOllamaBusy(true);
+    setOllamaResult(null);
+    try {
+      const r = await ollamaPullModel(ollamaPullName.trim(), ollamaHost, ollamaPort);
+      setOllamaResult(r.success ? `✓ ${r.message}` : `✗ ${r.message}`);
+      await probeOllama();
+    } catch (e: any) {
+      setOllamaResult(`✗ ${e.message ?? "Pull failed"}`);
+    } finally {
+      setOllamaBusy(false);
+    }
+  };
+
+  const handleOllamaDelete = async (name: string) => {
+    setOllamaBusy(true);
+    setOllamaResult(null);
+    try {
+      const r = await ollamaDeleteModel(name, ollamaHost, ollamaPort);
+      setOllamaResult(r.success ? `✓ ${r.message}` : `✗ ${r.message}`);
+      await probeOllama();
+    } catch (e: any) {
+      setOllamaResult(`✗ ${e.message ?? "Delete failed"}`);
+    } finally {
+      setOllamaBusy(false);
+    }
+  };
+
+  const handleOllamaRegister = async () => {
+    try {
+      const r = await ollamaRegisterProvider(ollamaHost, ollamaPort, ollamaProviderName);
+      setOllamaRegResult(
+        r.created
+          ? `✓ Registered as provider #${r.id} (${r.name} @ ${r.base_url})`
+          : `✓ Updated existing provider #${r.id}`,
+      );
+    } catch (e: any) {
+      setOllamaRegResult(`✗ ${e.message ?? "Failed"}`);
+    }
+  };
+
   const isRunning = status?.running ?? false;
   const cliOk = cliCheck?.available ?? false;
+  const ollamaIsRunning = ollamaStatus?.running ?? false;
 
   return (
     <div className="flex min-h-screen">
       <Sidebar />
       <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
         {/* Header */}
-        <div className="mb-8 flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight flex items-center gap-3">
+        <div className="mb-6">
+          <h1 className="text-2xl font-bold tracking-tight flex items-center gap-3">
+            Local Frameworks
+          </h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Manage local inference servers and register them as OpenAI-compatible providers.
+          </p>
+        </div>
+
+        <Tabs defaultValue="lmstudio" className="w-full">
+          <TabsList className="mb-6">
+            <TabsTrigger value="lmstudio" className="gap-2">
               <StatusDot running={isRunning} />
               LM Studio
-            </h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              Manage your local LM Studio server via the{" "}
-              <code className="text-xs font-mono bg-muted px-1 rounded">lms</code> CLI,
-              then register it as an OpenAI-compatible provider in the router.
-            </p>
+            </TabsTrigger>
+            <TabsTrigger value="ollama" className="gap-2">
+              <StatusDot running={ollamaIsRunning} />
+              Ollama
+            </TabsTrigger>
+          </TabsList>
+
+          {/* ==================== LM Studio Tab ==================== */}
+          <TabsContent value="lmstudio">
+          <div className="flex justify-end mb-4">
+            <Button variant="outline" size="sm" onClick={probe} disabled={probing}>
+              {probing ? "Probing…" : "Refresh"}
+            </Button>
           </div>
-          <Button variant="outline" size="sm" onClick={probe} disabled={probing}>
-            {probing ? "Probing…" : "Refresh"}
-          </Button>
-        </div>
 
         <div className="grid gap-6 xl:grid-cols-2">
           {/* ---- Status card ---- */}
@@ -382,7 +488,7 @@ export default function LMStudioPage() {
                   <Input
                     id="reg-name"
                     value={providerName}
-                    onChange={(e) => setProviderName(e.target.value)}
+                    onChange={(e) => { setProviderName(e.target.value); setProviderNameEdited(true); }}
                     placeholder="LM Studio"
                   />
                 </div>
@@ -422,6 +528,195 @@ export default function LMStudioPage() {
             </CardContent>
           </Card>
         </div>
+          </TabsContent>
+
+          {/* ==================== Ollama Tab ==================== */}
+          <TabsContent value="ollama">
+          <div className="flex justify-end mb-4">
+            <Button variant="outline" size="sm" onClick={probeOllama} disabled={ollamaProbing}>
+              {ollamaProbing ? "Probing…" : "Refresh"}
+            </Button>
+          </div>
+
+          <div className="grid gap-6 xl:grid-cols-2">
+            {/* ---- Ollama Status ---- */}
+            <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+              <CardHeader>
+                <CardTitle className="text-base flex items-center gap-2">
+                  <StatusDot running={ollamaIsRunning} />
+                  Ollama Status
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Server</span>
+                  <Badge
+                    variant="outline"
+                    className={ollamaIsRunning
+                      ? "bg-emerald-500/10 text-emerald-300 border-emerald-400/30"
+                      : "bg-zinc-500/10 text-zinc-400 border-zinc-500/30"}
+                  >
+                    {ollamaStatus ? (ollamaIsRunning ? `running :${ollamaStatus.port}` : "not reachable") : "…"}
+                  </Badge>
+                </div>
+
+                {ollamaStatus?.error && (
+                  <p className="text-xs text-muted-foreground rounded bg-muted/30 px-2 py-1.5">{ollamaStatus.error}</p>
+                )}
+
+                {/* Running models */}
+                {ollamaIsRunning && (ollamaStatus?.running_models.length ?? 0) > 0 && (
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-1">Running models (in VRAM)</p>
+                    <div className="flex flex-wrap gap-1">
+                      {ollamaStatus!.running_models.map((m) => (
+                        <Badge key={m.name} variant="outline" className="text-[11px] font-mono bg-emerald-500/10">
+                          {m.name}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Local models */}
+                {ollamaIsRunning && (
+                  <div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs text-muted-foreground w-full justify-start p-0 h-auto"
+                      onClick={() => setOllamaExpandModels(!ollamaExpandModels)}
+                    >
+                      {ollamaExpandModels ? `▾ Local models: ${ollamaStatus?.local_models.length ?? 0}` : `▸ Local models: ${ollamaStatus?.local_models.length ?? 0}`}
+                    </Button>
+                    {ollamaExpandModels && (
+                      <div className="mt-2 max-h-48 overflow-y-auto space-y-1">
+                        {(ollamaStatus?.local_models ?? []).map((m) => (
+                          <div key={m.name} className="flex items-center justify-between rounded border border-border/30 bg-muted/10 px-2 py-1">
+                            <div>
+                              <p className="text-xs font-mono">{m.name}</p>
+                              <p className="text-[10px] text-muted-foreground">{m.parameter_size} · {m.quantization_level} · {(m.size / 1e9).toFixed(1)}GB</p>
+                            </div>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-destructive text-xs h-6"
+                              disabled={ollamaBusy}
+                              onClick={() => handleOllamaDelete(m.name)}
+                            >
+                              ✕
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Connection config */}
+                <div className="pt-2 border-t border-border/30 grid grid-cols-[1fr_80px] gap-2">
+                  <div className="space-y-1">
+                    <Label className="text-xs">Host</Label>
+                    <Input value={ollamaHost} onChange={(e) => setOllamaHost(e.target.value)} className="h-8 text-sm font-mono" placeholder="127.0.0.1" />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Port</Label>
+                    <Input type="number" value={ollamaPort} onChange={(e) => setOllamaPort(Number(e.target.value))} className="h-8 text-sm font-mono" placeholder="11434" />
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* ---- Pull Model ---- */}
+            <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+              <CardHeader>
+                <CardTitle className="text-base">Pull Model</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="space-y-1">
+                  <Label className="text-xs">Model name</Label>
+                  <Input
+                    value={ollamaPullName}
+                    onChange={(e) => setOllamaPullName(e.target.value)}
+                    placeholder="e.g. llama3.1, qwen3:8b, gemma3:4b"
+                    className="text-sm font-mono"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Pull from the <a href="https://ollama.com/library" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2">Ollama library</a>.
+                  </p>
+                </div>
+                <Button
+                  className="w-full"
+                  disabled={ollamaBusy || !ollamaIsRunning || !ollamaPullName.trim()}
+                  onClick={handleOllamaPull}
+                >
+                  {ollamaBusy ? "Pulling…" : "Pull Model"}
+                </Button>
+                {ollamaResult && (
+                  <p className={["text-xs rounded px-3 py-2", ollamaResult.startsWith("✓") ? "bg-emerald-500/10 text-emerald-300" : "bg-red-500/10 text-red-300"].join(" ")}>
+                    {ollamaResult}
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* ---- Register as provider ---- */}
+            <Card className="border-border/40 bg-card/60 backdrop-blur-sm xl:col-span-2">
+              <CardHeader>
+                <CardTitle className="text-base">Register as Router Provider</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Ollama exposes an OpenAI-compatible API at <code className="text-xs font-mono bg-muted px-1 rounded">/v1</code>.
+                  Register it so the router can forward requests to it.
+                </p>
+                <div className="grid gap-3 sm:grid-cols-[1fr_120px_auto]">
+                  <div className="space-y-1">
+                    <Label className="text-xs">Provider name</Label>
+                    <Input
+                      value={ollamaProviderName}
+                      onChange={(e) => { setOllamaProviderName(e.target.value); setOllamaProviderNameEdited(true); }}
+                      placeholder="Ollama"
+                    />
+                  </div>
+                  <div className="space-y-1 opacity-60">
+                    <Label className="text-xs">URL (auto)</Label>
+                    <Input value={`http://${ollamaHost}:${ollamaPort}`} readOnly className="text-xs font-mono bg-muted/30" />
+                  </div>
+                  <div className="flex items-end">
+                    <Button
+                      onClick={handleOllamaRegister}
+                      disabled={!ollamaProviderName.trim()}
+                      className="w-full sm:w-auto"
+                    >
+                      Register
+                    </Button>
+                  </div>
+                </div>
+                {ollamaRegResult && (
+                  <p
+                    className={[
+                      "mt-3 text-sm rounded px-3 py-2",
+                      ollamaRegResult.startsWith("✓")
+                        ? "bg-emerald-500/10 text-emerald-300"
+                        : "bg-red-500/10 text-red-300",
+                    ].join(" ")}
+                  >
+                    {ollamaRegResult}
+                  </p>
+                )}
+                <p className="mt-3 text-[11px] text-muted-foreground">
+                  After registering, create a route in{" "}
+                  <a href="/routes" className="underline underline-offset-2">Routes</a>{" "}
+                  or add a virtual alias in{" "}
+                  <a href="/mapping" className="underline underline-offset-2">Mapping</a>{" "}
+                  that forwards to this provider.
+                </p>
+              </CardContent>
+            </Card>
+          </div>
+          </TabsContent>
+        </Tabs>
       </main>
     </div>
   );

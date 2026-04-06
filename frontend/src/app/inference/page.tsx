@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import Sidebar from "@/components/sidebar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,6 +19,13 @@ import {
   launchModelGroup,
   listInferenceModels,
   streamChatCompletion,
+  listSystemPromptProfiles,
+  upsertSystemPromptProfile,
+  deleteSystemPromptProfile,
+  listChatSessions,
+  getChatSession,
+  upsertChatSession,
+  deleteChatSession as apiDeleteChatSession,
   type ChatMessage,
   type ModelGroup,
   type OpenAIModelItem,
@@ -27,9 +36,7 @@ const DEFAULT_SYSTEM_PROMPT = "You are a precise local-model assistant. Keep ans
 
 const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : "Unknown error";
 
-// ---- System prompt profiles persistence ----
-const SYSTEM_PROMPT_PROFILES_KEY = "llm-router-system-prompt-profiles";
-
+// ---- System prompt profiles ----
 interface SystemPromptProfile {
   id: string;
   name: string;
@@ -43,20 +50,7 @@ const BUILTIN_PROFILES: SystemPromptProfile[] = [
   { id: "__analyst", name: "Data Analyst", content: "You are a data analyst. Provide precise, evidence-based answers. Use tables and structured output when helpful." },
 ];
 
-function loadProfiles(): SystemPromptProfile[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(SYSTEM_PROMPT_PROFILES_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
-}
-
-function saveProfiles(profiles: SystemPromptProfile[]) {
-  window.localStorage.setItem(SYSTEM_PROMPT_PROFILES_KEY, JSON.stringify(profiles));
-}
-
-// ---- Chat session persistence helpers ----
-const SESSIONS_STORAGE_KEY = "llm-router-chat-sessions";
+// ---- Chat session helpers ----
 const ACTIVE_SESSION_KEY = "llm-router-active-session";
 
 interface ChatSession {
@@ -70,18 +64,6 @@ interface ChatSession {
 
 function generateSessionId(): string {
   return `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function loadSessions(): ChatSession[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(SESSIONS_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
-}
-
-function saveSessions(sessions: ChatSession[]) {
-  window.localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(sessions));
 }
 
 function loadActiveSessionId(): string | null {
@@ -118,7 +100,7 @@ export default function InferencePage() {
   const [newProfileName, setNewProfileName] = useState("");
   const [temperature, setTemperature] = useState(0.7);
   const [topP, setTopP] = useState(0.95);
-  const [maxTokens, setMaxTokens] = useState(1024);
+  const [maxTokens, setMaxTokens] = useState(262144);
   const [streamReplies, setStreamReplies] = useState(true);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
@@ -128,52 +110,78 @@ export default function InferencePage() {
   const [launchingId, setLaunchingId] = useState<number | null>(null);
   const [launchDeckCollapsed, setLaunchDeckCollapsed] = useState(false);
   const [collapsedLaunchGroups, setCollapsedLaunchGroups] = useState<Record<string, boolean>>({});
+  const [collapsedCatalogGroups, setCollapsedCatalogGroups] = useState<Record<string, boolean>>({});
   const [usageSummary, setUsageSummary] = useState("");
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [sessionListCollapsed, setSessionListCollapsed] = useState(false);
   const skipSaveRef = useRef(false);
 
-  // --- Session bootstrap (runs once) ---
+  // --- Session & profile bootstrap (loads from backend, fallback to empty) ---
   useEffect(() => {
-    setProfiles(loadProfiles());
-    const loaded = loadSessions();
+    // Load custom profiles from backend
+    listSystemPromptProfiles().then((serverProfiles) => {
+      setProfiles(serverProfiles.map((p) => ({ id: p.id, name: p.name, content: p.content })));
+    }).catch(() => { /* silently ignore; built-in profiles still shown */ });
+
+    // Load sessions from backend
     const storedId = loadActiveSessionId();
-    if (loaded.length === 0) {
+    listChatSessions().then(async (summaries) => {
+      if (summaries.length === 0) {
+        const id = generateSessionId();
+        const fresh: ChatSession = { id, title: "New Chat", model: "", messages: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+        await upsertChatSession({ id, title: "New Chat", model: "", messages: [] }).catch(() => {});
+        saveActiveSessionId(id);
+        setSessions([fresh]);
+        setActiveSessionId(id);
+      } else {
+        const stubs: ChatSession[] = summaries.map((s) => ({
+          id: s.id, title: s.title, model: s.model, messages: [],
+          createdAt: s.created_at, updatedAt: s.updated_at,
+        }));
+        const targetSummary = summaries.find((s) => s.id === storedId) ?? summaries[0];
+        // Load messages for the active session
+        const detail = await getChatSession(targetSummary.id);
+        const activeSess: ChatSession = {
+          id: detail.id, title: detail.title, model: detail.model,
+          messages: detail.messages as ChatMessage[],
+          createdAt: detail.created_at, updatedAt: detail.updated_at,
+        };
+        const merged = stubs.map((s) => (s.id === activeSess.id ? activeSess : s));
+        saveActiveSessionId(targetSummary.id);
+        setSessions(merged);
+        setActiveSessionId(targetSummary.id);
+        skipSaveRef.current = true;
+        setMessages(activeSess.messages);
+        if (activeSess.model) setSelectedModel(activeSess.model);
+      }
+    }).catch(() => {
+      // Backend unavailable: create a blank in-memory session
       const id = generateSessionId();
       const fresh: ChatSession = { id, title: "New Chat", model: "", messages: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-      saveSessions([fresh]);
-      saveActiveSessionId(id);
       setSessions([fresh]);
       setActiveSessionId(id);
-    } else {
-      setSessions(loaded);
-      const target = loaded.find((s) => s.id === storedId) ?? loaded[0];
-      setActiveSessionId(target.id);
-      skipSaveRef.current = true;
-      setMessages(target.messages);
-    }
+    });
   }, []);
 
-  // --- Auto-save messages into current session ---
+  // --- Auto-save active session to backend when messages change ---
   useEffect(() => {
     if (!activeSessionId) return;
     if (skipSaveRef.current) { skipSaveRef.current = false; return; }
-    setSessions((prev) => {
-      const next = prev.map((s) =>
+    const title = deriveTitle(messages);
+    setSessions((prev) =>
+      prev.map((s) =>
         s.id === activeSessionId
-          ? { ...s, messages, model: selectedModel, title: deriveTitle(messages.length > 0 ? messages : s.messages === messages ? s.messages : messages), updatedAt: new Date().toISOString() }
+          ? { ...s, messages, model: selectedModel, title, updatedAt: new Date().toISOString() }
           : s,
-      );
-      saveSessions(next);
-      return next;
-    });
+      ),
+    );
+    upsertChatSession({ id: activeSessionId, title, model: selectedModel, messages }).catch(() => {});
   }, [messages, activeSessionId, selectedModel]);
 
   const switchSession = (id: string) => {
     const target = sessions.find((s) => s.id === id);
     if (!target) return;
-    // Abort any in-flight streaming response before switching
     if (abortRef.current) {
       abortRef.current.abort();
       abortRef.current = null;
@@ -181,9 +189,23 @@ export default function InferencePage() {
     }
     setActiveSessionId(id);
     saveActiveSessionId(id);
-    skipSaveRef.current = true;
-    setMessages(target.messages);
-    if (target.model) setSelectedModel(target.model);
+    // If messages not yet loaded for this session, fetch from backend
+    if (target.messages.length === 0) {
+      getChatSession(id).then((detail) => {
+        const loaded = detail.messages as ChatMessage[];
+        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, messages: loaded, model: detail.model } : s));
+        skipSaveRef.current = true;
+        setMessages(loaded);
+        if (detail.model) setSelectedModel(detail.model);
+      }).catch(() => {
+        skipSaveRef.current = true;
+        setMessages([]);
+      });
+    } else {
+      skipSaveRef.current = true;
+      setMessages(target.messages);
+      if (target.model) setSelectedModel(target.model);
+    }
     setUsageSummary("");
     setError(null);
   };
@@ -191,10 +213,9 @@ export default function InferencePage() {
   const createNewSession = () => {
     const id = generateSessionId();
     const fresh: ChatSession = { id, title: "New Chat", model: selectedModel, messages: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    const next = [fresh, ...sessions];
-    saveSessions(next);
+    upsertChatSession({ id, title: "New Chat", model: selectedModel, messages: [] }).catch(() => {});
     saveActiveSessionId(id);
-    setSessions(next);
+    setSessions((prev) => [fresh, ...prev]);
     setActiveSessionId(id);
     skipSaveRef.current = true;
     setMessages([]);
@@ -203,16 +224,18 @@ export default function InferencePage() {
   };
 
   const deleteSession = (id: string) => {
-    const next = sessions.filter((s) => s.id !== id);
-    if (next.length === 0) {
-      createNewSession();
-      return;
-    }
-    saveSessions(next);
-    setSessions(next);
-    if (activeSessionId === id) {
-      switchSession(next[0].id);
-    }
+    apiDeleteChatSession(id).catch(() => {});
+    setSessions((prev) => {
+      const next = prev.filter((s) => s.id !== id);
+      if (next.length === 0) {
+        createNewSession();
+        return prev; // createNewSession sets its own state
+      }
+      if (activeSessionId === id) {
+        switchSession(next[0].id);
+      }
+      return next;
+    });
   };
   const abortRef = useRef<AbortController | null>(null);
   const sendSessionRef = useRef<string | null>(null);
@@ -313,16 +336,15 @@ export default function InferencePage() {
     const name = newProfileName.trim();
     if (!name || !systemPrompt.trim()) return;
     const id = `custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const next = [...profiles, { id, name, content: systemPrompt }];
-    setProfiles(next);
-    saveProfiles(next);
+    const newProfile = { id, name, content: systemPrompt };
+    setProfiles((prev) => [...prev, newProfile]);
+    upsertSystemPromptProfile(newProfile).catch(() => {});
     setNewProfileName("");
   };
 
   const handleDeleteProfile = (id: string) => {
-    const next = profiles.filter((p) => p.id !== id);
-    setProfiles(next);
-    saveProfiles(next);
+    setProfiles((prev) => prev.filter((p) => p.id !== id));
+    deleteSystemPromptProfile(id).catch(() => {});
   };
 
   const handleLoadProfile = (profile: SystemPromptProfile) => {
@@ -605,43 +627,72 @@ export default function InferencePage() {
                   placeholder="Filter by model or owner"
                   className="border-white/10 bg-black/20 text-white placeholder:text-slate-500"
                 />
-                <div className="max-h-[420px] space-y-4 overflow-y-auto pr-1">
-                  {filteredModels.length === 0 && <p className="text-sm text-slate-400">No models match this filter.</p>}
-                  {(() => {
-                    const groups = filteredModels.reduce<Record<string, typeof filteredModels>>((acc, m) => {
-                      (acc[m.owned_by] ??= []).push(m);
-                      return acc;
-                    }, {});
-                    return Object.entries(groups).map(([owner, items]) => (
-                      <div key={owner}>
-                        <p className="mb-1.5 px-1 text-[10px] font-semibold uppercase tracking-widest text-slate-500">{owner}</p>
-                        <div className="space-y-1.5">
-                          {items.map((model) => {
-                            const active = model.id === selectedModel;
-                            return (
-                              <button
-                                key={`${model.owned_by}-${model.id}`}
-                                type="button"
-                                onClick={() => setSelectedModel(model.id)}
-                                className={`w-full rounded-2xl border p-3 text-left transition ${active ? "border-cyan-400/60 bg-cyan-500/10 shadow-[0_14px_32px_-24px_rgba(34,211,238,0.9)]" : "border-white/10 bg-black/20 hover:border-cyan-400/30 hover:bg-white/8"}`}
-                              >
-                                <div className="flex items-center justify-between gap-2">
-                                  <p className="truncate text-sm font-semibold text-white">{model.id}</p>
-                                </div>
-                                <p className="mt-1 text-[11px] text-slate-400">
-                                  {runningNames.has(model.id)
-                                    ? `Local: ${processPhaseMap[model.id] || "running"}`
-                                    : "Routed or remote target"}
-                                </p>
-                              </button>
-                            );
-                          })}
+                {filteredModels.length === 0 ? (
+                  <p className="text-sm text-slate-400">No models match this filter.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {Object.entries(
+                      filteredModels.reduce<Record<string, typeof filteredModels>>((acc, m) => {
+                        (acc[m.owned_by] ??= []).push(m);
+                        return acc;
+                      }, {}),
+                    ).map(([owner, items]) => {
+                      const collapsed = collapsedCatalogGroups[owner] ?? false;
+                      return (
+                        <div key={owner} className="rounded-2xl border border-white/10 bg-black/15 p-3">
+                          <button
+                            type="button"
+                            onClick={() => setCollapsedCatalogGroups((prev) => ({ ...prev, [owner]: !collapsed }))}
+                            className="flex w-full items-center justify-between gap-3 text-left"
+                          >
+                            <div>
+                              <p className="text-sm font-semibold text-white">{owner}</p>
+                              <p className="text-[11px] text-slate-400">{items.length} model{items.length > 1 ? "s" : ""}</p>
+                            </div>
+                            <Badge className="bg-white/10 text-white">{collapsed ? "Show" : "Hide"}</Badge>
+                          </button>
+                          {!collapsed && (
+                            <div className="mt-3 space-y-2">
+                              {items.map((model) => {
+                                const running = runningNames.has(model.id);
+                                const isSelected = selectedModel === model.id;
+                                return (
+                                  <div
+                                    key={`${model.owned_by}-${model.id}`}
+                                    className={`rounded-2xl border p-3 transition ${isSelected ? "border-cyan-400/40 bg-cyan-500/10" : "border-white/10 bg-black/20"}`}
+                                  >
+                                    <div className="flex items-start justify-between gap-2">
+                                      <p className="flex-1 truncate font-mono text-sm text-white">{model.id}</p>
+                                      {running && <Badge className="shrink-0 bg-emerald-500/20 text-emerald-300">Running</Badge>}
+                                    </div>
+                                    <div className="mt-2">
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        className={`w-full ${isSelected ? "border-cyan-400/40 text-cyan-300" : ""}`}
+                                        onClick={() => setSelectedModel(model.id)}
+                                      >
+                                        {isSelected ? "Selected ✓" : "Use"}
+                                      </Button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
-                      </div>
-                    ));
-                  })()}
-
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {selectedModel && (
+                  <p className="text-[11px] text-slate-400 px-1">
+                    Selected: <span className="text-cyan-300 font-mono">{selectedModel}</span>
+                    {runningNames.has(selectedModel) && (
+                      <span className="ml-2 text-emerald-400">{processPhaseMap[selectedModel] || "running"}</span>
+                    )}
+                  </p>
+                )}
               </CardContent>
             </Card>
 
@@ -765,7 +816,13 @@ export default function InferencePage() {
                       <div className="mb-1 flex items-center justify-between gap-2">
                         <span className="text-[11px] uppercase tracking-[0.18em] text-slate-400">{message.role}</span>
                       </div>
-                      <p className="whitespace-pre-wrap text-sm leading-6 text-white">{message.content || (sending && index === messages.length - 1 ? "Thinking..." : "")}</p>
+                      {message.role === "assistant" && message.content ? (
+                        <div className="text-sm leading-6 text-white [&_p]:mb-2 [&_p:last-child]:mb-0 [&_h1]:text-base [&_h1]:font-bold [&_h1]:mb-1 [&_h2]:text-sm [&_h2]:font-semibold [&_h2]:mb-1 [&_h3]:text-sm [&_h3]:font-medium [&_h3]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:mb-2 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:mb-2 [&_li]:mb-0.5 [&_code]:rounded [&_code]:bg-white/10 [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_code]:font-mono [&_pre]:rounded-lg [&_pre]:bg-black/40 [&_pre]:p-3 [&_pre]:text-xs [&_pre]:overflow-x-auto [&_pre]:mb-2 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_blockquote]:border-l-2 [&_blockquote]:border-white/30 [&_blockquote]:pl-3 [&_blockquote]:text-slate-300 [&_blockquote]:mb-2 [&_hr]:border-white/10 [&_hr]:my-2 [&_strong]:font-semibold [&_a]:text-cyan-400 [&_a]:underline [&_table]:w-full [&_table]:border-collapse [&_table]:text-xs [&_td]:border [&_td]:border-white/10 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-white/10 [&_th]:px-2 [&_th]:py-1 [&_th]:font-medium [&_th]:bg-white/5">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                        </div>
+                      ) : (
+                        <p className="whitespace-pre-wrap text-sm leading-6 text-white">{message.content || (sending && index === messages.length - 1 ? "Thinking..." : "")}</p>
+                      )}
                     </div>
                   ))
                 )}

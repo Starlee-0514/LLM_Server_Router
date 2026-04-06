@@ -16,12 +16,6 @@ export default function SettingsPage() {
   const [scanDirs, setScanDirs] = useState<string[]>([]);
   const [newDir, setNewDir] = useState("");
   const [defaultEngine, setDefaultEngine] = useState("");
-  const [openaiApiKey, setOpenaiApiKey] = useState("");
-  const [anthropicApiKey, setAnthropicApiKey] = useState("");
-  const [githubClientId, setGithubClientId] = useState("");
-  const [githubClientSecret, setGithubClientSecret] = useState("");
-  const [googleClientId, setGoogleClientId] = useState("");
-  const [googleClientSecret, setGoogleClientSecret] = useState("");
   const [listenHost, setListenHost] = useState("0.0.0.0");
   const [listenPort, setListenPort] = useState("8000");
   const [corsAllowOrigins, setCorsAllowOrigins] = useState("*");
@@ -74,12 +68,6 @@ export default function SettingsPage() {
       }
 
       setDefaultEngine(data.find((s) => s.key === "default_engine")?.value ?? runtimesData[0]?.name ?? "");
-      setOpenaiApiKey(data.find((s) => s.key === "openai_api_key")?.value ?? "");
-      setAnthropicApiKey(data.find((s) => s.key === "anthropic_api_key")?.value ?? "");
-      setGithubClientId(data.find((s) => s.key === "github_client_id")?.value ?? "");
-      setGithubClientSecret(data.find((s) => s.key === "github_client_secret")?.value ?? "");
-      setGoogleClientId(data.find((s) => s.key === "google_client_id")?.value ?? "");
-      setGoogleClientSecret(data.find((s) => s.key === "google_client_secret")?.value ?? "");
       setListenHost(data.find((s) => s.key === "listen_host")?.value ?? "0.0.0.0");
       setListenPort(data.find((s) => s.key === "listen_port")?.value ?? "8000");
       setCorsAllowOrigins(data.find((s) => s.key === "cors_allow_origins")?.value ?? "*");
@@ -179,12 +167,6 @@ export default function SettingsPage() {
       await updateSettings([
         { key: "model_scan_dirs", value: JSON.stringify(scanDirs) },
         { key: "default_engine", value: defaultEngine },
-        { key: "openai_api_key", value: openaiApiKey.trim() },
-        { key: "anthropic_api_key", value: anthropicApiKey.trim() },
-        { key: "github_client_id", value: githubClientId.trim() },
-        { key: "github_client_secret", value: githubClientSecret.trim() },
-        { key: "google_client_id", value: googleClientId.trim() },
-        { key: "google_client_secret", value: googleClientSecret.trim() },
         { key: "listen_host", value: listenHost.trim() },
         { key: "listen_port", value: listenPort.trim() },
         { key: "cors_allow_origins", value: corsAllowOrigins.trim() },
@@ -353,56 +335,6 @@ export default function SettingsPage() {
                 <p className="text-[10px] text-muted-foreground">
                   Rename operations keep linked model presets aligned automatically.
                 </p>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
-            <CardHeader>
-              <CardTitle className="text-base">Remote API Keys</CardTitle>
-              <p className="text-xs text-muted-foreground">
-                設定 OpenAI / Anthropic fallback 金鑰
-              </p>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="space-y-2">
-                <Label className="text-xs">OpenAI API Key</Label>
-                <Input value={openaiApiKey} onChange={(e) => setOpenaiApiKey(e.target.value)} type="password" className="font-mono text-xs" placeholder="sk-..." />
-              </div>
-              <div className="space-y-2">
-                <Label className="text-xs">Anthropic API Key</Label>
-                <Input value={anthropicApiKey} onChange={(e) => setAnthropicApiKey(e.target.value)} type="password" className="font-mono text-xs" placeholder="sk-ant-..." />
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
-            <CardHeader>
-              <CardTitle className="text-base">OAuth Clients (GitHub / Google)</CardTitle>
-              <p className="text-xs text-muted-foreground">
-                設定 common providers OAuth 登入所需的 client_id / client_secret
-              </p>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div className="space-y-2">
-                  <Label className="text-xs">GitHub Client ID</Label>
-                  <Input value={githubClientId} onChange={(e) => setGithubClientId(e.target.value)} className="font-mono text-xs" placeholder="GitHub OAuth App Client ID" />
-                </div>
-                <div className="space-y-2">
-                  <Label className="text-xs">GitHub Client Secret</Label>
-                  <Input value={githubClientSecret} onChange={(e) => setGithubClientSecret(e.target.value)} type="password" className="font-mono text-xs" placeholder="GitHub OAuth App Client Secret" />
-                </div>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div className="space-y-2">
-                  <Label className="text-xs">Google Client ID</Label>
-                  <Input value={googleClientId} onChange={(e) => setGoogleClientId(e.target.value)} className="font-mono text-xs" placeholder="Google OAuth Client ID" />
-                </div>
-                <div className="space-y-2">
-                  <Label className="text-xs">Google Client Secret</Label>
-                  <Input value={googleClientSecret} onChange={(e) => setGoogleClientSecret(e.target.value)} type="password" className="font-mono text-xs" placeholder="Google OAuth Client Secret" />
-                </div>
               </div>
             </CardContent>
           </Card>

@@ -206,6 +206,29 @@ export default function MappingPage() {
           </p>
         </div>
 
+        {/* Usage Guide */}
+        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm border-l-4 border-l-sky-400/60">
+          <CardContent className="py-4">
+            <details>
+              <summary className="text-sm font-semibold cursor-pointer select-none text-sky-300/90">📖 使用說明（點擊展開）</summary>
+              <div className="mt-3 space-y-2 text-sm text-muted-foreground leading-relaxed">
+                <p><strong className="text-foreground/80">用途：</strong>Model Mapping 讓你建立「虛擬模型別名」，例如 <code className="bg-muted px-1 rounded text-xs">coding</code>、<code className="bg-muted px-1 rounded text-xs">chat</code>、<code className="bg-muted px-1 rounded text-xs">vision</code>。當客戶端（如 VS Code Copilot）發送請求時，只需指定別名，路由器會根據你設定的策略自動選擇最佳的後端模型。</p>
+                <p><strong className="text-foreground/80">路由策略：</strong></p>
+                <ul className="list-disc list-inside space-y-1 ml-2">
+                  <li><strong>local_first</strong> — 優先使用本地模型（LM Studio / Ollama），本地不可用時退回遠端</li>
+                  <li><strong>cheapest</strong> — 選擇 token 費用最低的供應商</li>
+                  <li><strong>fastest</strong> — 選擇延遲最低的供應商</li>
+                  <li><strong>highest_quality</strong> — 選擇最高品質的模型，不考慮費用</li>
+                  <li><strong>local_only</strong> — 只使用本地模型</li>
+                  <li><strong>remote_only</strong> — 只使用遠端 API 供應商</li>
+                </ul>
+                <p><strong className="text-foreground/80">能力需求：</strong>你可以設定別名需要「工具呼叫」或「視覺能力」，路由器只會選擇支援這些能力的模型。</p>
+                <p><strong className="text-foreground/80">快速開始：</strong>點擊下方的預設別名按鈕一鍵建立常用別名，或手動在右側表單中建立自訂別名。</p>
+              </div>
+            </details>
+          </CardContent>
+        </Card>
+
         {error && (
           <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}

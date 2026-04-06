@@ -1,17 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useCallback, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import Sidebar from "@/components/sidebar";
-import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
+import { Badge } from "@/components/ui/badge";
 import {
   createModelRoute,
   deleteModelRoute,
   getModelRoutes,
+  getProviderModels,
   getProviders,
   updateModelRoute,
   type ModelRouteItem,
@@ -19,100 +19,136 @@ import {
   type ProviderEndpoint,
 } from "@/lib/api";
 
-const emptyForm: ModelRoutePayload = {
-  route_name: "",
-  match_type: "exact",
-  match_value: "",
-  target_model: "",
-  provider_id: 0,
-  priority: 100,
-  enabled: true,
-};
+/* ------------------------------------------------------------------ */
+/* Searchable Dropdown                                                 */
+/* ------------------------------------------------------------------ */
+function SearchableDropdown({
+  value,
+  options,
+  onChange,
+  placeholder,
+  loading,
+}: {
+  value: string;
+  options: { label: string; value: string }[];
+  onChange: (v: string) => void;
+  placeholder?: string;
+  loading?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const ref = useRef<HTMLDivElement>(null);
 
-type SuggestedProviderKind = "github-copilot" | "google-gemini-cli";
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
 
-interface SuggestedRouteTemplate {
-  exposedModel: string;
-  providerKind: SuggestedProviderKind;
+  const filtered = useMemo(() => {
+    if (!q) return options;
+    const lower = q.toLowerCase();
+    return options.filter(
+      (o) => o.label.toLowerCase().includes(lower) || o.value.toLowerCase().includes(lower),
+    );
+  }, [options, q]);
+
+  const displayLabel =
+    options.find((o) => o.value === value)?.label ?? (value || placeholder || "Select…");
+
+  return (
+    <div ref={ref} className="relative flex-1 min-w-0">
+      <button
+        type="button"
+        onClick={() => {
+          setOpen(!open);
+          setQ("");
+        }}
+        className="flex h-8 w-full items-center justify-between rounded-md border border-input bg-background px-2 text-xs truncate"
+      >
+        <span className="truncate">{loading ? "Scanning…" : displayLabel}</span>
+        <span className="ml-1 text-muted-foreground/60 shrink-0">▾</span>
+      </button>
+      {open && (
+        <div className="absolute z-50 top-full left-0 mt-1 w-full min-w-[200px] rounded-md border border-border bg-popover shadow-md">
+          <div className="p-1.5">
+            <input
+              autoFocus
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search…"
+              className="h-7 w-full rounded border border-input bg-background px-2 text-xs outline-none focus:border-ring"
+            />
+          </div>
+          <div className="max-h-[200px] overflow-y-auto">
+            {filtered.length === 0 ? (
+              <div className="px-3 py-2 text-xs text-muted-foreground">No matches</div>
+            ) : (
+              filtered.map((o) => (
+                <button
+                  key={o.value}
+                  type="button"
+                  className={`flex w-full items-center px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors text-left ${
+                    o.value === value ? "bg-muted/40 font-semibold" : ""
+                  }`}
+                  onClick={() => {
+                    onChange(o.value);
+                    setOpen(false);
+                  }}
+                >
+                  {o.label}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
-const suggestedRouteTemplates: SuggestedRouteTemplate[] = [
-  { exposedModel: "github-copilot/claude-haiku-4.5", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/claude-opus-4.5", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/claude-opus-4.6", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/claude-sonnet-4.5", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/claude-sonnet-4.6", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-4.1", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-4o", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-5", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-5.4", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-5.3-codex", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-5.2-codex", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-5.1", providerKind: "github-copilot" },
-  { exposedModel: "github-copilot/gpt-5-mini", providerKind: "github-copilot" },
-  { exposedModel: "google-gemini-cli/gemini-2.5-pro", providerKind: "google-gemini-cli" },
-  { exposedModel: "google-gemini-cli/gemini-3-flash-preview", providerKind: "google-gemini-cli" },
-  { exposedModel: "google-gemini-cli/gemini-3-pro-preview", providerKind: "google-gemini-cli" },
-  { exposedModel: "google-gemini-cli/gemini-3.1-pro-preview", providerKind: "google-gemini-cli" },
-];
-
-const suggestedProviderLabels: Record<SuggestedProviderKind, string> = {
-  "github-copilot": "GitHub Copilot Catalog",
-  "google-gemini-cli": "Google Gemini CLI Catalog",
-};
-
-const detectSuggestedProviderKind = (provider: ProviderEndpoint): SuggestedProviderKind | null => {
-  const name = provider.name.toLowerCase();
-  const baseUrl = (provider.base_url || "").toLowerCase();
-
-  if (
-    baseUrl.includes("models.inference.ai.azure.com") ||
-    baseUrl.includes("api.individual.githubcopilot.com") ||
-    name.includes("github") ||
-    name.includes("copilot")
-  ) {
-    return "github-copilot";
-  }
-
-  if (
-    baseUrl.includes("generativelanguage.googleapis.com") ||
-    baseUrl.includes("cloudcode-pa.googleapis.com") ||
-    name.includes("gemini") ||
-    name.includes("google")
-  ) {
-    return "google-gemini-cli";
-  }
-
-  return null;
-};
-
-const buildSuggestedTargetModel = (exposedModel: string) => exposedModel.split("/").slice(1).join("/");
-
-const buildSuggestedRouteName = (exposedModel: string) =>
-  `route-${exposedModel.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")}`;
-
-const buildSuggestedRoutePayload = (template: SuggestedRouteTemplate, providerId: number): ModelRoutePayload => ({
-  route_name: buildSuggestedRouteName(template.exposedModel),
-  match_type: "exact",
-  match_value: template.exposedModel,
-  target_model: buildSuggestedTargetModel(template.exposedModel),
-  provider_id: providerId,
-  priority: 80,
-  enabled: true,
-});
-
+/* ------------------------------------------------------------------ */
+/* RoutesPage                                                          */
+/* ------------------------------------------------------------------ */
 export default function RoutesPage() {
   const [routes, setRoutes] = useState<ModelRouteItem[]>([]);
   const [providers, setProviders] = useState<ProviderEndpoint[]>([]);
-  const [form, setForm] = useState<ModelRoutePayload>(emptyForm);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [search, setSearch] = useState("");
-  const [sortBy, setSortBy] = useState<"priority" | "name" | "provider">("priority");
-  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
-  const [addingSuggestionKey, setAddingSuggestionKey] = useState<string | null>(null);
-  const [addingSuggestionGroup, setAddingSuggestionGroup] = useState<SuggestedProviderKind | null>(null);
+  const [selectedRouteName, setSelectedRouteName] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+
+  // Per-provider model lists
+  const [providerModelsCache, setProviderModelsCache] = useState<Record<number, string[]>>({});
+  const [scanningModels, setScanningModels] = useState<Record<number, boolean>>({});
+
+  // Column width
+  const [leftColWidth, setLeftColWidth] = useState(260);
+
+  // New route creation (left panel)
+  const [newRouteName, setNewRouteName] = useState<string | null>(null);
+  const [newRouteMatchValue, setNewRouteMatchValue] = useState("");
+  const [newRouteMatchType, setNewRouteMatchType] = useState<"exact" | "prefix">("exact");
+
+  // New pairing creation (right panel)
+  const [newPairing, setNewPairing] = useState<{ provider_id: number; target_model: string } | null>(null);
+
+  // Editing route name
+  const [editingRouteName, setEditingRouteName] = useState<string | null>(null);
+  const [editRouteNameValue, setEditRouteNameValue] = useState("");
+
+  // Editing match value
+  const [editingMatchValue, setEditingMatchValue] = useState(false);
+  const [editMatchValueText, setEditMatchValueText] = useState("");
+
+  // Delete confirmation
+  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
+
+  // Drag state
+  const dragIndexRef = useRef<number | null>(null);
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
 
   const providerMap = useMemo(() => {
     const map = new Map<number, ProviderEndpoint>();
@@ -120,363 +156,808 @@ export default function RoutesPage() {
     return map;
   }, [providers]);
 
-  const filteredRoutes = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const filtered = routes.filter((item) => {
-      const providerName = providerMap.get(item.provider_id)?.name ?? "";
-      if (!q) return true;
-      return (
-        item.route_name.toLowerCase().includes(q) ||
-        item.match_value.toLowerCase().includes(q) ||
-        (item.target_model || "").toLowerCase().includes(q) ||
-        providerName.toLowerCase().includes(q)
-      );
-    });
-
-    filtered.sort((a, b) => {
-      if (sortBy === "name") return a.route_name.localeCompare(b.route_name);
-      if (sortBy === "provider") {
-        const aName = providerMap.get(a.provider_id)?.name ?? "";
-        const bName = providerMap.get(b.provider_id)?.name ?? "";
-        return aName.localeCompare(bName);
-      }
-      return a.priority - b.priority;
-    });
-
-    return filtered;
-  }, [routes, search, sortBy, providerMap]);
-
-  const suggestedProviders = useMemo(() => {
-    const matches = new Map<SuggestedProviderKind, ProviderEndpoint>();
-    for (const provider of providers) {
-      if (!provider.enabled) continue;
-      const kind = detectSuggestedProviderKind(provider);
-      if (kind && !matches.has(kind)) {
-        matches.set(kind, provider);
-      }
+  // Group routes by route_name
+  const routeNames = useMemo(() => {
+    const groups = new Map<string, ModelRouteItem[]>();
+    for (const r of routes) {
+      const arr = groups.get(r.route_name) ?? [];
+      arr.push(r);
+      groups.set(r.route_name, arr);
     }
-    return matches;
-  }, [providers]);
-
-  const suggestedRouteGroups = useMemo(() => {
-    return (["github-copilot", "google-gemini-cli"] as SuggestedProviderKind[]).map((kind) => {
-      const provider = suggestedProviders.get(kind) ?? null;
-      const items = suggestedRouteTemplates
-        .filter((template) => template.providerKind === kind)
-        .map((template) => ({
-          ...template,
-          targetModel: buildSuggestedTargetModel(template.exposedModel),
-          added: provider
-            ? routes.some(
-                (route) => route.provider_id === provider.id && route.match_value === template.exposedModel,
-              )
-            : false,
-        }));
-
-      return {
-        kind,
-        label: suggestedProviderLabels[kind],
-        provider,
-        items,
-      };
+    const entries = Array.from(groups.entries());
+    entries.sort((a, b) => {
+      const aMin = Math.min(...a[1].map((x) => x.priority));
+      const bMin = Math.min(...b[1].map((x) => x.priority));
+      return aMin - bMin || a[0].localeCompare(b[0]);
     });
-  }, [routes, suggestedProviders]);
+    return entries;
+  }, [routes]);
 
-  const refresh = async () => {
+  const filteredRouteNames = useMemo(() => {
+    if (!search.trim()) return routeNames;
+    const q = search.trim().toLowerCase();
+    return routeNames.filter(
+      ([name, items]) =>
+        name.toLowerCase().includes(q) ||
+        items.some(
+          (it) =>
+            it.match_value.toLowerCase().includes(q) ||
+            (it.target_model || "").toLowerCase().includes(q) ||
+            (providerMap.get(it.provider_id)?.name ?? "").toLowerCase().includes(q),
+        ),
+    );
+  }, [routeNames, search, providerMap]);
+
+  const selectedRoutes = useMemo(() => {
+    if (!selectedRouteName) return [];
+    return routes
+      .filter((r) => r.route_name === selectedRouteName)
+      .sort((a, b) => a.priority - b.priority);
+  }, [routes, selectedRouteName]);
+
+  // Selected route group info (from first pairing)
+  const selectedGroupInfo = useMemo(() => {
+    if (selectedRoutes.length === 0) return null;
+    const first = selectedRoutes[0];
+    return {
+      match_value: first.match_value,
+      match_type: first.match_type as "exact" | "prefix",
+      supports_tools: first.supports_tools,
+      supports_vision: first.supports_vision,
+      supports_thinking: first.supports_thinking,
+    };
+  }, [selectedRoutes]);
+
+  const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const [routeData, providerData] = await Promise.all([getModelRoutes(), getProviders()]);
       setRoutes(routeData);
       setProviders(providerData);
-      if (providerData.length > 0 && form.provider_id === 0) {
-        setForm((prev) => ({ ...prev, provider_id: providerData[0].id }));
-      }
       setError(null);
-    } catch (e: any) {
-      setError(e.message ?? "Failed to load routes");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Failed to load routes");
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
 
-  const resetForm = () => {
-    setForm({ ...emptyForm, provider_id: providers[0]?.id ?? 0 });
-    setEditingId(null);
-  };
-
-  const handleSubmit = async () => {
-    try {
-      if (!form.route_name.trim() || !form.match_value.trim() || !form.provider_id) return;
-      if (editingId !== null) {
-        await updateModelRoute(editingId, form);
-      } else {
-        await createModelRoute(form);
+  // Auto-fetch models for local providers on load
+  const initialFetchDone = useRef(false);
+  useEffect(() => {
+    if (initialFetchDone.current || providers.length === 0) return;
+    initialFetchDone.current = true;
+    const localTypes = new Set(["lmstudio", "ollama"]);
+    providers.forEach((p) => {
+      if (localTypes.has(p.provider_type)) {
+        fetchModelsRaw(p.id);
       }
-      resetForm();
-      await refresh();
-    } catch (e: any) {
-      setError(e.message ?? "Save failed");
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providers]);
+
+  const fetchModelsRaw = async (providerId: number) => {
+    if (!providerId) return;
+    setScanningModels((prev) => ({ ...prev, [providerId]: true }));
+    try {
+      const models = await getProviderModels(providerId);
+      setProviderModelsCache((prev) => ({ ...prev, [providerId]: models.map((m) => m.id) }));
+    } catch {
+      setProviderModelsCache((prev) => ({ ...prev, [providerId]: [] }));
+    } finally {
+      setScanningModels((prev) => ({ ...prev, [providerId]: false }));
     }
   };
 
-  const handleEdit = (item: ModelRouteItem) => {
-    setEditingId(item.id);
-    setForm({
-      route_name: item.route_name,
-      match_type: item.match_type,
-      match_value: item.match_value,
-      target_model: item.target_model || "",
-      provider_id: item.provider_id,
-      priority: item.priority,
-      enabled: item.enabled,
-    });
+  const fetchModels = async (providerId: number) => {
+    if (!providerId || providerModelsCache[providerId] !== undefined) return;
+    await fetchModelsRaw(providerId);
   };
 
-  const handleDelete = async (id: number) => {
+  // Build payload from existing item
+  const payloadFromItem = (item: ModelRouteItem): ModelRoutePayload => ({
+    route_name: item.route_name,
+    match_type: item.match_type,
+    match_value: item.match_value,
+    target_model: item.target_model || "",
+    provider_id: item.provider_id,
+    priority: item.priority,
+    enabled: item.enabled,
+    supports_tools: item.supports_tools,
+    supports_vision: item.supports_vision,
+    supports_thinking: item.supports_thinking,
+  });
+
+  const handleInlineUpdate = async (item: ModelRouteItem, changes: Partial<ModelRoutePayload>) => {
+    try {
+      await updateModelRoute(item.id, { ...payloadFromItem(item), ...changes });
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Update failed");
+    }
+  };
+
+  // Batch update without intermediate refreshes
+  const batchUpdateRoutes = async (updates: Array<{ id: number; payload: ModelRoutePayload }>) => {
+    try {
+      await Promise.all(updates.map(({ id, payload }) => updateModelRoute(id, payload)));
+      await refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Batch update failed");
+    }
+  };
+
+  const handleDeleteRoute = async (id: number) => {
     try {
       await deleteModelRoute(id);
-      if (pendingDeleteId === id) setPendingDeleteId(null);
+      setPendingDeleteId(null);
+      const remaining = routes.filter((r) => r.route_name === selectedRouteName && r.id !== id);
+      if (remaining.length === 0) setSelectedRouteName(null);
       await refresh();
-    } catch (e: any) {
-      setError(e.message ?? "Delete failed");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Delete failed");
     }
   };
 
-  const handleAddSuggestedRoute = async (template: SuggestedRouteTemplate, providerId: number) => {
-    setAddingSuggestionKey(template.exposedModel);
+  // Create new route group
+  const handleCreateRouteName = async () => {
+    if (!newRouteName?.trim()) return;
+    const name = newRouteName.trim();
+    const matchVal = newRouteMatchValue.trim() || name;
     try {
-      await createModelRoute(buildSuggestedRoutePayload(template, providerId));
+      await createModelRoute({
+        route_name: name,
+        match_type: newRouteMatchType,
+        match_value: matchVal,
+        target_model: "",
+        provider_id: providers[0]?.id ?? 0,
+        priority: 100,
+        enabled: true,
+      });
+      setNewRouteName(null);
+      setNewRouteMatchValue("");
+      setNewRouteMatchType("exact");
       await refresh();
-    } catch (e: any) {
-      setError(e.message ?? "Suggested route creation failed");
-    } finally {
-      setAddingSuggestionKey(null);
+      setSelectedRouteName(name);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Create failed");
     }
   };
 
-  const handleAddSuggestedGroup = async (kind: SuggestedProviderKind) => {
-    const group = suggestedRouteGroups.find((entry) => entry.kind === kind);
-    if (!group?.provider) return;
-
-    const pending = group.items.filter((item) => !item.added);
-    if (pending.length === 0) return;
-
-    setAddingSuggestionGroup(kind);
+  // Create new pairing under selected route
+  const handleCreatePairing = async () => {
+    if (!selectedRouteName || !newPairing) return;
+    const existing = routes.find((r) => r.route_name === selectedRouteName);
+    const matchType = existing?.match_type ?? "exact";
+    const matchValue = existing?.match_value ?? selectedRouteName;
+    const count = routes.filter((r) => r.route_name === selectedRouteName).length;
     try {
-      for (const item of pending) {
-        await createModelRoute(buildSuggestedRoutePayload(item, group.provider.id));
-      }
+      await createModelRoute({
+        route_name: selectedRouteName,
+        match_type: matchType,
+        match_value: matchValue,
+        target_model: newPairing.target_model,
+        provider_id: newPairing.provider_id,
+        priority: 100 + count,
+        enabled: true,
+        supports_tools: selectedGroupInfo?.supports_tools,
+        supports_vision: selectedGroupInfo?.supports_vision,
+        supports_thinking: selectedGroupInfo?.supports_thinking,
+      });
+      setNewPairing(null);
       await refresh();
-    } catch (e: any) {
-      setError(e.message ?? "Suggested route import failed");
-    } finally {
-      setAddingSuggestionGroup(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Create pairing failed");
     }
   };
+
+  // Rename route (updates all pairings)
+  const handleRenameRoute = async (oldName: string, newName: string) => {
+    if (!newName.trim() || newName.trim() === oldName) {
+      setEditingRouteName(null);
+      return;
+    }
+    const toUpdate = routes.filter((r) => r.route_name === oldName);
+    await batchUpdateRoutes(
+      toUpdate.map((item) => ({
+        id: item.id,
+        payload: { ...payloadFromItem(item), route_name: newName.trim() },
+      })),
+    );
+    setEditingRouteName(null);
+    setSelectedRouteName(newName.trim());
+  };
+
+  // Update match value for all pairings in group
+  const handleUpdateMatchValue = async (newVal: string) => {
+    if (!selectedRouteName || !newVal.trim()) {
+      setEditingMatchValue(false);
+      return;
+    }
+    const toUpdate = routes.filter((r) => r.route_name === selectedRouteName);
+    await batchUpdateRoutes(
+      toUpdate.map((item) => ({
+        id: item.id,
+        payload: { ...payloadFromItem(item), match_value: newVal.trim() },
+      })),
+    );
+    setEditingMatchValue(false);
+  };
+
+  // Update match type for all pairings in group
+  const handleUpdateMatchType = async (newType: "exact" | "prefix") => {
+    if (!selectedRouteName) return;
+    const toUpdate = routes.filter((r) => r.route_name === selectedRouteName);
+    await batchUpdateRoutes(
+      toUpdate.map((item) => ({
+        id: item.id,
+        payload: { ...payloadFromItem(item), match_type: newType },
+      })),
+    );
+  };
+
+  // Toggle capability for all pairings in group
+  const handleCapabilityToggle = async (
+    field: "supports_tools" | "supports_vision" | "supports_thinking",
+    value: boolean,
+  ) => {
+    if (!selectedRouteName) return;
+    const toUpdate = routes.filter((r) => r.route_name === selectedRouteName);
+    await batchUpdateRoutes(
+      toUpdate.map((item) => ({
+        id: item.id,
+        payload: { ...payloadFromItem(item), [field]: value },
+      })),
+    );
+  };
+
+  // Drag and drop handlers
+  const handleDragEnd = () => {
+    dragIndexRef.current = null;
+    setDragOverIndex(null);
+  };
+
+  const handleDrop = async (dropIndex: number) => {
+    const srcIndex = dragIndexRef.current;
+    setDragOverIndex(null);
+    dragIndexRef.current = null;
+    if (srcIndex === null || srcIndex === dropIndex) return;
+
+    const items = [...selectedRoutes];
+    const [moved] = items.splice(srcIndex, 1);
+    items.splice(dropIndex, 0, moved);
+
+    // Reassign priorities sequentially
+    await batchUpdateRoutes(
+      items.map((item, i) => ({
+        id: item.id,
+        payload: { ...payloadFromItem(item), priority: 100 + i },
+      })),
+    );
+  };
+
+  const providerOptions = useMemo(() => {
+    const localTypes = new Set(["lmstudio", "ollama"]);
+    return providers.map((p) => ({
+      label: `${localTypes.has(p.provider_type) ? "🖥 " : ""}${p.name} (${p.provider_type})`,
+      value: String(p.id),
+    }));
+  }, [providers]);
+
+  const modelOptions = useCallback(
+    (providerId: number) => {
+      const models = providerModelsCache[providerId] ?? [];
+      return [
+        { label: "(auto — use provider default)", value: "" },
+        ...models.map((m) => ({ label: m, value: m })),
+      ];
+    },
+    [providerModelsCache],
+  );
 
   return (
     <div className="flex min-h-screen">
       <Sidebar />
-      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
-        <div className="mb-8">
+      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200 overflow-x-hidden">
+        <div className="mb-6">
           <h1 className="text-2xl font-bold tracking-tight">Model Routes</h1>
-          <p className="text-sm text-muted-foreground mt-1">設定模型名稱匹配規則，將請求路由到不同 provider</p>
+          <p className="text-sm text-muted-foreground mt-1">
+            設定模型名稱匹配規則，將請求路由到不同 provider。同一路由名稱可綁定多個供應商，依優先順序自動切換。
+          </p>
         </div>
 
-        {error && <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
+        {error && (
+          <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+            <button className="ml-2 underline text-xs" onClick={() => setError(null)}>
+              dismiss
+            </button>
+          </div>
+        )}
 
-        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">
-          <CardHeader>
-            <CardTitle className="text-base">Suggested Provider Routes</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <p className="text-xs text-muted-foreground">
-              One-click exact routes for the requested GitHub Copilot and Gemini CLI models. Each route keeps the exposed prefixed name and forwards the stripped upstream model id to the selected provider.
-            </p>
+        {/* Column Width Adjustment */}
+        <div className="mb-4 rounded-2xl border border-border/40 bg-card/55 p-3 backdrop-blur-sm">
+          <label className="flex items-center gap-3 text-xs text-muted-foreground">
+            <span className="shrink-0">Left Panel Width</span>
+            <input
+              type="range"
+              min="180"
+              max="450"
+              step="10"
+              value={leftColWidth}
+              onChange={(e) => setLeftColWidth(Number(e.target.value))}
+              className="flex-1"
+            />
+            <span className="w-12 text-right font-mono shrink-0">{leftColWidth}px</span>
+          </label>
+        </div>
 
-            <div className="grid gap-4 xl:grid-cols-2">
-              {suggestedRouteGroups.map((group) => {
-                const completed = group.items.filter((item) => item.added).length;
-                const pending = group.items.length - completed;
-
-                return (
-                  <div key={group.kind} className="rounded-md border border-border/40 bg-muted/20 p-4">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-semibold">{group.label}</p>
-                        <p className="text-xs text-muted-foreground mt-1">
-                          {group.provider
-                            ? `Using provider ${group.provider.name}`
-                            : "Add a matching provider in Providers before importing these routes."}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Badge className="bg-white/10">{completed}/{group.items.length}</Badge>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={!group.provider || pending === 0 || addingSuggestionGroup === group.kind}
-                          onClick={() => handleAddSuggestedGroup(group.kind)}
-                        >
-                          {addingSuggestionGroup === group.kind ? "Adding..." : pending === 0 ? "Imported" : `Add ${pending}`}
-                        </Button>
-                      </div>
-                    </div>
-
-                    <div className="mt-4 max-h-[320px] space-y-2 overflow-y-auto pr-1">
-                      {group.items.map((item) => (
-                        <div key={item.exposedModel} className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border/40 bg-background/60 p-3">
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate text-sm font-semibold font-mono">{item.exposedModel}</p>
-                            <p className="mt-1 text-[11px] font-mono text-muted-foreground">
-                              upstream {"->"} {item.targetModel}
-                            </p>
-                          </div>
-                          {item.added ? (
-                            <Badge className="bg-emerald-500/15 text-emerald-300 border-emerald-400/30">Added</Badge>
-                          ) : !group.provider ? (
-                            <Badge className="bg-amber-500/15 text-amber-300 border-amber-400/30">Provider missing</Badge>
-                          ) : (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={addingSuggestionKey === item.exposedModel || addingSuggestionGroup === group.kind}
-                              onClick={() => handleAddSuggestedRoute(item, group.provider!.id)}
-                            >
-                              {addingSuggestionKey === item.exposedModel ? "Adding..." : "Add"}
-                            </Button>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">
-          <CardHeader>
-            <CardTitle className="text-base">{editingId !== null ? "Edit Route" : "Create Route"}</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label className="text-xs">Route Name</Label>
-                <Input value={form.route_name} onChange={(e) => setForm({ ...form, route_name: e.target.value })} className="text-xs" placeholder="qwen-route" />
-              </div>
-              <div className="space-y-2">
-                <Label className="text-xs">Provider</Label>
-                <select
-                  value={form.provider_id}
-                  onChange={(e) => setForm({ ...form, provider_id: Number(e.target.value) })}
-                  className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs"
-                >
-                  {providers.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name} ({p.provider_type})</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label className="text-xs">Match Type</Label>
-                <select
-                  value={form.match_type}
-                  onChange={(e) => setForm({ ...form, match_type: e.target.value as "exact" | "prefix" })}
-                  className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-xs"
-                >
-                  <option value="exact">exact</option>
-                  <option value="prefix">prefix</option>
-                </select>
-              </div>
-              <div className="space-y-2">
-                <Label className="text-xs">Priority</Label>
-                <Input type="number" value={form.priority} onChange={(e) => setForm({ ...form, priority: Number(e.target.value) || 100 })} className="text-xs" />
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-xs">Match Value</Label>
-              <Input value={form.match_value} onChange={(e) => setForm({ ...form, match_value: e.target.value })} className="text-xs" placeholder="qwen" />
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-xs">Target Model (optional)</Label>
-              <Input value={form.target_model} onChange={(e) => setForm({ ...form, target_model: e.target.value })} className="text-xs" placeholder="Qwen3.5-9B-Instruct" />
-            </div>
-
-            <div className="flex items-center gap-2">
-              <Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} />
-              <span className="text-xs text-muted-foreground">Enabled</span>
-            </div>
-
-            <div className="flex gap-2">
-              <Button onClick={handleSubmit} size="sm">{editingId !== null ? "Update" : "Create"}</Button>
-              {editingId !== null && <Button variant="outline" size="sm" onClick={resetForm}>Cancel</Button>}
-            </div>
-          </CardContent>
-        </Card>
-
+        {/* Routing Edit — master-detail two-panel */}
         <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
           <CardHeader>
-            <CardTitle className="text-base">Route List {loading ? "(Loading...)" : ""}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="mb-3 flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <CardTitle className="text-base">
+                Routing Edit
+                {loading && (
+                  <span className="text-xs font-normal text-muted-foreground ml-2">Loading…</span>
+                )}
+              </CardTitle>
               <Input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search by route, match, target, provider"
-                className="h-8 w-72 text-xs"
+                placeholder="Search routes…"
+                className="h-8 w-52 text-xs"
               />
-              <select
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value as "priority" | "name" | "provider")}
-                className="flex h-8 rounded-md border border-input bg-background px-2 py-1 text-xs"
-              >
-                <option value="priority">Sort: Priority</option>
-                <option value="name">Sort: Route Name</option>
-                <option value="provider">Sort: Provider</option>
-              </select>
-              <span className="text-xs text-muted-foreground">{filteredRoutes.length} result(s)</span>
+            </div>
+          </CardHeader>
+          <CardContent className="p-0">
+            {/* Column headers */}
+            <div
+              className="grid divide-x divide-border/40 border-b border-border/40 bg-muted/30"
+              style={{ gridTemplateColumns: `${leftColWidth}px 1fr` }}
+            >
+              <div className="px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Route Name
+              </div>
+              <div className="px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Model Pairing{" "}
+                <span className="font-normal">(provider → model, drag to reorder)</span>
+              </div>
             </div>
 
-            {filteredRoutes.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No model routes configured.</p>
-            ) : (
-              <div className="space-y-3">
-                {filteredRoutes.map((item) => (
-                  <div key={item.id} className="rounded-md border border-border/40 bg-muted/20 p-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <p className="text-sm font-semibold">{item.route_name}</p>
-                        <p className="text-xs text-muted-foreground font-mono">
-                          {item.match_type}({item.match_value}) {"->"} {item.target_model || "(same model)"} · provider={providerMap.get(item.provider_id)?.name || `#${item.provider_id}`} · p={item.priority}
-                        </p>
-                      </div>
-                      <div className="flex gap-2">
-                        <Button variant="outline" size="sm" onClick={() => handleEdit(item)}>Edit</Button>
-                        {pendingDeleteId === item.id ? (
-                          <>
-                            <Button variant="destructive" size="sm" onClick={() => handleDelete(item.id)}>Confirm Delete</Button>
-                            <Button variant="outline" size="sm" onClick={() => setPendingDeleteId(null)}>Cancel</Button>
-                          </>
-                        ) : (
-                          <Button variant="destructive" size="sm" onClick={() => setPendingDeleteId(item.id)}>Delete</Button>
+            {/* Two-panel body */}
+            <div
+              className="grid divide-x divide-border/40 min-h-[300px]"
+              style={{ gridTemplateColumns: `${leftColWidth}px 1fr` }}
+            >
+              {/* ==================== Left panel ==================== */}
+              <div className="flex flex-col">
+                <div className="flex-1 overflow-y-auto max-h-[520px]">
+                  {filteredRouteNames.length === 0 && newRouteName === null && (
+                    <div className="py-8 text-center text-xs text-muted-foreground">
+                      No routes yet.
+                    </div>
+                  )}
+                  {filteredRouteNames.map(([name, items]) => {
+                    const isSelected = name === selectedRouteName;
+                    const pairingCount = items.length;
+                    const matchVal = items[0]?.match_value ?? name;
+                    const isEditing = editingRouteName === name;
+
+                    if (isEditing) {
+                      return (
+                        <div key={name} className="px-3 py-2 border-b border-border/20 bg-muted/40">
+                          <input
+                            autoFocus
+                            value={editRouteNameValue}
+                            onChange={(e) => setEditRouteNameValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") handleRenameRoute(name, editRouteNameValue);
+                              if (e.key === "Escape") setEditingRouteName(null);
+                            }}
+                            onBlur={() => handleRenameRoute(name, editRouteNameValue)}
+                            className="h-7 w-full rounded border border-input bg-background px-2 text-xs outline-none focus:border-ring"
+                          />
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <button
+                        key={name}
+                        type="button"
+                        onClick={() => {
+                          setSelectedRouteName(isSelected ? null : name);
+                          setNewPairing(null);
+                          setPendingDeleteId(null);
+                          setEditingMatchValue(false);
+                        }}
+                        onDoubleClick={() => {
+                          setEditingRouteName(name);
+                          setEditRouteNameValue(name);
+                        }}
+                        className={`group w-full text-left px-4 py-3 border-b border-border/20 transition-colors ${
+                          isSelected
+                            ? "bg-muted/60 border-l-2 border-l-ring"
+                            : "hover:bg-muted/30 border-l-2 border-l-transparent"
+                        }`}
+                      >
+                        <p className="text-sm font-medium truncate">{name}</p>
+                        {matchVal !== name && (
+                          <p className="text-[10px] text-muted-foreground/70 font-mono truncate mt-0.5">
+                            match: {matchVal}
+                          </p>
                         )}
+                        <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                          <span className="text-[10px] text-muted-foreground">
+                            {pairingCount} pairing{pairingCount !== 1 ? "s" : ""}
+                          </span>
+                          {items[0]?.supports_tools && (
+                            <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 bg-orange-500/10 text-orange-300 border-orange-400/30">
+                              tools
+                            </Badge>
+                          )}
+                          {items[0]?.supports_vision && (
+                            <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 bg-cyan-500/10 text-cyan-300 border-cyan-400/30">
+                              vision
+                            </Badge>
+                          )}
+                          {items[0]?.supports_thinking && (
+                            <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 bg-violet-500/10 text-violet-300 border-violet-400/30">
+                              think
+                            </Badge>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+
+                  {/* New route form */}
+                  {newRouteName !== null && (
+                    <div className="px-3 py-2 border-b border-border/20 space-y-1.5">
+                      <input
+                        autoFocus
+                        value={newRouteName}
+                        onChange={(e) => setNewRouteName(e.target.value)}
+                        placeholder="Route display name…"
+                        className="h-7 w-full rounded border border-input bg-background px-2 text-xs outline-none focus:border-ring"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handleCreateRouteName();
+                          if (e.key === "Escape") {
+                            setNewRouteName(null);
+                            setNewRouteMatchValue("");
+                          }
+                        }}
+                      />
+                      <input
+                        value={newRouteMatchValue}
+                        onChange={(e) => setNewRouteMatchValue(e.target.value)}
+                        placeholder="Match pattern (defaults to name)"
+                        className="h-7 w-full rounded border border-input bg-background px-2 text-xs font-mono outline-none focus:border-ring"
+                      />
+                      <div className="flex items-center gap-1">
+                        <select
+                          value={newRouteMatchType}
+                          onChange={(e) => setNewRouteMatchType(e.target.value as "exact" | "prefix")}
+                          className="h-6 rounded border border-input bg-background px-1 text-[10px]"
+                        >
+                          <option value="exact">exact</option>
+                          <option value="prefix">prefix</option>
+                        </select>
+                        <Button size="sm" className="h-6 text-[10px] px-2" onClick={handleCreateRouteName}>
+                          Create
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 text-[10px] px-2"
+                          onClick={() => {
+                            setNewRouteName(null);
+                            setNewRouteMatchValue("");
+                          }}
+                        >
+                          Cancel
+                        </Button>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setNewRouteName("")}
+                  className="px-4 py-3 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors text-left border-t border-border/40"
+                >
+                  + Add new route
+                </button>
               </div>
-            )}
+
+              {/* ==================== Right panel ==================== */}
+              <div className="flex flex-col">
+                {selectedRouteName === null ? (
+                  <div className="flex items-center justify-center h-full text-sm text-muted-foreground py-16">
+                    ← Select a route name to see its pairings
+                    <br />
+                    <span className="text-[11px] block mt-1">Double-click a route name to rename it</span>
+                  </div>
+                ) : (
+                  <>
+                    {/* Route group header */}
+                    <div className="px-4 py-3 border-b border-border/30 bg-muted/20 space-y-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-semibold">{selectedRouteName}</span>
+                        {selectedGroupInfo && (
+                          <>
+                            {!editingMatchValue ? (
+                              <>
+                                <Badge variant="outline" className="text-[10px] font-mono">
+                                  {selectedGroupInfo.match_type}: {selectedGroupInfo.match_value}
+                                </Badge>
+                                <button
+                                  className="text-[10px] text-muted-foreground hover:text-foreground underline"
+                                  onClick={() => {
+                                    setEditingMatchValue(true);
+                                    setEditMatchValueText(selectedGroupInfo.match_value);
+                                  }}
+                                >
+                                  edit pattern
+                                </button>
+                              </>
+                            ) : (
+                              <div className="flex items-center gap-1">
+                                <select
+                                  value={selectedGroupInfo.match_type}
+                                  onChange={(e) => handleUpdateMatchType(e.target.value as "exact" | "prefix")}
+                                  className="h-6 rounded border border-input bg-background px-1 text-[10px]"
+                                >
+                                  <option value="exact">exact</option>
+                                  <option value="prefix">prefix</option>
+                                </select>
+                                <input
+                                  autoFocus
+                                  value={editMatchValueText}
+                                  onChange={(e) => setEditMatchValueText(e.target.value)}
+                                  className="h-6 w-40 rounded border border-input bg-background px-1.5 text-[10px] font-mono outline-none focus:border-ring"
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") handleUpdateMatchValue(editMatchValueText);
+                                    if (e.key === "Escape") setEditingMatchValue(false);
+                                  }}
+                                />
+                                <Button
+                                  size="sm"
+                                  className="h-5 text-[9px] px-1.5"
+                                  onClick={() => handleUpdateMatchValue(editMatchValueText)}
+                                >
+                                  OK
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-5 text-[9px] px-1.5"
+                                  onClick={() => setEditingMatchValue(false)}
+                                >
+                                  ✕
+                                </Button>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+
+                      {/* Capability toggles */}
+                      <div className="flex items-center gap-4 flex-wrap">
+                        <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={selectedGroupInfo?.supports_tools ?? false}
+                            onChange={(e) => handleCapabilityToggle("supports_tools", e.target.checked)}
+                            className="rounded"
+                          />
+                          <span>🔧 Tool Calling</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={selectedGroupInfo?.supports_vision ?? false}
+                            onChange={(e) => handleCapabilityToggle("supports_vision", e.target.checked)}
+                            className="rounded"
+                          />
+                          <span>👁 Vision</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={selectedGroupInfo?.supports_thinking ?? false}
+                            onChange={(e) => handleCapabilityToggle("supports_thinking", e.target.checked)}
+                            className="rounded"
+                          />
+                          <span>🧠 Thinking</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Pairings list */}
+                    <div className="flex-1 overflow-y-auto max-h-[420px]">
+                      {selectedRoutes.length === 0 && !newPairing && (
+                        <div className="py-8 text-center text-xs text-muted-foreground">
+                          No pairings for &quot;{selectedRouteName}&quot;.
+                        </div>
+                      )}
+                      {selectedRoutes.map((item, idx) => (
+                        <div
+                          key={item.id}
+                          draggable
+                          onDragStart={(e) => {
+                            dragIndexRef.current = idx;
+                            e.dataTransfer.effectAllowed = "move";
+                            e.dataTransfer.setData("text/plain", String(idx));
+                          }}
+                          onDragOver={(e) => {
+                            e.preventDefault();
+                            e.dataTransfer.dropEffect = "move";
+                            setDragOverIndex(idx);
+                          }}
+                          onDragLeave={() => setDragOverIndex(null)}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            handleDrop(idx);
+                          }}
+                          onDragEnd={handleDragEnd}
+                          className={`border-b border-border/20 px-4 py-3 transition-colors ${
+                            dragOverIndex === idx
+                              ? "bg-sky-500/10 border-t-2 border-t-sky-400/60"
+                              : ""
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="text-muted-foreground/40 text-base select-none cursor-grab shrink-0 active:cursor-grabbing"
+                              title="Drag to reorder"
+                            >
+                              ⠿
+                            </span>
+                            <Badge
+                              variant="outline"
+                              className="text-[9px] shrink-0 font-mono tabular-nums w-7 justify-center"
+                            >
+                              {idx + 1}
+                            </Badge>
+
+                            {/* Provider dropdown */}
+                            <SearchableDropdown
+                              value={String(item.provider_id)}
+                              options={providerOptions}
+                              onChange={async (v) => {
+                                const pid = Number(v);
+                                await fetchModels(pid);
+                                await handleInlineUpdate(item, {
+                                  provider_id: pid,
+                                  target_model: "",
+                                });
+                              }}
+                              placeholder="Select provider…"
+                            />
+
+                            {/* Model dropdown */}
+                            <SearchableDropdown
+                              value={item.target_model || ""}
+                              options={modelOptions(item.provider_id)}
+                              onChange={async (v) => {
+                                await handleInlineUpdate(item, { target_model: v });
+                              }}
+                              placeholder="(auto)"
+                              loading={scanningModels[item.provider_id]}
+                            />
+
+                            {pendingDeleteId === item.id ? (
+                              <div className="flex gap-1 shrink-0">
+                                <Button
+                                  variant="destructive"
+                                  size="sm"
+                                  className="h-6 text-[10px] px-2"
+                                  onClick={() => handleDeleteRoute(item.id)}
+                                >
+                                  Delete
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-6 text-[10px] px-2"
+                                  onClick={() => setPendingDeleteId(null)}
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => setPendingDeleteId(item.id)}
+                                className="shrink-0 text-muted-foreground/40 hover:text-destructive transition-colors text-sm px-1"
+                                title="Delete pairing"
+                              >
+                                ✕
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+
+                      {/* New pairing form */}
+                      {newPairing && selectedRouteName && (
+                        <div className="border-b border-border/20 px-4 py-3 bg-muted/10">
+                          <div className="flex items-center gap-2">
+                            <span className="text-muted-foreground/20 text-base select-none shrink-0">
+                              ⠿
+                            </span>
+                            <Badge
+                              variant="outline"
+                              className="text-[9px] shrink-0 font-mono tabular-nums w-7 justify-center opacity-40"
+                            >
+                              {selectedRoutes.length + 1}
+                            </Badge>
+                            <SearchableDropdown
+                              value={String(newPairing.provider_id)}
+                              options={providerOptions}
+                              onChange={(v) => {
+                                const pid = Number(v);
+                                fetchModels(pid);
+                                setNewPairing({
+                                  ...newPairing,
+                                  provider_id: pid,
+                                  target_model: "",
+                                });
+                              }}
+                              placeholder="Select provider…"
+                            />
+                            <SearchableDropdown
+                              value={newPairing.target_model}
+                              options={modelOptions(newPairing.provider_id)}
+                              onChange={(v) =>
+                                setNewPairing({ ...newPairing, target_model: v })
+                              }
+                              placeholder="(auto)"
+                              loading={scanningModels[newPairing.provider_id]}
+                            />
+                            <Button
+                              size="sm"
+                              className="h-7 shrink-0 text-xs px-2"
+                              onClick={handleCreatePairing}
+                            >
+                              Save
+                            </Button>
+                            <button
+                              type="button"
+                              onClick={() => setNewPairing(null)}
+                              className="shrink-0 text-muted-foreground/40 hover:text-foreground text-sm px-1"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Footer */}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setNewPairing({
+                          provider_id: providers[0]?.id ?? 0,
+                          target_model: "",
+                        })
+                      }
+                      className="px-4 py-3 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors text-left border-t border-border/40"
+                    >
+                      + Add pairing
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
           </CardContent>
         </Card>
       </main>

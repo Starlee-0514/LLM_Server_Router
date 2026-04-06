@@ -147,6 +147,32 @@ export default function MeshPage() {
           <p className="text-sm text-muted-foreground mt-1">檢視 Tailscale worker 節點，並手動送 heartbeat 測試同步</p>
         </div>
 
+        {/* Usage Guide */}
+        <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm border-l-4 border-l-sky-400/60">
+          <CardContent className="py-4">
+            <details>
+              <summary className="text-sm font-semibold cursor-pointer select-none text-sky-300/90">📖 使用說明（點擊展開）</summary>
+              <div className="mt-3 space-y-2 text-sm text-muted-foreground leading-relaxed">
+                <p><strong className="text-foreground/80">用途：</strong>Mesh 頁面讓你把多台電腦上的 LLM Server Router 串接起來。當你在不同電腦（如家裡桌機 + 公司筆電）都安裝了此軟體，透過 Tailscale 或同一個區域網路，它們可以互相發現並共享可用模型，無需在每台電腦重複設定供應商登入等資訊。</p>
+                <p><strong className="text-foreground/80">運作原理：</strong></p>
+                <ul className="list-disc list-inside space-y-1 ml-2">
+                  <li>每個節點定時向其他節點發送 <strong>Heartbeat</strong>（心跳信號），回報自己的名稱、位址、可用模型等資訊</li>
+                  <li>路由器收到請求時，如果本地沒有對應模型，會自動查找其他 Mesh 節點是否有可用模型並轉發請求</li>
+                  <li>你可以將節點綁定到一個已註冊的 Provider，這樣 Mesh 節點的模型就會自動出現在路由系統中</li>
+                </ul>
+                <p><strong className="text-foreground/80">如何使用：</strong></p>
+                <ul className="list-disc list-inside space-y-1 ml-2">
+                  <li>在下方「Send Worker Heartbeat」表單中填入另一台電腦的節點名稱與 Base URL（如 <code className="bg-muted px-1 rounded text-xs">http://my-desktop.tailnet.ts.net:8000</code>）</li>
+                  <li>填入該節點上可用的模型名稱（每行一個）</li>
+                  <li>點擊「Send Heartbeat」註冊節點</li>
+                  <li>節點狀態會顯示在下方的 Worker List 中</li>
+                </ul>
+                <p className="text-xs text-muted-foreground/60 italic">未來版本將支援自動偵測區域網路 / Tailscale 上的其他節點。</p>
+              </div>
+            </details>
+          </CardContent>
+        </Card>
+
         {error && <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
 
         <Card className="mb-6 border-border/40 bg-card/60 backdrop-blur-sm">

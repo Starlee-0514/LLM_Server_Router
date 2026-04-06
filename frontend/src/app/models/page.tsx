@@ -136,15 +136,15 @@ export default function ModelsPage() {
 
   const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : "Unknown error";
   const compiledExtraArgs = buildExtraArgs(launchOptions);
-  const selectedRecipe = getPresetRecipe(selectedRecipeKey);
   const allRecipes = [...PRESET_RECIPES, ...customRecipes];
+  const selectedRecipe = getPresetRecipe(selectedRecipeKey, allRecipes);
   const selectedWorkbenchGroup = groups.find((group) => group.id === selectedWorkbenchId) ?? null;
   const workbenchExtraArgs = buildExtraArgs(workbenchOptions);
-  const workbenchRecipe = getPresetRecipe(workbenchRecipeKey);
+  const workbenchRecipe = getPresetRecipe(workbenchRecipeKey, allRecipes);
   const modelsLayoutStyle = {
     "--models-groups-col": `minmax(0, ${groupColumnWidth}fr)`,
     "--models-files-col": `minmax(0, ${fileColumnWidth}fr)`,
-    "--models-recipes-col": `minmax(280px, ${recipeColumnWidth}fr)`,
+    "--models-recipes-col": `minmax(0, ${recipeColumnWidth}fr)`,
   } as CSSProperties;
   const launchPreview = buildLaunchPreview({
     runtimeName: newEngine,
@@ -166,7 +166,7 @@ export default function ModelsPage() {
   });
 
   const applyRecipe = (recipeKey: string, baseOptions?: LaunchOptionDraft) => {
-    const { recipe, options } = applyPresetRecipe(recipeKey, baseOptions ?? launchOptions);
+    const { recipe, options } = applyPresetRecipe(recipeKey, baseOptions ?? launchOptions, allRecipes);
     setSelectedRecipeKey(recipe.key);
     setNewNgl(recipe.ngl);
     setNewBatch(recipe.batch);
@@ -176,7 +176,7 @@ export default function ModelsPage() {
   };
 
   const applyWorkbenchRecipe = (recipeKey: string, baseOptions?: LaunchOptionDraft) => {
-    const { recipe, options } = applyPresetRecipe(recipeKey, baseOptions ?? workbenchOptions);
+    const { recipe, options } = applyPresetRecipe(recipeKey, baseOptions ?? workbenchOptions, allRecipes);
     setWorkbenchRecipeKey(recipe.key);
     setWorkbenchNgl(recipe.ngl);
     setWorkbenchBatch(recipe.batch);
@@ -297,7 +297,7 @@ export default function ModelsPage() {
       seededOptions.mmprojPath = model.related_mmproj_path;
     }
 
-    const { recipe, options } = applyPresetRecipe(recipeKey, seededOptions);
+    const { recipe, options } = applyPresetRecipe(recipeKey, seededOptions, allRecipes);
 
     setNewModelFamily(inferPresetFamily(model));
     setSelectedRecipeKey(recipe.key);
@@ -316,7 +316,7 @@ export default function ModelsPage() {
       arch: group.description,
       model_type: group.extra_args.includes("--mmproj") ? "multimodal_base" : "text",
     });
-    const hydrated = applyPresetRecipe(inferredRecipe, parsedOptions);
+    const hydrated = applyPresetRecipe(inferredRecipe, parsedOptions, allRecipes);
 
     setSelectedWorkbenchId(group.id);
     setWorkbenchFamily((group.model_family || hydrated.recipe.family) as PresetFamily);
@@ -489,7 +489,7 @@ export default function ModelsPage() {
       const parsedOptions = parseExtraArgs(group.extra_args || "");
       const nextFamily = (patch.model_family ?? group.model_family ?? inferPresetFamily(group)) as PresetFamily;
       const nextRecipe = patch.preset_recipe ?? group.preset_recipe ?? inferPresetRecipeKey({ ...group, model_family: nextFamily });
-      const { recipe, options } = applyPresetRecipe(nextRecipe, parsedOptions);
+      const { recipe, options } = applyPresetRecipe(nextRecipe, parsedOptions, allRecipes);
 
       await updateModelGroup(group.id, {
         group_name: group.group_name,
@@ -602,7 +602,7 @@ export default function ModelsPage() {
   return (
     <div className="flex min-h-screen bg-[radial-gradient(circle_at_top_right,rgba(56,189,248,0.14),transparent_42%),radial-gradient(circle_at_20%_20%,rgba(14,165,233,0.12),transparent_38%)]">
       <Sidebar />
-      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200">
+      <main className="ml-[var(--sidebar-width,14rem)] flex-1 p-8 transition-[margin] duration-200 overflow-x-hidden">
         <div className="mb-6 flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Model Studio</h1>
@@ -990,7 +990,7 @@ export default function ModelsPage() {
                                     arch: g.description,
                                     model_type: g.extra_args.includes("--mmproj") ? "multimodal_base" : "text",
                                   });
-                                  const hydrated = applyPresetRecipe(inferredRecipe, parsedOptions);
+                                  const hydrated = applyPresetRecipe(inferredRecipe, parsedOptions, allRecipes);
                                   setEditingGroupId(g.id); setNewGroupName(g.group_name); setNewName(g.name);
                                   setNewDesc(g.description); setNewPath(g.model_path); setNewEngine(g.engine_type);
                                   setNewModelFamily((g.model_family || hydrated.recipe.family) as PresetFamily);
@@ -1083,8 +1083,9 @@ export default function ModelsPage() {
                   <Card key={m.filepath} className="border-border/50 bg-card/70 backdrop-blur-sm">
                     <CardHeader className="pb-2 pt-3">
                       <CardTitle className="text-sm flex items-center justify-between gap-2">
-                        <span className="truncate">{m.arch || m.filename}</span>
+                        <span className="truncate">{overrides.find((o) => o.filepath === m.filepath)?.display_name || m.filename.replace(/\.gguf$/i, "")}</span>
                         <div className="flex items-center gap-2 shrink-0">
+                          {m.arch && <Badge variant="secondary" className="text-[9px] uppercase tracking-[0.18em] bg-slate-700/50">{m.arch}</Badge>}
                           <Badge variant="secondary" className="text-[9px] uppercase tracking-[0.18em]">{inferModelClassification(m)}</Badge>
                           {inferModality(m) === "vision" && <Badge className="bg-cyan-500/20 text-cyan-300 border-cyan-400/30 text-[9px]">Vision</Badge>}
                           {inferThinkingCapable(m) && <Badge className="bg-violet-500/20 text-violet-300 border-violet-400/30 text-[9px]">Thinking</Badge>}
@@ -1099,7 +1100,7 @@ export default function ModelsPage() {
                         <Badge variant="secondary">Param: {m.param_size || "unknown"}</Badge>
                         <Badge variant="secondary">File: {m.size_human}</Badge>
                         <Badge variant="secondary">Publisher: {m.publisher || "unknown"}</Badge>
-                        <Badge variant="outline">Suggested: {getPresetRecipe(inferPresetRecipeKey(m)).label}</Badge>
+                        <Badge variant="outline">Suggested: {getPresetRecipe(inferPresetRecipeKey(m), allRecipes).label}</Badge>
                       </div>
                       {m.model_type === "multimodal_base" && m.related_mmproj_path && (
                         <p className="mt-2 text-[10px] text-cyan-300/90 font-mono truncate">mmproj linked: {shortName(m.related_mmproj_path)}</p>

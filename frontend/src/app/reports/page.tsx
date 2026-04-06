@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import Sidebar, { sidebarNavItems } from "@/components/sidebar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -616,18 +618,8 @@ ${additionalContext ? `\n## Additional Notes\n\n${additionalContext}` : ""}`
                       </Button>
                     </CardHeader>
                     <CardContent>
-                      <div className="bg-black/30 rounded-md p-5 max-h-[75vh] overflow-y-auto">
-                        {viewContent.split("\n").map((line, i) => {
-                          const imgMatch = line.match(/!\[([^\]]*)\]\(([^)]+)\)/);
-                          if (imgMatch) {
-                            return (
-                              <div key={i} className="my-2">
-                                <img src={imgMatch[2]} alt={imgMatch[1] || "screenshot"} className="max-w-full max-h-[400px] rounded border border-border/40 object-contain" />
-                              </div>
-                            );
-                          }
-                          return <pre key={i} className="text-xs font-mono text-muted-foreground whitespace-pre-wrap leading-relaxed">{line}</pre>;
-                        })}
+                      <div className="bg-black/30 rounded-md p-5 max-h-[75vh] overflow-y-auto text-sm [&_h1]:text-base [&_h1]:font-bold [&_h1]:mb-2 [&_h2]:text-sm [&_h2]:font-semibold [&_h2]:mt-4 [&_h2]:mb-1 [&_h3]:text-sm [&_h3]:font-medium [&_h3]:mt-3 [&_h3]:mb-1 [&_p]:mb-2 [&_p]:text-xs [&_p]:text-muted-foreground [&_hr]:border-border/30 [&_hr]:my-3 [&_strong]:font-semibold [&_strong]:text-foreground [&_code]:rounded [&_code]:bg-muted/50 [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_code]:font-mono [&_pre]:rounded-lg [&_pre]:bg-muted/30 [&_pre]:p-3 [&_pre]:text-xs [&_pre]:overflow-x-auto [&_pre]:mb-2 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:mb-2 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:mb-2 [&_li]:mb-0.5 [&_li]:text-xs [&_li]:text-muted-foreground [&_img]:max-w-full [&_img]:max-h-96 [&_img]:rounded [&_img]:border [&_img]:border-border/40 [&_img]:object-contain [&_img]:my-2 [&_a]:text-blue-400 [&_a]:underline">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{viewContent}</ReactMarkdown>
                       </div>
                     </CardContent>
                   </Card>
