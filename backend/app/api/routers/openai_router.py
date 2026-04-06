@@ -233,7 +233,53 @@ def _convert_anthropic_to_openai(resp: dict, model_name: str) -> dict:
 _GEMINI_CLI_HEADERS = {
     "User-Agent": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     "X-Goog-Api-Client": "gl-node/22.17.0",
+    "Client-Metadata": json.dumps({
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+    }),
 }
+
+
+def _extract_gemini_retry_delay(error_text: str, headers: httpx.Headers | None = None) -> float | None:
+    """Extract retry delay (seconds) from Gemini error response.
+
+    Checks Retry-After / x-ratelimit-reset-after headers first, then parses
+    body patterns like "Your quota will reset after 14s" or
+    "retryDelay": "34.07s".  Returns *None* when no hint is found.
+    """
+    import re
+
+    if headers:
+        for hdr in ("retry-after", "x-ratelimit-reset-after"):
+            val = headers.get(hdr)
+            if val:
+                try:
+                    return float(val) + 1.0
+                except ValueError:
+                    pass
+
+    # "Your quota will reset after 18h31m10s" / "reset after 6s"
+    m = re.search(r"reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s", error_text, re.I)
+    if m:
+        h = int(m.group(1) or 0)
+        mi = int(m.group(2) or 0)
+        s = float(m.group(3))
+        return (h * 3600 + mi * 60 + s) + 1.0
+
+    # "Please retry in Xs" / "Please retry in Xms"
+    m = re.search(r"retry in ([0-9.]+)(ms|s)", error_text, re.I)
+    if m:
+        v = float(m.group(1))
+        return (v / 1000.0 if m.group(2).lower() == "ms" else v) + 1.0
+
+    # "retryDelay": "34.07s"
+    m = re.search(r'"retryDelay":\s*"([0-9.]+)(ms|s)"', error_text, re.I)
+    if m:
+        v = float(m.group(1))
+        return (v / 1000.0 if m.group(2).lower() == "ms" else v) + 1.0
+
+    return None
 
 
 def _is_gemini_cloudcode_provider(provider: ProviderEndpoint) -> bool:
@@ -262,6 +308,69 @@ def _is_lmstudio_provider(provider: ProviderEndpoint) -> bool:
     if name in {"lm_studio", "lm studio", "lmstudio", "lm-studio"} or name.startswith("lm studio"):
         return True
     return False
+
+
+def _parse_gemini_sse_response(raw_text: str) -> dict:
+    """Parse an SSE stream from streamGenerateContent into a single aggregated
+    Gemini response dict (same shape as generateContent).
+
+    Each SSE event looks like:
+        data: {"response":{"candidates":[...],"usageMetadata":{...}}}
+    We concatenate text parts from all chunks and keep the last usageMetadata.
+    """
+    import re as _re
+
+    text_parts: list[str] = []
+    usage_metadata: dict = {}
+    finish_reason = ""
+    model_version = ""
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        resp = chunk.get("response", chunk)
+        candidates = resp.get("candidates", [])
+        for cand in candidates:
+            parts = cand.get("content", {}).get("parts", [])
+            for p in parts:
+                if "text" in p:
+                    text_parts.append(p["text"])
+            fr = cand.get("finishReason", "")
+            if fr:
+                finish_reason = fr
+
+        um = resp.get("usageMetadata")
+        if um:
+            usage_metadata = um
+
+        mv = resp.get("modelVersion", "")
+        if mv:
+            model_version = mv
+
+    # Re-assemble into the non-streaming response shape that _convert_gemini_to_openai expects
+    result: dict = {
+        "response": {
+            "candidates": [
+                {
+                    "content": {"role": "model", "parts": [{"text": "".join(text_parts)}]},
+                    "finishReason": finish_reason or "STOP",
+                }
+            ],
+            "usageMetadata": usage_metadata,
+        }
+    }
+    if model_version:
+        result["response"]["modelVersion"] = model_version
+    return result
 
 
 def _convert_openai_messages_to_gemini(messages: list[dict]) -> tuple[str | None, list[dict]]:
@@ -368,7 +477,14 @@ async def _discover_gemini_project(access_token: str) -> str:
 async def _proxy_gemini_cloudcode(
     provider: ProviderEndpoint, db: Session, body: dict
 ) -> JSONResponse:
-    """Proxy an OpenAI-format request through Cloud Code Assist (native Gemini API)."""
+    """Proxy an OpenAI-format request through Cloud Code Assist (native Gemini API).
+
+    When stream=True, we open a true streaming connection to Gemini's SSE
+    endpoint and translate each chunk on-the-fly to OpenAI SSE format so the
+    client sees tokens as they arrive (matching pi-agent behaviour).
+    """
+    import asyncio
+
     t0 = time.time()
     model_name = body.get("model", "")
     messages = body.get("messages", [])
@@ -376,6 +492,7 @@ async def _proxy_gemini_cloudcode(
     # Gemini Cloud Code caps maxOutputTokens at 65536
     max_tokens = min(int(max_tokens), 65536)
     temperature = body.get("temperature")
+    is_streaming = body.get("stream", False)
 
     # Refresh OAuth token
     headers_result = await _build_oauth_provider_headers(provider, db)
@@ -424,89 +541,224 @@ async def _proxy_gemini_cloudcode(
     if project_id:
         gemini_body["project"] = project_id
 
-    target_url = "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+    target_url = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     req_headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
+        "Accept": "text/event-stream",
         **_GEMINI_CLI_HEADERS,
     }
 
-    # Retry with exponential backoff on 429 (quota limit)
-    import asyncio
-    max_retries = 3
-    for attempt in range(max_retries + 1):
-        try:
-            response = await http_client.post(target_url, headers=req_headers, json=gemini_body, timeout=120.0)
-        except httpx.RequestError as e:
-            logger.error("Gemini Cloud Code request error: %s", e)
-            return JSONResponse(status_code=502, content={"error": {"message": f"Failed to reach Gemini Cloud Code: {e}"}})
+    # ------------------------------------------------------------------
+    # Helper: make the upstream request.  For streaming we need the httpx
+    # response kept open (stream=True); for non-streaming a normal post.
+    # ------------------------------------------------------------------
+    _MAX_RETRIES = 5
+    _MAX_RETRY_WAIT = 120  # seconds
 
-        if response.status_code == 429 and attempt < max_retries:
-            wait = 2 ** attempt * 2  # 2s, 4s, 8s
-            logger.warning("Gemini rate limited (429), retrying in %ds (attempt %d/%d)", wait, attempt + 1, max_retries)
-            await asyncio.sleep(wait)
-            continue
-
-        if response.status_code != 200:
-            logger.warning("Gemini Cloud Code error %s: %s", response.status_code, response.text[:500])
+    async def _make_request_with_retry(*, stream: bool):
+        """Return an httpx.Response.  Caller must close if stream=True."""
+        for attempt in range(_MAX_RETRIES + 1):
             try:
-                err = response.json()
-            except Exception:
-                err = {"error": {"message": response.text[:1000]}}
-            return JSONResponse(status_code=response.status_code, content=err)
+                if stream:
+                    req = http_client.build_request(
+                        "POST", target_url, headers=req_headers, json=gemini_body,
+                        timeout=httpx.Timeout(connect=15.0, read=180.0, write=30.0, pool=5.0),
+                    )
+                    resp = await http_client.send(req, stream=True)
+                else:
+                    resp = await http_client.post(
+                        target_url, headers=req_headers, json=gemini_body, timeout=180.0,
+                    )
+            except httpx.RequestError as e:
+                logger.error("Gemini Cloud Code request error: %s", e)
+                if attempt < _MAX_RETRIES:
+                    wait = min(2 ** attempt * 2, _MAX_RETRY_WAIT)
+                    logger.warning("Network error, retrying in %ds (attempt %d/%d)", wait, attempt + 1, _MAX_RETRIES)
+                    await asyncio.sleep(wait)
+                    continue
+                return None, f"Failed to reach Gemini Cloud Code: {e}"
 
-        break
+            # On 429 — read body so we can parse retry delay, then retry
+            if resp.status_code == 429 and attempt < _MAX_RETRIES:
+                if stream:
+                    error_text = (await resp.aread()).decode(errors="replace")
+                    await resp.aclose()
+                else:
+                    error_text = resp.text
+                server_delay = _extract_gemini_retry_delay(error_text, resp.headers)
+                wait = server_delay if server_delay else 2 ** attempt * 2
+                wait = min(wait, _MAX_RETRY_WAIT)
+                logger.warning(
+                    "Gemini rate limited (429), retrying in %.1fs (attempt %d/%d, server_hint=%s)",
+                    wait, attempt + 1, _MAX_RETRIES,
+                    f"{server_delay:.1f}s" if server_delay else "none",
+                )
+                await asyncio.sleep(wait)
+                continue
 
-    gemini_resp = response.json()
+            # Transient server errors
+            if resp.status_code in (500, 502, 503, 504) and attempt < _MAX_RETRIES:
+                if stream:
+                    await resp.aread()
+                    await resp.aclose()
+                wait = min(2 ** attempt * 2, _MAX_RETRY_WAIT)
+                logger.warning("Gemini server error %d, retrying in %ds (attempt %d/%d)", resp.status_code, wait, attempt + 1, _MAX_RETRIES)
+                await asyncio.sleep(wait)
+                continue
+
+            # Non-retryable error
+            if resp.status_code != 200:
+                if stream:
+                    err_body = (await resp.aread()).decode(errors="replace")
+                    await resp.aclose()
+                else:
+                    err_body = resp.text
+                logger.warning("Gemini Cloud Code error %s: %s", resp.status_code, err_body[:500])
+                try:
+                    err = json.loads(err_body)
+                except Exception:
+                    err = {"error": {"message": err_body[:1000]}}
+                return None, err  # caller returns JSONResponse
+
+            return resp, None  # success
+
+        return None, "Gemini Cloud Code: max retries exceeded"
+
+    # ==================================================================
+    # STREAMING PATH — true chunk-by-chunk SSE translation
+    # ==================================================================
+    if is_streaming:
+        response, err = await _make_request_with_retry(stream=True)
+        if response is None:
+            if isinstance(err, dict):
+                return JSONResponse(status_code=502, content=err)
+            return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+
+        # Closure vars for post-stream logging
+        _t0 = t0
+        _body = body
+        _usage: dict = {}
+        _finish_reason = "stop"
+        _chunk_id = f"chatcmpl-gemini-{int(time.time())}"
+        _created = int(time.time())
+
+        async def generate_stream():
+            nonlocal _finish_reason
+            try:
+                # Role header chunk
+                role_chunk = {
+                    "id": _chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": _created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}],
+                }
+                yield f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8")
+
+                buffer = ""
+                async for raw_line in response.aiter_lines():
+                    line = raw_line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+
+                    resp_data = chunk.get("response", chunk)
+                    candidates = resp_data.get("candidates", [])
+                    for cand in candidates:
+                        parts = cand.get("content", {}).get("parts", [])
+                        for p in parts:
+                            text = p.get("text")
+                            if text:
+                                delta_chunk = {
+                                    "id": _chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": _created,
+                                    "model": model_name,
+                                    "choices": [{"index": 0, "delta": {"content": text}}],
+                                }
+                                yield f"data: {json.dumps(delta_chunk)}\n\n".encode("utf-8")
+                        fr = cand.get("finishReason", "")
+                        if fr:
+                            if fr == "MAX_TOKENS":
+                                _finish_reason = "length"
+                            elif fr == "SAFETY":
+                                _finish_reason = "content_filter"
+                            else:
+                                _finish_reason = "stop"
+
+                    um = resp_data.get("usageMetadata")
+                    if um:
+                        _usage["prompt_tokens"] = int(um.get("promptTokenCount", 0))
+                        _usage["completion_tokens"] = int(um.get("candidatesTokenCount", 0))
+                        _usage["total_tokens"] = int(um.get("totalTokenCount", 0))
+
+                # Finish reason chunk
+                stop_chunk = {
+                    "id": _chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": _created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": _finish_reason}],
+                }
+                yield f"data: {json.dumps(stop_chunk)}\n\n".encode("utf-8")
+
+                # Usage chunk
+                if _usage:
+                    usage_chunk = {
+                        "id": _chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": _created,
+                        "model": model_name,
+                        "choices": [],
+                        "usage": _usage,
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
+
+                yield b"data: [DONE]\n\n"
+            finally:
+                await response.aclose()
+                # Record completion log after stream ends
+                elapsed = time.time() - _t0
+                completion_tokens = _usage.get("completion_tokens", 0)
+                try:
+                    from backend.app.database import SessionLocal as _SessionLocal
+                    new_db = _SessionLocal()
+                    try:
+                        openai_resp_for_log = {
+                            "usage": _usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                        }
+                        _log_completion_usage(
+                            _body, openai_resp_for_log, target_url,
+                            db=new_db, elapsed=elapsed,
+                        )
+                    finally:
+                        new_db.close()
+                except Exception as exc:
+                    logger.warning("[AutoBench] Gemini streaming record failed: %s", exc)
+
+        return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+    # ==================================================================
+    # NON-STREAMING PATH — collect full response then return JSON
+    # ==================================================================
+    response, err = await _make_request_with_retry(stream=False)
+    if response is None:
+        if isinstance(err, dict):
+            return JSONResponse(status_code=502, content=err)
+        return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+
+    # Parse SSE stream into a single aggregated response
+    gemini_resp = _parse_gemini_sse_response(response.text)
     openai_resp = _convert_gemini_to_openai(gemini_resp, model_name)
     elapsed = time.time() - t0
     _log_completion_usage(body, openai_resp, target_url, db=db, elapsed=elapsed)
-
-    if body.get("stream", False):
-        async def generate():
-            chunk1 = {
-                "id": openai_resp["id"],
-                "object": "chat.completion.chunk",
-                "created": openai_resp["created"],
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]
-            }
-            yield f"data: {json.dumps(chunk1)}\n\n".encode("utf-8")
-            
-            content = openai_resp["choices"][0]["message"].get("content", "")
-            if content:
-                chunk2 = {
-                    "id": openai_resp["id"],
-                    "object": "chat.completion.chunk",
-                    "created": openai_resp["created"],
-                    "model": model_name,
-                    "choices": [{"index": 0, "delta": {"content": content}}]
-                }
-                yield f"data: {json.dumps(chunk2)}\n\n".encode("utf-8")
-                
-            chunk3 = {
-                "id": openai_resp["id"],
-                "object": "chat.completion.chunk",
-                "created": openai_resp["created"],
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": openai_resp["choices"][0].get("finish_reason", "stop")}]
-            }
-            yield f"data: {json.dumps(chunk3)}\n\n".encode("utf-8")
-            
-            if "usage" in openai_resp:
-                chunk4 = {
-                    "id": openai_resp["id"],
-                    "object": "chat.completion.chunk",
-                    "created": openai_resp["created"],
-                    "model": model_name,
-                    "choices": [],
-                    "usage": openai_resp["usage"]
-                }
-                yield f"data: {json.dumps(chunk4)}\n\n".encode("utf-8")
-                
-            yield b"data: [DONE]\n\n"
-            
-        return StreamingResponse(generate(), media_type="text/event-stream")
 
     return JSONResponse(status_code=200, content=openai_resp)
 
