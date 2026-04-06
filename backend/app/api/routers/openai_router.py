@@ -62,7 +62,12 @@ def _log_completion_usage(body: dict, resp_json: dict, target_url: str, db: Sess
     prompt_preview = ""
     for m in reversed(msgs):
         if m.get("role") == "user":
-            prompt_preview = (m.get("content") or "")[:120]
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                # Multimodal content — extract text parts only
+                text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                content = " ".join(filter(None, text_parts))
+            prompt_preview = str(content)[:120]
             break
     usage = resp_json.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens") or 0
@@ -254,7 +259,7 @@ def _is_lmstudio_provider(provider: ProviderEndpoint) -> bool:
     # Port 1234 is LM Studio's default; accept both localhost and any IP/hostname
     if ":1234" in base:
         return True
-    if name in {"lm_studio", "lm studio", "lmstudio", "lm-studio"}:
+    if name in {"lm_studio", "lm studio", "lmstudio", "lm-studio"} or name.startswith("lm studio"):
         return True
     return False
 
@@ -368,6 +373,8 @@ async def _proxy_gemini_cloudcode(
     model_name = body.get("model", "")
     messages = body.get("messages", [])
     max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 8192
+    # Gemini Cloud Code caps maxOutputTokens at 65536
+    max_tokens = min(int(max_tokens), 65536)
     temperature = body.get("temperature")
 
     # Refresh OAuth token
@@ -454,6 +461,53 @@ async def _proxy_gemini_cloudcode(
     openai_resp = _convert_gemini_to_openai(gemini_resp, model_name)
     elapsed = time.time() - t0
     _log_completion_usage(body, openai_resp, target_url, db=db, elapsed=elapsed)
+
+    if body.get("stream", False):
+        async def generate():
+            chunk1 = {
+                "id": openai_resp["id"],
+                "object": "chat.completion.chunk",
+                "created": openai_resp["created"],
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]
+            }
+            yield f"data: {json.dumps(chunk1)}\n\n".encode("utf-8")
+            
+            content = openai_resp["choices"][0]["message"].get("content", "")
+            if content:
+                chunk2 = {
+                    "id": openai_resp["id"],
+                    "object": "chat.completion.chunk",
+                    "created": openai_resp["created"],
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"content": content}}]
+                }
+                yield f"data: {json.dumps(chunk2)}\n\n".encode("utf-8")
+                
+            chunk3 = {
+                "id": openai_resp["id"],
+                "object": "chat.completion.chunk",
+                "created": openai_resp["created"],
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": openai_resp["choices"][0].get("finish_reason", "stop")}]
+            }
+            yield f"data: {json.dumps(chunk3)}\n\n".encode("utf-8")
+            
+            if "usage" in openai_resp:
+                chunk4 = {
+                    "id": openai_resp["id"],
+                    "object": "chat.completion.chunk",
+                    "created": openai_resp["created"],
+                    "model": model_name,
+                    "choices": [],
+                    "usage": openai_resp["usage"]
+                }
+                yield f"data: {json.dumps(chunk4)}\n\n".encode("utf-8")
+                
+            yield b"data: [DONE]\n\n"
+            
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
     return JSONResponse(status_code=200, content=openai_resp)
 
 
@@ -531,6 +585,9 @@ def _find_model_route(db: Session, model_name: str) -> tuple[ModelRoute | None, 
         if rule.match_type == "exact" and model_name == rule.match_value:
             matched = True
         elif rule.match_type == "prefix" and model_name.startswith(rule.match_value):
+            matched = True
+        # Also match by route_name (the user-facing alias)
+        elif rule.route_name and model_name == rule.route_name:
             matched = True
         if not matched:
             continue
@@ -611,12 +668,17 @@ async def _proxy_openai_compatible(
     is_streaming = body.get("stream", False)
     t0 = time.time()
     if is_streaming:
-        req = http_client.build_request("POST", target_url, headers=headers, json=body)
+        # Inject stream_options so the upstream returns usage in the final SSE chunk
+        streaming_body = dict(body)
+        streaming_body.setdefault("stream_options", {})["include_usage"] = True
+
         # 串流超時：連線 15s，每個 chunk 之間最多等 120s
-        response = await http_client.send(
-            req, stream=True,
+        # timeout must be set on build_request (httpx 0.28+ dropped timeout kwarg on send())
+        req = http_client.build_request(
+            "POST", target_url, headers=headers, json=streaming_body,
             timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=5.0),
         )
+        response = await http_client.send(req, stream=True)
 
         if response.status_code != 200:
             err_body = await response.aread()
@@ -628,12 +690,75 @@ async def _proxy_openai_compatible(
                 err_json = {"error": {"message": err_body.decode(errors="replace")[:1000]}}
             return JSONResponse(status_code=response.status_code, content=err_json)
 
+        # Capture closure vars for post-stream recording
+        _t0 = t0
+        _body = body
+        _target_url = target_url
+        _model_resolved = model_resolved
+        _provider_name = provider_name
+        _provider_type = provider_type
+        _conversation_id = conversation_id
+        _tool_calls_count = tool_calls_count
+        _usage: dict = {}
+
         async def generate():
             try:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+                async for line in response.aiter_lines():
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            d = json.loads(line[6:])
+                            has_choices = bool(d.get("choices"))
+                            has_usage = "usage" in d and d["usage"] is not None
+
+                            if has_usage:
+                                _usage.update(d["usage"])
+
+                            # 1) If it has NO choices and NO usage, it's likely a prompt_filter_results chunk.
+                            # Strict OpenAI clients might crash on choices: [] without usage.
+                            if not has_choices and not has_usage:
+                                continue
+
+                            # 2) If it has BOTH choices and usage (GitHub Copilot anomaly).
+                            # Strict OpenAI spec requires choices: [] when usage is present in stream.
+                            if has_choices and has_usage:
+                                # Yield choices chunk first without usage
+                                d_choices = dict(d)
+                                del d_choices["usage"]
+                                yield f"data: {json.dumps(d_choices)}\n\n".encode("utf-8")
+
+                                # Yield usage chunk with empty choices
+                                d_usage = dict(d)
+                                d_usage["choices"] = []
+                                yield f"data: {json.dumps(d_usage)}\n\n".encode("utf-8")
+                                continue
+
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    
+                    yield (line + "\n").encode("utf-8")
             finally:
                 await response.aclose()
+                # Record benchmark/completion log after stream ends
+                completion_tokens = _usage.get("completion_tokens") or 0
+                elapsed = time.time() - _t0
+                if completion_tokens > 0 and elapsed > 0:
+                    try:
+                        from backend.app.database import SessionLocal as _SessionLocal
+                        new_db = _SessionLocal()
+                        try:
+                            _log_completion_usage(
+                                _body, {"usage": _usage}, _target_url,
+                                db=new_db, elapsed=elapsed,
+                                model_resolved=_model_resolved,
+                                provider_name=_provider_name,
+                                provider_type=_provider_type,
+                                conversation_id=_conversation_id,
+                                tool_calls_count=_tool_calls_count,
+                            )
+                        finally:
+                            new_db.close()
+                    except Exception as exc:
+                        logger.warning("[AutoBench] Streaming record failed: %s", exc)
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -684,7 +809,7 @@ async def list_models(db: Session = Depends(get_db)):
     # Explicit route table
     rules = db.query(ModelRoute).filter(ModelRoute.enabled == 1).all()
     for rule in rules:
-        exposed_id = rule.target_model or rule.match_value
+        exposed_id = rule.route_name or rule.target_model or rule.match_value
         data.append({
             "id": exposed_id,
             "object": "model",
@@ -725,6 +850,11 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
     if not model_name:
         raise HTTPException(status_code=400, detail="Missing 'model' in request body")
 
+    # Strip Ollama ':latest' tag — providers/routes use bare model names
+    if model_name.endswith(":latest"):
+        model_name = model_name.removesuffix(":latest")
+        body = {**body, "model": model_name}
+
     # Read route policy from header (override) or fall back to default
     policy = request.headers.get("x-route-policy", "").strip() or DEFAULT_POLICY
     if policy not in {"local_first", "cheapest", "fastest", "highest_quality", "local_only", "remote_only"}:
@@ -752,7 +882,7 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
     # 1) Explicit model route table has highest priority.
     rule, provider = _find_model_route(db, model_name)
     if rule and provider:
-        routed_model = rule.target_model or model_name
+        routed_model = rule.target_model or rule.match_value or model_name
         # For prefix routes with no explicit target_model, strip the matched
         # prefix so "github-copilot/gpt-5-mini" → "gpt-5-mini" upstream.
         if not rule.target_model and rule.match_type == "prefix" and model_name.startswith(rule.match_value):

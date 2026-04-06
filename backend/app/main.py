@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.database import init_db
-from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes, dev_routes, virtual_model_routes, lmstudio_routes
+from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes, dev_routes, virtual_model_routes, lmstudio_routes, ollama_routes, ollama_compat_router, inference_storage_routes
 from backend.app.core.dev_logs import install_dev_log_handler
 from backend.app.core.process_manager import llama_process_manager
 from backend.app.database import SessionLocal
@@ -85,6 +85,31 @@ app.include_router(report_routes.router)
 app.include_router(dev_routes.router)
 app.include_router(virtual_model_routes.router)
 app.include_router(lmstudio_routes.router)
+app.include_router(ollama_routes.router)
+
+
+@app.get("/")
+def root():
+    """健康檢查端點。"""
+    return {
+        "service": "LLM Server Router",
+        "version": "0.1.0",
+        "status": "running",
+    }
+
+
+@app.get("/api/status")
+def get_server_status():
+    """取得所有 llama-server 進程狀態。"""
+    statuses = llama_process_manager.get_all_status()
+    return {
+        "active_count": len(statuses),
+        "processes": statuses,
+    }
+
+
+app.include_router(ollama_compat_router.router)
+app.include_router(inference_storage_routes.router)
 
 
 @app.middleware("http")
@@ -115,23 +140,3 @@ async def enforce_api_token(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized: invalid API token"})
 
     return await call_next(request)
-
-
-@app.get("/")
-def root():
-    """健康檢查端點。"""
-    return {
-        "service": "LLM Server Router",
-        "version": "0.1.0",
-        "status": "running",
-    }
-
-
-@app.get("/api/status")
-def get_server_status():
-    """取得所有 llama-server 進程狀態。"""
-    statuses = llama_process_manager.get_all_status()
-    return {
-        "active_count": len(statuses),
-        "processes": statuses,
-    }

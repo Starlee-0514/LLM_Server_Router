@@ -902,6 +902,52 @@ async def provider_models(provider_id: int, db: Session = Depends(get_db)):
     return models or fallback_models
 
 
+@router.post("/sync-local", response_model=list[ProviderEndpointResponse])
+def sync_local_providers(db: Session = Depends(get_db)):
+    """Auto-create provider entries for locally running llama-server processes."""
+    from backend.app.core.process_manager import llama_process_manager
+
+    statuses = llama_process_manager.get_all_status()
+    created: list[ProviderEndpoint] = []
+
+    for s in statuses:
+        if not s.get("is_running"):
+            continue
+        port = s.get("port")
+        if not port:
+            continue
+
+        base_url = f"http://localhost:{port}"
+        existing = db.query(ProviderEndpoint).filter(ProviderEndpoint.base_url == base_url).first()
+        if existing:
+            continue
+
+        identifier = s.get("identifier") or f"local-{port}"
+        name = f"local-{identifier}"
+        # Avoid duplicate names
+        if db.query(ProviderEndpoint).filter(ProviderEndpoint.name == name).first():
+            name = f"local-{identifier}-{port}"
+
+        row = ProviderEndpoint(
+            name=name,
+            provider_type="openai_compatible",
+            base_url=base_url,
+            api_key="",
+            extra_headers="",
+            enabled=1,
+        )
+        db.add(row)
+        db.flush()
+        created.append(row)
+
+    if created:
+        db.commit()
+        for row in created:
+            db.refresh(row)
+
+    return created
+
+
 routes_router = APIRouter(prefix="/api/model-routes", tags=["model-routes"])
 
 
@@ -912,10 +958,6 @@ def list_model_routes(db: Session = Depends(get_db)):
 
 @routes_router.post("", response_model=ModelRouteResponse, status_code=201)
 def create_model_route(request: ModelRouteCreate, db: Session = Depends(get_db)):
-    existing = db.query(ModelRoute).filter(ModelRoute.route_name == request.route_name).first()
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Model route '{request.route_name}' already exists")
-
     provider = db.query(ProviderEndpoint).filter(ProviderEndpoint.id == request.provider_id).first()
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
@@ -928,6 +970,9 @@ def create_model_route(request: ModelRouteCreate, db: Session = Depends(get_db))
         provider_id=request.provider_id,
         priority=request.priority,
         enabled=1 if request.enabled else 0,
+        supports_tools=1 if request.supports_tools else 0,
+        supports_vision=1 if request.supports_vision else 0,
+        supports_thinking=1 if request.supports_thinking else 0,
     )
     db.add(row)
     db.commit()
@@ -952,6 +997,9 @@ def update_model_route(route_id: int, request: ModelRouteCreate, db: Session = D
     row.provider_id = request.provider_id
     row.priority = request.priority
     row.enabled = 1 if request.enabled else 0
+    row.supports_tools = 1 if request.supports_tools else 0
+    row.supports_vision = 1 if request.supports_vision else 0
+    row.supports_thinking = 1 if request.supports_thinking else 0
     db.commit()
     db.refresh(row)
     return row
