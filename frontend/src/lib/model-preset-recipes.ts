@@ -175,8 +175,8 @@ const FAMILY_KEYWORDS: Record<Exclude<PresetFamily, "universal">, RegExp> = {
   multimodal: /(vision|vl|llava|qwen2\.5-vl|multimodal)/i,
 };
 
-export const getPresetRecipe = (key: string) =>
-  PRESET_RECIPES.find((recipe) => recipe.key === key) ?? PRESET_RECIPES[0];
+export const getPresetRecipe = (key: string, recipes: PresetRecipe[] = PRESET_RECIPES) =>
+  recipes.find((recipe) => recipe.key === key) ?? PRESET_RECIPES.find((recipe) => recipe.key === key) ?? PRESET_RECIPES[0];
 
 export const getPresetRecipeGroupKey = (recipe: PresetRecipe): PresetRecipeGroupKey => recipe.family;
 
@@ -186,11 +186,21 @@ export const filterRecipesForFamily = (family: PresetFamily, recipes: PresetReci
     ? recipes
     : recipes.filter((r) => r.family === family || r.family === "universal");
 
-export const groupPresetRecipes = (recipes: PresetRecipe[] = PRESET_RECIPES) =>
-  PRESET_RECIPE_GROUPS.map((group) => ({
+export const groupPresetRecipes = (recipes: PresetRecipe[] = PRESET_RECIPES) => {
+  const grouped = PRESET_RECIPE_GROUPS.map((group) => ({
     ...group,
     recipes: recipes.filter((recipe) => recipe.family === group.key),
   })).filter((group) => group.recipes.length > 0);
+
+  const customRecipes = recipes.filter(
+    (r) => !PRESET_RECIPES.some((pr) => pr.key === r.key)
+  );
+  if (customRecipes.length > 0) {
+    grouped.push({ key: "custom" as PresetRecipeGroupKey, label: "Custom", description: "User-defined custom recipes", recipes: customRecipes });
+  }
+
+  return grouped;
+};
 
 /** Grouped recipes filtered to a specific family (family-own + universal). Skips empty groups. */
 export const groupRecipesForFamily = (family: PresetFamily, recipes: PresetRecipe[] = PRESET_RECIPES) =>
@@ -199,8 +209,9 @@ export const groupRecipesForFamily = (family: PresetFamily, recipes: PresetRecip
 export const applyPresetRecipe = (
   key: string,
   current: LaunchOptionDraft,
+  recipes: PresetRecipe[] = PRESET_RECIPES,
 ): { recipe: PresetRecipe; options: LaunchOptionDraft } => {
-  const recipe = getPresetRecipe(key);
+  const recipe = getPresetRecipe(key, recipes);
   return {
     recipe,
     options: {

@@ -278,6 +278,9 @@ export interface ModelRouteItem {
   provider_id: number;
   priority: number;
   enabled: boolean;
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_thinking: boolean;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -290,6 +293,9 @@ export interface ModelRoutePayload {
   provider_id: number;
   priority: number;
   enabled: boolean;
+  supports_tools?: boolean;
+  supports_vision?: boolean;
+  supports_thinking?: boolean;
 }
 
 export interface MeshWorker {
@@ -580,6 +586,8 @@ export const getRecentBenchmarks = (limit = 5) =>
 
 // --- Providers ---
 export const getProviders = () => apiFetch<ProviderEndpoint[]>("/api/providers");
+export const syncLocalProviders = () =>
+  apiFetch<ProviderEndpoint[]>("/api/providers/sync-local", { method: "POST" });
 export const createProvider = (payload: ProviderCreatePayload) =>
   apiFetch<ProviderEndpoint>("/api/providers", {
     method: "POST",
@@ -988,3 +996,121 @@ export const lmStudioRegisterProvider = (host = "127.0.0.1", port = 1234, name =
     method: "POST",
     body: JSON.stringify({ host, port, name, enabled: true }),
   });
+
+// ---------------------------------------------------------------------------
+// Ollama
+// ---------------------------------------------------------------------------
+
+export interface OllamaModelInfo {
+  name: string;
+  size: number;
+  digest: string;
+  parameter_size: string;
+  quantization_level: string;
+}
+
+export interface OllamaRunningModel {
+  name: string;
+  size: number;
+  vram_size: number;
+  expires_at: string;
+}
+
+export interface OllamaStatus {
+  running: boolean;
+  port: number;
+  host: string;
+  local_models: OllamaModelInfo[];
+  running_models: OllamaRunningModel[];
+  error: string;
+}
+
+export interface OllamaCommandResult {
+  success: boolean;
+  message: string;
+  status: string;
+}
+
+export interface OllamaProviderRegistered {
+  id: number;
+  name: string;
+  base_url: string;
+  created: boolean;
+}
+
+export const getOllamaStatus = (host = "127.0.0.1", port = 11434) =>
+  apiFetch<OllamaStatus>(`/api/ollama/status?host=${host}&port=${port}`);
+
+export const ollamaPullModel = (name: string, host = "127.0.0.1", port = 11434) =>
+  apiFetch<OllamaCommandResult>("/api/ollama/models/pull", {
+    method: "POST",
+    body: JSON.stringify({ name, host, port }),
+  });
+
+export const ollamaDeleteModel = (name: string, host = "127.0.0.1", port = 11434) =>
+  apiFetch<OllamaCommandResult>("/api/ollama/models/delete", {
+    method: "POST",
+    body: JSON.stringify({ name, host, port }),
+  });
+
+export const ollamaRegisterProvider = (host = "127.0.0.1", port = 11434, name = "Ollama") =>
+  apiFetch<OllamaProviderRegistered>("/api/ollama/provider/register", {
+    method: "POST",
+    body: JSON.stringify({ host, port, name, enabled: true }),
+  });
+
+// ==================
+// Inference Storage (system prompt profiles + chat sessions)
+// ==================
+export interface SystemPromptProfileItem {
+  id: string;
+  name: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatSessionSummary {
+  id: string;
+  title: string;
+  model: string;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatSessionDetail {
+  id: string;
+  title: string;
+  model: string;
+  messages: { role: string; content: string }[];
+  created_at: string;
+  updated_at: string;
+}
+
+export const listSystemPromptProfiles = () =>
+  apiFetch<SystemPromptProfileItem[]>("/api/inference/profiles");
+
+export const upsertSystemPromptProfile = (profile: { id: string; name: string; content: string }) =>
+  apiFetch<SystemPromptProfileItem>(`/api/inference/profiles/${profile.id}`, {
+    method: "PUT",
+    body: JSON.stringify(profile),
+  });
+
+export const deleteSystemPromptProfile = (id: string) =>
+  apiFetch<{ deleted: string }>(`/api/inference/profiles/${id}`, { method: "DELETE" });
+
+export const listChatSessions = () =>
+  apiFetch<ChatSessionSummary[]>("/api/inference/sessions");
+
+export const getChatSession = (id: string) =>
+  apiFetch<ChatSessionDetail>(`/api/inference/sessions/${id}`);
+
+export const upsertChatSession = (session: { id: string; title: string; model: string; messages: { role: string; content: string }[] }) =>
+  apiFetch<ChatSessionSummary>(`/api/inference/sessions/${session.id}`, {
+    method: "PUT",
+    body: JSON.stringify(session),
+  });
+
+export const deleteChatSession = (id: string) =>
+  apiFetch<{ deleted: string }>(`/api/inference/sessions/${id}`, { method: "DELETE" });
