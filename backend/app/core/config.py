@@ -1,8 +1,12 @@
 """
-應用程式設定 - 從 .env 檔案載入環境變數
+應用程式設定 - 從 repo root 的 .env 檔案載入環境變數。
 """
 from pathlib import Path
 from pydantic_settings import BaseSettings
+
+
+ROOT_DIR = Path(__file__).resolve().parents[3]
+ENV_FILE = ROOT_DIR / ".env"
 
 
 class Settings(BaseSettings):
@@ -32,7 +36,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./llm_router.db"
 
     model_config = {
-        "env_file": ".env",
+        "env_file": str(ENV_FILE),
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
     }

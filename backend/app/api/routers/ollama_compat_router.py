@@ -104,6 +104,23 @@ def _infer_model_details(name: str, model_path: str | None = None) -> dict[str, 
     }
 
 
+def _model_info_architecture(entry: dict[str, Any]) -> str:
+    details = entry.get("details") or {}
+    family = details.get("family") or "llama"
+    normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", str(family).strip().lower())
+    return normalized or "llama"
+
+
+def _build_model_info(entry: dict[str, Any]) -> dict[str, Any]:
+    architecture = _model_info_architecture(entry)
+    context_length = int(entry.get("context_length") or 4096)
+    return {
+        "general.basename": entry["name"].split(":", 1)[0],
+        "general.architecture": architecture,
+        f"{architecture}.context_length": context_length,
+    }
+
+
 def _infer_capabilities(name: str) -> list[str]:
     lowered = (name or "").lower()
     capabilities = ["completion"]
@@ -213,7 +230,12 @@ async def _build_model_catalog(db: Session) -> dict[str, dict[str, Any]]:
     for rule in db.query(ModelRoute).filter(ModelRoute.enabled == 1).all():
         exposed = rule.route_name or rule.target_model or rule.match_value or ""
         if exposed:
-            _upsert_catalog_entry(catalog, exposed, source_name=rule.target_model or rule.match_value or exposed)
+            _upsert_catalog_entry(
+                catalog,
+                exposed,
+                source_name=rule.target_model or rule.match_value or exposed,
+                context_length=rule.context_length,
+            )
             # Override capabilities from route config
             tag = _normalize_model_name(exposed)
             if tag in catalog:
@@ -232,7 +254,12 @@ async def _build_model_catalog(db: Session) -> dict[str, dict[str, Any]]:
             models = []
         for model_name in models:
             if model_name:
-                _upsert_catalog_entry(catalog, model_name, source_name=model_name)
+                _upsert_catalog_entry(
+                    catalog,
+                    model_name,
+                    source_name=model_name,
+                    context_length=worker.max_context_length,
+                )
 
     for virtual_model in db.query(VirtualModel).filter(VirtualModel.enabled == 1).all():
         if virtual_model.model_id:
@@ -818,7 +845,7 @@ async def ollama_show(req: OllamaShowRequest, db: Session = Depends(get_db)):
         "system": req.system,
         "details": entry["details"],
         "messages": [],
-        "model_info": {"general.basename": entry["name"].split(":", 1)[0]},
+        "model_info": _build_model_info(entry),
         "capabilities": entry["capabilities"],
         "modified_at": entry["modified_at"],
     }

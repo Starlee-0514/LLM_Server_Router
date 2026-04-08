@@ -20,6 +20,10 @@ export default function SettingsPage() {
   const [listenPort, setListenPort] = useState("8000");
   const [corsAllowOrigins, setCorsAllowOrigins] = useState("*");
   const [apiToken, setApiToken] = useState("");
+  const [githubClientId, setGithubClientId] = useState("");
+  const [githubClientSecret, setGithubClientSecret] = useState("");
+  const [googleClientId, setGoogleClientId] = useState("");
+  const [googleClientSecret, setGoogleClientSecret] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -72,6 +76,10 @@ export default function SettingsPage() {
       setListenPort(data.find((s) => s.key === "listen_port")?.value ?? "8000");
       setCorsAllowOrigins(data.find((s) => s.key === "cors_allow_origins")?.value ?? "*");
       setApiToken(data.find((s) => s.key === "api_token")?.value ?? "");
+      setGithubClientId(data.find((s) => s.key === "github_client_id")?.value ?? "");
+      setGithubClientSecret(data.find((s) => s.key === "github_client_secret")?.value ?? "");
+      setGoogleClientId(data.find((s) => s.key === "google_client_id")?.value ?? "");
+      setGoogleClientSecret(data.find((s) => s.key === "google_client_secret")?.value ?? "");
     } catch {}
   };
 
@@ -171,6 +179,10 @@ export default function SettingsPage() {
         { key: "listen_port", value: listenPort.trim() },
         { key: "cors_allow_origins", value: corsAllowOrigins.trim() },
         { key: "api_token", value: apiToken.trim() },
+        { key: "github_client_id", value: githubClientId.trim() },
+        { key: "github_client_secret", value: githubClientSecret.trim() },
+        { key: "google_client_id", value: googleClientId.trim() },
+        { key: "google_client_secret", value: googleClientSecret.trim() },
       ]);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -365,6 +377,40 @@ export default function SettingsPage() {
                 <Label className="text-xs">API Token (for /v1 routes)</Label>
                 <Input value={apiToken} onChange={(e) => setApiToken(e.target.value)} type="password" className="font-mono text-xs" placeholder="optional bearer token" />
               </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/40 bg-card/60 backdrop-blur-sm">
+            <CardHeader>
+              <CardTitle className="text-base">OAuth Clients</CardTitle>
+              <p className="text-xs text-muted-foreground">
+                設定 GitHub 與 Google OAuth client。儲存後重新啟動後端可立即套用。
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label className="text-xs">GitHub Client ID</Label>
+                  <Input value={githubClientId} onChange={(e) => setGithubClientId(e.target.value)} className="font-mono text-xs" placeholder="Iv1.xxxxx" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">GitHub Client Secret</Label>
+                  <Input value={githubClientSecret} onChange={(e) => setGithubClientSecret(e.target.value)} type="password" className="font-mono text-xs" placeholder="optional if device flow only" />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label className="text-xs">Google Client ID</Label>
+                  <Input value={googleClientId} onChange={(e) => setGoogleClientId(e.target.value)} className="font-mono text-xs" placeholder="xxxx.apps.googleusercontent.com" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">Google Client Secret</Label>
+                  <Input value={googleClientSecret} onChange={(e) => setGoogleClientSecret(e.target.value)} type="password" className="font-mono text-xs" placeholder="GOCSPX-..." />
+                </div>
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                Google PKCE login requires both Client ID and Client Secret. If these are blank, the Providers page will now show a clear API error instead of opening a broken Google auth page.
+              </p>
             </CardContent>
           </Card>
 

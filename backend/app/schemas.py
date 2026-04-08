@@ -284,6 +284,7 @@ class ModelRouteCreate(BaseModel):
     supports_tools: bool = False
     supports_vision: bool = False
     supports_thinking: bool = False
+    context_length: int | None = None
 
 
 class ModelRouteResponse(BaseModel):
@@ -298,6 +299,7 @@ class ModelRouteResponse(BaseModel):
     supports_tools: bool = False
     supports_vision: bool = False
     supports_thinking: bool = False
+    context_length: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

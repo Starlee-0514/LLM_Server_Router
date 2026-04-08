@@ -65,6 +65,7 @@ def init_db():
     override_columns = {column["name"] for column in inspector.get_columns("model_property_overrides")}
     benchmark_columns = {column["name"] for column in inspector.get_columns("benchmark_records")}
     mesh_worker_columns = {column["name"] for column in inspector.get_columns("mesh_workers")}
+    model_route_columns = {column["name"] for column in inspector.get_columns("model_routes")}
 
     with engine.begin() as connection:
         if "model_family" not in model_group_columns:
@@ -92,5 +93,8 @@ def init_db():
             connection.execute(text("ALTER TABLE mesh_workers ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"))
         if "last_health_check_at" not in mesh_worker_columns:
             connection.execute(text("ALTER TABLE mesh_workers ADD COLUMN last_health_check_at DATETIME"))
+        # model_routes: context_length for agent declarations
+        if "context_length" not in model_route_columns:
+            connection.execute(text("ALTER TABLE model_routes ADD COLUMN context_length INTEGER DEFAULT NULL"))
 
     ensure_default_runtimes()

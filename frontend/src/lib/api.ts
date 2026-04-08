@@ -281,6 +281,7 @@ export interface ModelRouteItem {
   supports_tools: boolean;
   supports_vision: boolean;
   supports_thinking: boolean;
+  context_length: number | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -296,6 +297,7 @@ export interface ModelRoutePayload {
   supports_tools?: boolean;
   supports_vision?: boolean;
   supports_thinking?: boolean;
+  context_length?: number | null;
 }
 
 export interface MeshWorker {
@@ -1114,3 +1116,26 @@ export const upsertChatSession = (session: { id: string; title: string; model: s
 
 export const deleteChatSession = (id: string) =>
   apiFetch<{ deleted: string }>(`/api/inference/sessions/${id}`, { method: "DELETE" });
+
+// ==================
+// Terminal Sessions (zellij)
+// ==================
+export interface TerminalSession {
+  name: string;
+  attached: boolean;
+  raw: string;
+}
+
+export const listTerminalSessions = () =>
+  apiFetch<{ sessions: TerminalSession[]; zellij_available: boolean }>("/api/terminal/sessions");
+
+export const createTerminalSession = (name: string) =>
+  apiFetch<{ ok?: boolean; error?: string; name?: string }>("/api/terminal/sessions", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+
+export const deleteTerminalSession = (name: string) =>
+  apiFetch<{ ok?: boolean; error?: string; name?: string }>(`/api/terminal/sessions/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });

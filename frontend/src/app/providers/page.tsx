@@ -339,7 +339,7 @@ export default function ProvidersPage() {
                   disabled={deviceCodePolling}
                   onClick={() => handleRegisterCommon(tpl.provider_key)}
                 >
-                  {tpl.oauth_method === "device_code" || tpl.oauth_method === "pkce" ? `Login ${tpl.label}` : `Add ${tpl.label}`}
+                  {tpl.oauth_method === "device_code" || tpl.oauth_method === "pkce" ? `Add ${tpl.label} Account` : `Add ${tpl.label}`}
                 </Button>
               ))}
             </div>

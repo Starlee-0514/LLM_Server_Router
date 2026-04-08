@@ -82,6 +82,10 @@ def _log_completion_usage(body: dict, resp_json: dict, target_url: str, db: Sess
     log_completion(model, prompt_tokens, completion_tokens, total_tokens,
                    elapsed or 0, target_url, prompt_preview)
 
+    # Track per-conversation usage for quota enforcement
+    if conversation_id:
+        request_stats.increment_conversation(conversation_id, total_tokens)
+
     if db:
         # Write CompletionLog row
         try:
@@ -623,7 +627,8 @@ async def _proxy_gemini_cloudcode(
 
             return resp, None  # success
 
-        return None, "Gemini Cloud Code: max retries exceeded"
+        # All retries exhausted — signal the last failure reason
+        return None, {"error": {"message": "Gemini Cloud Code: max retries exceeded (rate limited)"}, "_status": 429}
 
     # ==================================================================
     # STREAMING PATH — true chunk-by-chunk SSE translation
@@ -657,7 +662,8 @@ async def _proxy_gemini_cloudcode(
             response, err = await _make_request_with_retry(stream=True)
             if response is None:
                 if isinstance(err, dict):
-                    return JSONResponse(status_code=502, content=err)
+                    status = err.pop("_status", 502)
+                    return JSONResponse(status_code=status, content=err)
                 return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
 
             # Consume the SSE stream and check if it has actual content
@@ -804,7 +810,8 @@ async def _proxy_gemini_cloudcode(
         response, err = await _make_request_with_retry(stream=False)
         if response is None:
             if isinstance(err, dict):
-                return JSONResponse(status_code=502, content=err)
+                status = err.pop("_status", 502)
+                return JSONResponse(status_code=status, content=err)
             return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
 
         # Parse SSE stream into a single aggregated response
@@ -835,7 +842,11 @@ def _provider_headers(provider: ProviderEndpoint) -> dict[str, str]:
 
 
 async def _build_oauth_provider_headers(provider: ProviderEndpoint, db: Session) -> dict[str, str]:
-    """Build headers for OAuth providers (e.g. Google Gemini) with auto-refresh."""
+    """Build headers for OAuth providers (e.g. Google Gemini) with auto-refresh.
+
+    Uses expires_at tracking (with 5-minute buffer, same as pi-agent) to avoid
+    refreshing on every request. Only refreshes when the token is actually expired.
+    """
     api_key = provider.api_key or ""
     headers = {"Content-Type": "application/json"}
 
@@ -847,11 +858,13 @@ async def _build_oauth_provider_headers(provider: ProviderEndpoint, db: Session)
 
     access_token = token_data.get("access_token", "")
     refresh_token = token_data.get("refresh_token", "")
+    expires_at = token_data.get("expires_at", 0)
 
-    # Try to refresh if we have a refresh_token (Google OAuth tokens expire in ~1 hour)
-    if refresh_token:
+    # Only refresh if token is expired (or no expires_at tracked yet → always refresh once)
+    needs_refresh = not expires_at or time.time() >= expires_at
+
+    if needs_refresh and refresh_token:
         try:
-            from backend.app.core.runtime_settings import get_google_client_id, get_google_client_secret
             from backend.app.api.routers.provider_routes import _get_google_creds
             client_id, client_secret = _get_google_creds()
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -867,13 +880,20 @@ async def _build_oauth_provider_headers(provider: ProviderEndpoint, db: Session)
             if resp.status_code == 200:
                 payload = resp.json()
                 new_access = payload.get("access_token", "")
+                new_expires_in = int(payload.get("expires_in", 3600))
                 if new_access:
                     access_token = new_access
                     token_data["access_token"] = new_access
+                    # 5-minute buffer before actual expiry (same as pi-agent)
+                    token_data["expires_at"] = time.time() + new_expires_in - 300
+                    # Google may rotate refresh_token
                     if payload.get("refresh_token"):
                         token_data["refresh_token"] = payload["refresh_token"]
                     provider.api_key = json.dumps(token_data)
                     db.commit()
+                    logger.info("Google OAuth token refreshed (expires_in=%ds)", new_expires_in)
+            else:
+                logger.warning("Google OAuth token refresh HTTP %d: %s", resp.status_code, resp.text[:200])
         except Exception as e:
             logger.warning("Google OAuth token refresh failed: %s", e)
 
@@ -892,12 +912,26 @@ async def _build_oauth_provider_headers(provider: ProviderEndpoint, db: Session)
 
 
 def _find_model_route(db: Session, model_name: str) -> tuple[ModelRoute | None, ProviderEndpoint | None]:
+    """Return the first matching (route, provider) pair."""
+    matches = _find_all_model_routes(db, model_name)
+    if matches:
+        return matches[0]
+    return None, None
+
+
+def _find_all_model_routes(db: Session, model_name: str) -> list[tuple[ModelRoute, ProviderEndpoint]]:
+    """Return ALL matching (route, provider) pairs, ordered by priority ASC.
+
+    This allows the caller to fall through to the next route when the
+    first one returns 429 / 502 / 503.
+    """
     rules = (
         db.query(ModelRoute)
         .filter(ModelRoute.enabled == 1)
         .order_by(ModelRoute.priority.asc(), ModelRoute.created_at.asc())
         .all()
     )
+    results: list[tuple[ModelRoute, ProviderEndpoint]] = []
     for rule in rules:
         matched = False
         if rule.match_type == "exact" and model_name == rule.match_value:
@@ -916,9 +950,9 @@ def _find_model_route(db: Session, model_name: str) -> tuple[ModelRoute | None, 
             .first()
         )
         if provider:
-            return rule, provider
+            results.append((rule, provider))
 
-    return None, None
+    return results
 
 
 def _find_mesh_worker_for_model(db: Session, model_name: str) -> MeshWorker | None:
@@ -1128,12 +1162,15 @@ async def list_models(db: Session = Depends(get_db)):
     rules = db.query(ModelRoute).filter(ModelRoute.enabled == 1).all()
     for rule in rules:
         exposed_id = rule.route_name or rule.target_model or rule.match_value
-        data.append({
+        model_entry: dict = {
             "id": exposed_id,
             "object": "model",
             "created": 0,
             "owned_by": "provider-route",
-        })
+        }
+        if rule.context_length:
+            model_entry["context_length"] = rule.context_length
+        data.append(model_entry)
 
     # Virtual model aliases (stable logical IDs)
     virtual_models = db.query(VirtualModel).filter(VirtualModel.enabled == 1).all()
@@ -1198,92 +1235,114 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
     mesh_candidates = [c for c in resolver_candidates if c.backend_type == "mesh"]
 
     # 1) Explicit model route table has highest priority.
-    rule, provider = _find_model_route(db, model_name)
-    if rule and provider:
+    #    Try ALL matching routes in priority order; fall through on 429/502/503.
+    _FALLBACK_STATUS_CODES = {429, 502, 503}
+    all_routes = _find_all_model_routes(db, model_name)
+    last_fallback_response = None
+
+    if all_routes:
+        logger.info(
+            "Routing model '%s' with %d candidate route(s) under policy '%s'",
+            model_name,
+            len(all_routes),
+            policy,
+        )
+
+    for _route_idx, (rule, provider) in enumerate(all_routes):
+        is_last_route = _route_idx == len(all_routes) - 1
+
         routed_model = rule.target_model or rule.match_value or model_name
         # For prefix routes with no explicit target_model, strip the matched
         # prefix so "github-copilot/gpt-5-mini" → "gpt-5-mini" upstream.
         if not rule.target_model and rule.match_type == "prefix" and model_name.startswith(rule.match_value):
             routed_model = model_name[len(rule.match_value):]
-        if routed_model != model_name:
-            body = {**body, "model": routed_model}
+        route_body = {**body, "model": routed_model} if routed_model != model_name else body
 
         if policy == POLICY_REMOTE_ONLY and provider.provider_type == "local_process":
             # Skip local process if policy says remote only
-            pass
-        elif provider.provider_type == "local_process":
+            continue
+
+        logger.info(
+            "Route attempt %d/%d: route='%s' provider='%s' type='%s' model='%s'",
+            _route_idx + 1,
+            len(all_routes),
+            rule.route_name,
+            provider.name,
+            provider.provider_type,
+            routed_model,
+        )
+
+        result = None  # will hold the response from this route attempt
+
+        if provider.provider_type == "local_process":
             port = llama_process_manager.get_router_port_for_model(routed_model)
             if port is None:
                 raise HTTPException(status_code=503, detail=f"Local model '{routed_model}' is not currently running")
             request_stats.increment_local()
             target_url = f"http://127.0.0.1:{port}/v1/chat/completions"
-            return await _proxy_openai_compatible(
-                target_url, {"Content-Type": "application/json"}, body, db=db,
+            result = await _proxy_openai_compatible(
+                target_url, {"Content-Type": "application/json"}, route_body, db=db,
                 model_resolved=routed_model, provider_name="local", provider_type="local_process",
                 conversation_id=conversation_id,
             )
 
-        if provider.provider_type == "openai_compatible":
+        elif provider.provider_type == "openai_compatible":
             if not provider.base_url:
                 raise HTTPException(status_code=500, detail=f"Provider '{provider.name}' base_url is empty")
             request_stats.increment_remote()
 
             # Translate tools for the provider if needed
-            fwd_body = translate_tools(body, provider.provider_type)
+            fwd_body = translate_tools(route_body, provider.provider_type)
 
             # Gemini Cloud Code: use native API translation
             if _is_gemini_cloudcode_provider(provider):
-                return await _proxy_gemini_cloudcode(provider, db, body)
+                result = await _proxy_gemini_cloudcode(provider, db, route_body)
 
-            target_url = build_provider_chat_url(provider.base_url)
-
-            # GitHub Copilot: auto-refresh token and add Copilot-specific headers
-            if _is_copilot_provider(provider):
+            elif _is_copilot_provider(provider):
                 copilot_token = await _ensure_fresh_copilot_token(provider, db)
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {copilot_token}",
                     **COPILOT_STATIC_HEADERS,
                 }
-                return await _proxy_openai_compatible(
-                    target_url, headers, fwd_body, db=db,
+                result = await _proxy_openai_compatible(
+                    build_provider_chat_url(provider.base_url), headers, fwd_body, db=db,
                     model_resolved=routed_model, provider_name=provider.name,
                     provider_type=provider.provider_type, conversation_id=conversation_id,
                 )
 
-            # GitHub Models: uses same Copilot token exchange + Copilot headers
-            if _is_github_models_provider(provider):
+            elif _is_github_models_provider(provider):
                 gh_token = await _ensure_fresh_github_models_token(provider, db)
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {gh_token}",
                     **COPILOT_STATIC_HEADERS,
                 }
-                return await _proxy_openai_compatible(
-                    target_url, headers, fwd_body, db=db,
+                result = await _proxy_openai_compatible(
+                    build_provider_chat_url(provider.base_url), headers, fwd_body, db=db,
                     model_resolved=routed_model, provider_name=provider.name,
                     provider_type=provider.provider_type, conversation_id=conversation_id,
                 )
 
-            # Google OAuth: extract access_token from JSON-encoded api_key and auto-refresh
-            if (provider.api_key or "").startswith("{"):
+            elif (provider.api_key or "").startswith("{"):
                 headers = await _build_oauth_provider_headers(provider, db)
-                return await _proxy_openai_compatible(
-                    target_url, headers, fwd_body, db=db,
+                result = await _proxy_openai_compatible(
+                    build_provider_chat_url(provider.base_url), headers, fwd_body, db=db,
                     model_resolved=routed_model, provider_name=provider.name,
                     provider_type=provider.provider_type, conversation_id=conversation_id,
                 )
 
-            return await _proxy_openai_compatible(
-                target_url, _provider_headers(provider), fwd_body, db=db,
-                model_resolved=routed_model, provider_name=provider.name,
-                provider_type=provider.provider_type, conversation_id=conversation_id,
-            )
+            else:
+                result = await _proxy_openai_compatible(
+                    build_provider_chat_url(provider.base_url), _provider_headers(provider), fwd_body, db=db,
+                    model_resolved=routed_model, provider_name=provider.name,
+                    provider_type=provider.provider_type, conversation_id=conversation_id,
+                )
 
-        if provider.provider_type == "anthropic":
-            if body.get("stream", False):
+        elif provider.provider_type == "anthropic":
+            if route_body.get("stream", False):
                 raise HTTPException(status_code=501, detail="Anthropic streaming conversion is not implemented yet")
-            messages = body.get("messages")
+            messages = route_body.get("messages")
             if not isinstance(messages, list):
                 raise HTTPException(status_code=400, detail="Invalid or missing 'messages'")
 
@@ -1293,15 +1352,14 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
 
             system_prompt, converted_messages = _convert_openai_messages_to_anthropic(messages)
 
-            # Translate OpenAI tools → Anthropic tool_use format
-            openai_tools = body.get("tools")
+            openai_tools = route_body.get("tools")
             anthropic_tools = translate_tools_for_anthropic(openai_tools) if openai_tools else None
 
             anthropic_payload = {
                 "model": routed_model,
                 "messages": converted_messages,
-                "max_tokens": int(body.get("max_tokens") or 1024),
-                "temperature": body.get("temperature", 0.7),
+                "max_tokens": int(route_body.get("max_tokens") or 1024),
+                "temperature": route_body.get("temperature", 0.7),
             }
             if system_prompt:
                 anthropic_payload["system"] = system_prompt
@@ -1324,19 +1382,63 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                 )
                 payload = response.json()
                 if response.status_code >= 400:
-                    return JSONResponse(status_code=response.status_code, content=payload)
-                openai_resp = _convert_anthropic_to_openai(payload, routed_model)
-                _log_completion_usage(
-                    body, openai_resp, target_url, db=db,
-                    elapsed=time.time() - t0_ant,
-                    model_resolved=routed_model, provider_name=provider.name,
-                    provider_type="anthropic", conversation_id=conversation_id,
-                    tool_calls_count=len(openai_tools) if openai_tools else 0,
-                )
-                return JSONResponse(status_code=200, content=openai_resp)
+                    result = JSONResponse(status_code=response.status_code, content=payload)
+                else:
+                    openai_resp = _convert_anthropic_to_openai(payload, routed_model)
+                    _log_completion_usage(
+                        body, openai_resp, target_url, db=db,
+                        elapsed=time.time() - t0_ant,
+                        model_resolved=routed_model, provider_name=provider.name,
+                        provider_type="anthropic", conversation_id=conversation_id,
+                        tool_calls_count=len(openai_tools) if openai_tools else 0,
+                    )
+                    result = JSONResponse(status_code=200, content=openai_resp)
             except httpx.RequestError as e:
                 logger.error("連線至 Anthropic provider 失敗: %s", e)
-                raise HTTPException(status_code=502, detail="Bad Gateway: Unable to reach Anthropic provider")
+                result = JSONResponse(status_code=502, content={"error": {"message": f"Bad Gateway: Unable to reach Anthropic provider: {e}"}})
+
+        # --- Fallback decision ---
+        if result is not None:
+            # Check if this is a retryable error and we have more routes to try
+            should_fallback = False
+            if not is_last_route and isinstance(result, JSONResponse):
+                result_status = result.status_code
+                if result_status in _FALLBACK_STATUS_CODES:
+                    should_fallback = True
+
+            if should_fallback:
+                next_route, next_provider = all_routes[_route_idx + 1]
+                logger.info(
+                    "Route switch: '%s' -> '%s' (provider '%s' -> '%s') due to status=%d (%d/%d)",
+                    rule.route_name,
+                    next_route.route_name,
+                    provider.name,
+                    next_provider.name,
+                    result.status_code,
+                    _route_idx + 1,
+                    len(all_routes),
+                )
+                last_fallback_response = result
+                continue
+            logger.info(
+                "Route success on attempt %d/%d: route='%s' provider='%s' status=%d",
+                _route_idx + 1,
+                len(all_routes),
+                rule.route_name,
+                provider.name,
+                result.status_code if isinstance(result, JSONResponse) else 200,
+            )
+            return result
+
+    # If all routes were exhausted with retryable errors, return the last error
+    if last_fallback_response is not None:
+        logger.info(
+            "All %d candidate routes exhausted for model '%s'; returning last fallback status=%d",
+            len(all_routes),
+            model_name,
+            last_fallback_response.status_code,
+        )
+        return last_fallback_response
 
     # 2) Mesh worker auto-discovery — use resolver's scored candidates first.
     if mesh_candidates:

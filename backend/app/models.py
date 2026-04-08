@@ -177,6 +177,7 @@ class ModelRoute(Base):
     supports_tools = Column(Integer, nullable=False, default=0)
     supports_vision = Column(Integer, nullable=False, default=0)
     supports_thinking = Column(Integer, nullable=False, default=0)
+    context_length = Column(Integer, nullable=True, default=None)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(
         DateTime,

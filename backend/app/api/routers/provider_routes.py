@@ -190,13 +190,19 @@ async def _ensure_fresh_github_models_token(provider: ProviderEndpoint, db: Sess
 def _get_google_creds() -> tuple[str, str]:
     """Return (client_id, client_secret) for Google OAuth.
 
-    Returns the user-configured OAuth credentials."""
-    cid = get_google_client_id() or ""
-    csec = get_google_client_secret() or ""
-    return cid, csec
+    Values come from Settings or the repo-root .env file."""
+    return get_google_client_id(), get_google_client_secret()
 
 
 COMMON_PROVIDER_TEMPLATES: dict[str, dict] = {
+    "ollama": {
+        "label": "Ollama (local)",
+        "provider_type": "openai_compatible",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "auth_hint": "No API key required — available while Ollama is running",
+        "default_extra_headers": "",
+        "oauth_method": "none",
+    },
     "lm_studio": {
         "label": "LM Studio (local)",
         "provider_type": "openai_compatible",
@@ -253,6 +259,14 @@ COMMON_PROVIDER_TEMPLATES: dict[str, dict] = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "auth_hint": "Uses Google OAuth (PKCE) or API key",
         "default_extra_headers": '{"x-goog-api-key": "<GOOGLE_API_KEY>"}',
+        "oauth_method": "pkce",
+    },
+    "google_gemini_cli": {
+        "label": "Google Gemini CLI (Cloud Code Assist)",
+        "provider_type": "openai_compatible",
+        "base_url": "https://cloudcode-pa.googleapis.com",
+        "auth_hint": "Requires Google OAuth client ID and client secret from Settings or .env",
+        "default_extra_headers": "",
         "oauth_method": "pkce",
     },
 }
@@ -504,6 +518,21 @@ async def poll_device_code_flow(request: Request, db: Session = Depends(get_db))
         provider_name = ctx.get("name_override") or ctx["provider_key"]
         extra_headers = template["default_extra_headers"]
 
+        # Fetch GitHub username for multi-account naming
+        if not ctx.get("name_override"):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as gh_client:
+                    gh_resp = await gh_client.get(
+                        "https://api.github.com/user",
+                        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                    )
+                    if gh_resp.status_code == 200:
+                        gh_user = gh_resp.json().get("login", "")
+                        if gh_user:
+                            provider_name = f"{template['label']} ({gh_user})"
+            except Exception:
+                _provider_logger.warning("Failed to fetch GitHub user for account naming")
+
         # Store token data as JSON including refresh_token for auto-refresh
         refresh_token = data.get("refresh_token", "")
         expires_in = data.get("expires_in", 0)
@@ -574,12 +603,20 @@ async def poll_device_code_flow(request: Request, db: Session = Depends(get_db))
 @router.get("/common/oauth/start/{provider_key}")
 def start_common_provider_oauth(provider_key: str, request: Request, name_override: str = ""):
     """Start Google Gemini OAuth with PKCE. Returns auth_url for the browser."""
-    if provider_key != "google_gemini_openai":
-        raise HTTPException(status_code=400, detail="Browser-based OAuth is only supported for google_gemini_openai. Use device code flow for github_models.")
+    if provider_key not in ("google_gemini_openai", "google_gemini_cli"):
+        raise HTTPException(status_code=400, detail="Browser-based OAuth is only supported for google_gemini_openai / google_gemini_cli. Use device code flow for github_models.")
 
     callback_url = str(request.url_for("common_provider_oauth_callback", provider_key=provider_key))
 
-    client_id, _ = _get_google_creds()
+    client_id, client_secret = _get_google_creds()
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET "
+                "in the repo root .env or save google_client_id/google_client_secret in Settings first."
+            ),
+        )
 
     verifier, challenge = _generate_pkce()
     state = secrets.token_urlsafe(24)
@@ -599,7 +636,7 @@ def start_common_provider_oauth(provider_key: str, request: Request, name_overri
             "response_type": "code",
             "scope": "openid email profile https://www.googleapis.com/auth/cloud-platform",
             "access_type": "offline",
-            "prompt": "consent",
+            "prompt": "consent select_account",
             "state": state,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
@@ -622,7 +659,7 @@ async def common_provider_oauth_callback(
     if not ctx or ctx.get("provider_key") != provider_key:
         return HTMLResponse("<html><body><h3>OAuth failed: invalid state</h3></body></html>")
 
-    if provider_key != "google_gemini_openai":
+    if provider_key not in ("google_gemini_openai", "google_gemini_cli"):
         return HTMLResponse("<html><body><h3>OAuth callback not supported for this provider</h3></body></html>")
 
     template = COMMON_PROVIDER_TEMPLATES[provider_key]
@@ -649,14 +686,38 @@ async def common_provider_oauth_callback(
     payload = resp.json()
     access_token = str(payload.get("access_token") or "")
     refresh_token = str(payload.get("refresh_token") or "")
+    expires_in = int(payload.get("expires_in", 3600))
+    # 5-minute buffer before actual expiry (same as pi-agent)
+    expires_at = time.time() + expires_in - 300
     if not access_token:
         err_detail = payload.get("error_description", payload.get("error", "unknown"))
         return HTMLResponse(f"<html><body><h3>OAuth failed: {err_detail}</h3></body></html>")
 
-    # Store refresh_token + access_token as JSON in api_key for later refresh
+    # Fetch user email from Google userinfo to support multi-account naming
+    account_email = ""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as info_client:
+            info_resp = await info_client.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if info_resp.status_code == 200:
+                account_email = info_resp.json().get("email", "")
+    except Exception:
+        _provider_logger.warning("Failed to fetch Google userinfo for account naming")
+
+    # Auto-generate provider name from email if no override given
+    label = template["label"]
+    if not ctx.get("name_override"):
+        if account_email:
+            provider_name = f"{label} ({account_email})"
+        # else keep original provider_key as fallback
+
+    # Store refresh_token + access_token + expires_at as JSON in api_key
     token_data = json.dumps({
         "access_token": access_token,
         "refresh_token": refresh_token,
+        "expires_at": expires_at,
     })
     extra_headers = template["default_extra_headers"]
 
@@ -751,8 +812,10 @@ async def refresh_provider_token(provider_id: int, db: Session = Depends(get_db)
     if not new_access:
         raise HTTPException(status_code=502, detail="No access_token in refresh response")
 
-    # Update stored token data (keep refresh_token, update access_token)
+    # Update stored token data (keep refresh_token, update access_token + expires_at)
     token_data["access_token"] = new_access
+    expires_in = int(payload.get("expires_in", 3600))
+    token_data["expires_at"] = time.time() + expires_in - 300  # 5-minute buffer
     if payload.get("refresh_token"):
         token_data["refresh_token"] = payload["refresh_token"]
     row.api_key = json.dumps(token_data)
@@ -906,9 +969,10 @@ async def provider_models(provider_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/sync-local", response_model=list[ProviderEndpointResponse])
-def sync_local_providers(db: Session = Depends(get_db)):
-    """Auto-create provider entries for locally running llama-server processes."""
+async def sync_local_providers(db: Session = Depends(get_db)):
+    """Auto-create provider entries for locally running llama-server processes and Ollama."""
     from backend.app.core.process_manager import llama_process_manager
+    from backend.app.services import ollama_service as ols
 
     statuses = llama_process_manager.get_all_status()
     created: list[ProviderEndpoint] = []
@@ -943,6 +1007,31 @@ def sync_local_providers(db: Session = Depends(get_db)):
         db.flush()
         created.append(row)
 
+    # Also probe Ollama on default port
+    ollama_status = await ols.get_status()
+    if ollama_status.running:
+        ollama_base = f"http://{ollama_status.host}:{ollama_status.port}"
+        # Use /v1 endpoint for OpenAI-compatible routing
+        ollama_api_base = f"{ollama_base}/v1"
+        existing_ollama = db.query(ProviderEndpoint).filter(
+            ProviderEndpoint.base_url.in_([ollama_base, ollama_api_base])
+        ).first()
+        if not existing_ollama:
+            ollama_name = "Ollama (local)"
+            if db.query(ProviderEndpoint).filter(ProviderEndpoint.name == ollama_name).first():
+                ollama_name = f"Ollama-{ollama_status.port}"
+            row = ProviderEndpoint(
+                name=ollama_name,
+                provider_type="openai_compatible",
+                base_url=ollama_api_base,
+                api_key="",
+                extra_headers="",
+                enabled=1,
+            )
+            db.add(row)
+            db.flush()
+            created.append(row)
+
     if created:
         db.commit()
         for row in created:
@@ -976,6 +1065,7 @@ def create_model_route(request: ModelRouteCreate, db: Session = Depends(get_db))
         supports_tools=1 if request.supports_tools else 0,
         supports_vision=1 if request.supports_vision else 0,
         supports_thinking=1 if request.supports_thinking else 0,
+        context_length=request.context_length,
     )
     db.add(row)
     db.commit()
@@ -1003,6 +1093,7 @@ def update_model_route(route_id: int, request: ModelRouteCreate, db: Session = D
     row.supports_tools = 1 if request.supports_tools else 0
     row.supports_vision = 1 if request.supports_vision else 0
     row.supports_thinking = 1 if request.supports_thinking else 0
+    row.context_length = request.context_length
     db.commit()
     db.refresh(row)
     return row

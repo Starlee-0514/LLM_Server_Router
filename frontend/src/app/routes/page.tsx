@@ -205,6 +205,7 @@ export default function RoutesPage() {
       supports_tools: first.supports_tools,
       supports_vision: first.supports_vision,
       supports_thinking: first.supports_thinking,
+      context_length: first.context_length,
     };
   }, [selectedRoutes]);
 
@@ -270,6 +271,7 @@ export default function RoutesPage() {
     supports_tools: item.supports_tools,
     supports_vision: item.supports_vision,
     supports_thinking: item.supports_thinking,
+    context_length: item.context_length,
   });
 
   const handleInlineUpdate = async (item: ModelRouteItem, changes: Partial<ModelRoutePayload>) => {
@@ -347,6 +349,7 @@ export default function RoutesPage() {
         supports_tools: selectedGroupInfo?.supports_tools,
         supports_vision: selectedGroupInfo?.supports_vision,
         supports_thinking: selectedGroupInfo?.supports_thinking,
+        context_length: selectedGroupInfo?.context_length,
       });
       setNewPairing(null);
       await refresh();
@@ -411,6 +414,18 @@ export default function RoutesPage() {
       toUpdate.map((item) => ({
         id: item.id,
         payload: { ...payloadFromItem(item), [field]: value },
+      })),
+    );
+  };
+
+  // Update context_length for all pairings in group
+  const handleContextLengthUpdate = async (value: number | null) => {
+    if (!selectedRouteName) return;
+    const toUpdate = routes.filter((r) => r.route_name === selectedRouteName);
+    await batchUpdateRoutes(
+      toUpdate.map((item) => ({
+        id: item.id,
+        payload: { ...payloadFromItem(item), context_length: value },
       })),
     );
   };
@@ -611,6 +626,11 @@ export default function RoutesPage() {
                               think
                             </Badge>
                           )}
+                          {items[0]?.context_length && (
+                            <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 bg-emerald-500/10 text-emerald-300 border-emerald-400/30 font-mono">
+                              {items[0].context_length >= 1024 ? `${Math.round(items[0].context_length / 1024)}k` : items[0].context_length}
+                            </Badge>
+                          )}
                         </div>
                       </button>
                     );
@@ -776,6 +796,21 @@ export default function RoutesPage() {
                             className="rounded"
                           />
                           <span>🧠 Thinking</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground select-none ml-auto">
+                          <span>📏 Context</span>
+                          <input
+                            type="number"
+                            min={0}
+                            step={1024}
+                            placeholder="e.g. 131072"
+                            value={selectedGroupInfo?.context_length ?? ""}
+                            onChange={(e) => {
+                              const val = e.target.value.trim();
+                              handleContextLengthUpdate(val ? parseInt(val, 10) : null);
+                            }}
+                            className="h-6 w-24 rounded border border-input bg-background px-1.5 text-[11px] font-mono outline-none focus:border-ring tabular-nums"
+                          />
                         </label>
                       </div>
                     </div>
