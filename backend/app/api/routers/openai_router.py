@@ -627,36 +627,46 @@ async def _proxy_gemini_cloudcode(
 
     # ==================================================================
     # STREAMING PATH — true chunk-by-chunk SSE translation
+    #
+    # Pi-agent observation: Gemini Cloud Code sometimes returns HTTP 200
+    # but the SSE stream is completely empty (0 completion tokens).  This
+    # is especially common with large prompts (skills, long context).  Pi
+    # agent retries up to MAX_EMPTY_STREAM_RETRIES times before giving up.
+    # We replicate the same behaviour here.
     # ==================================================================
+    _MAX_EMPTY_STREAM_RETRIES = 2
+    _EMPTY_STREAM_BASE_DELAY_MS = 500  # ms, doubles each attempt
+
     if is_streaming:
-        response, err = await _make_request_with_retry(stream=True)
-        if response is None:
-            if isinstance(err, dict):
-                return JSONResponse(status_code=502, content=err)
-            return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+        # We may need multiple attempts if Gemini returns empty streams.
+        # Because we can only start yielding SSE data to the client once,
+        # we must collect + retry *before* entering the generator.
+        collected_lines: list[str] = []  # raw SSE "data: ..." lines with content
+        final_usage: dict = {}
+        final_finish_reason = "stop"
 
-        # Closure vars for post-stream logging
-        _t0 = t0
-        _body = body
-        _usage: dict = {}
-        _finish_reason = "stop"
-        _chunk_id = f"chatcmpl-gemini-{int(time.time())}"
-        _created = int(time.time())
+        for empty_attempt in range(_MAX_EMPTY_STREAM_RETRIES + 1):
+            if empty_attempt > 0:
+                backoff_s = (_EMPTY_STREAM_BASE_DELAY_MS / 1000.0) * (2 ** (empty_attempt - 1))
+                logger.warning(
+                    "[Gemini] Empty stream on attempt %d, retrying in %.1fs",
+                    empty_attempt, backoff_s,
+                )
+                await asyncio.sleep(backoff_s)
 
-        async def generate_stream():
-            nonlocal _finish_reason
+            response, err = await _make_request_with_retry(stream=True)
+            if response is None:
+                if isinstance(err, dict):
+                    return JSONResponse(status_code=502, content=err)
+                return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+
+            # Consume the SSE stream and check if it has actual content
+            has_content = False
+            collected_lines = []
+            final_usage = {}
+            final_finish_reason = "stop"
+
             try:
-                # Role header chunk
-                role_chunk = {
-                    "id": _chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": _created,
-                    "model": model_name,
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}],
-                }
-                yield f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8")
-
-                buffer = ""
                 async for raw_line in response.aiter_lines():
                     line = raw_line.strip()
                     if not line.startswith("data:"):
@@ -676,28 +686,63 @@ async def _proxy_gemini_cloudcode(
                         for p in parts:
                             text = p.get("text")
                             if text:
-                                delta_chunk = {
-                                    "id": _chunk_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": _created,
-                                    "model": model_name,
-                                    "choices": [{"index": 0, "delta": {"content": text}}],
-                                }
-                                yield f"data: {json.dumps(delta_chunk)}\n\n".encode("utf-8")
+                                has_content = True
+                                collected_lines.append(text)
                         fr = cand.get("finishReason", "")
                         if fr:
                             if fr == "MAX_TOKENS":
-                                _finish_reason = "length"
+                                final_finish_reason = "length"
                             elif fr == "SAFETY":
-                                _finish_reason = "content_filter"
+                                final_finish_reason = "content_filter"
                             else:
-                                _finish_reason = "stop"
+                                final_finish_reason = "stop"
 
                     um = resp_data.get("usageMetadata")
                     if um:
-                        _usage["prompt_tokens"] = int(um.get("promptTokenCount", 0))
-                        _usage["completion_tokens"] = int(um.get("candidatesTokenCount", 0))
-                        _usage["total_tokens"] = int(um.get("totalTokenCount", 0))
+                        final_usage["prompt_tokens"] = int(um.get("promptTokenCount", 0))
+                        final_usage["completion_tokens"] = int(um.get("candidatesTokenCount", 0))
+                        final_usage["total_tokens"] = int(um.get("totalTokenCount", 0))
+            finally:
+                await response.aclose()
+
+            if has_content:
+                break  # Got real content, stop retrying
+
+        if not collected_lines:
+            logger.warning("[Gemini] Empty response after %d attempts", _MAX_EMPTY_STREAM_RETRIES + 1)
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": "Gemini Cloud Code returned an empty response after retries"}},
+            )
+
+        # Now yield the collected content as OpenAI SSE chunks to the client
+        _t0 = t0
+        _body = body
+        _chunk_id = f"chatcmpl-gemini-{int(time.time())}"
+        _created = int(time.time())
+
+        async def generate_stream():
+            try:
+                # Role header chunk
+                role_chunk = {
+                    "id": _chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": _created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}],
+                }
+                yield f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8")
+
+                # Yield each collected text part
+                for text in collected_lines:
+                    delta_chunk = {
+                        "id": _chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": _created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"content": text}}],
+                    }
+                    yield f"data: {json.dumps(delta_chunk)}\n\n".encode("utf-8")
 
                 # Finish reason chunk
                 stop_chunk = {
@@ -705,34 +750,32 @@ async def _proxy_gemini_cloudcode(
                     "object": "chat.completion.chunk",
                     "created": _created,
                     "model": model_name,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": _finish_reason}],
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": final_finish_reason}],
                 }
                 yield f"data: {json.dumps(stop_chunk)}\n\n".encode("utf-8")
 
                 # Usage chunk
-                if _usage:
+                if final_usage:
                     usage_chunk = {
                         "id": _chunk_id,
                         "object": "chat.completion.chunk",
                         "created": _created,
                         "model": model_name,
                         "choices": [],
-                        "usage": _usage,
+                        "usage": final_usage,
                     }
                     yield f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
 
                 yield b"data: [DONE]\n\n"
             finally:
-                await response.aclose()
                 # Record completion log after stream ends
                 elapsed = time.time() - _t0
-                completion_tokens = _usage.get("completion_tokens", 0)
                 try:
                     from backend.app.database import SessionLocal as _SessionLocal
                     new_db = _SessionLocal()
                     try:
                         openai_resp_for_log = {
-                            "usage": _usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                            "usage": final_usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                         }
                         _log_completion_usage(
                             _body, openai_resp_for_log, target_url,
@@ -747,18 +790,41 @@ async def _proxy_gemini_cloudcode(
 
     # ==================================================================
     # NON-STREAMING PATH — collect full response then return JSON
+    # Same empty-stream retry logic as streaming path.
     # ==================================================================
-    response, err = await _make_request_with_retry(stream=False)
-    if response is None:
-        if isinstance(err, dict):
-            return JSONResponse(status_code=502, content=err)
-        return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+    for empty_attempt in range(_MAX_EMPTY_STREAM_RETRIES + 1):
+        if empty_attempt > 0:
+            backoff_s = (_EMPTY_STREAM_BASE_DELAY_MS / 1000.0) * (2 ** (empty_attempt - 1))
+            logger.warning(
+                "[Gemini] Empty response on attempt %d (non-stream), retrying in %.1fs",
+                empty_attempt, backoff_s,
+            )
+            await asyncio.sleep(backoff_s)
 
-    # Parse SSE stream into a single aggregated response
-    gemini_resp = _parse_gemini_sse_response(response.text)
-    openai_resp = _convert_gemini_to_openai(gemini_resp, model_name)
+        response, err = await _make_request_with_retry(stream=False)
+        if response is None:
+            if isinstance(err, dict):
+                return JSONResponse(status_code=502, content=err)
+            return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+
+        # Parse SSE stream into a single aggregated response
+        gemini_resp = _parse_gemini_sse_response(response.text)
+        openai_resp = _convert_gemini_to_openai(gemini_resp, model_name)
+
+        # Check for empty response
+        content_text = openai_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if content_text:
+            break  # Got real content
+
     elapsed = time.time() - t0
     _log_completion_usage(body, openai_resp, target_url, db=db, elapsed=elapsed)
+
+    if not content_text:
+        logger.warning("[Gemini] Empty response after %d attempts (non-stream)", _MAX_EMPTY_STREAM_RETRIES + 1)
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": "Gemini Cloud Code returned an empty response after retries"}},
+        )
 
     return JSONResponse(status_code=200, content=openai_resp)
 
