@@ -16,6 +16,7 @@ export const sidebarNavItems = [
   { href: "/mesh", label: "Mesh", icon: "⛓" },
   { href: "/lmstudio", label: "Local Frameworks", icon: "◐" },
   { href: "/ollama-compat", label: "Ollama Compat", icon: "🦙" },
+  { href: "/terminal", label: "Terminal", icon: "⌥" },
   { href: "/reports", label: "Reports", icon: "⚑" },
   { href: "/dev", label: "Dev", icon: "⌘" },
   { href: "/settings", label: "Settings", icon: "⚙" },
