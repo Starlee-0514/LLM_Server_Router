@@ -37,4 +37,3 @@ LLM Server Router is a high-performance local LLM routing system optimized for A
 
 # Inbox:
 > must change this part and apply into current file
-> 1. chack the file ./bug_reports, if theres files not solved, check if its solved, and move the solved to solved folder, solve the unsolved requests.
