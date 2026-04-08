@@ -18,6 +18,7 @@ venv/
 # Database
 *.db
 *.db-shm
+*.db.*
 
 # Logs
 logs/
