@@ -18,6 +18,7 @@ export const sidebarNavItems = [
   { href: "/ollama-compat", label: "Ollama Compat", icon: "🦙" },
   { href: "/terminal", label: "Terminal", icon: "⌥" },
   { href: "/reports", label: "Reports", icon: "⚑" },
+  { href: "/config-export", label: "Config Export", icon: "⎘" },
   { href: "/dev", label: "Dev", icon: "⌘" },
   { href: "/settings", label: "Settings", icon: "⚙" },
 ];

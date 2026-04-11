@@ -31,8 +31,11 @@ def _base_with_default_v1(base_url: str) -> tuple[str, bool]:
     lower = base.lower()
     if lower.endswith("/v1") or lower.endswith("/api/v1") or lower.endswith("/v1beta/openai"):
         return base, True
-    # GitHub Copilot API: no /v1 prefix, it's just /chat/completions
+    # GitHub Copilot API: no /v1 prefix
     if "githubcopilot.com" in lower:
+        return base, True
+    # Vertex AI Express OpenAI-compat endpoint ends in /openapi
+    if lower.endswith("/openapi") or "aiplatform.googleapis.com" in lower:
         return base, True
     return base, False
 

@@ -18,6 +18,12 @@ from backend.app.api.routers.provider_routes import (
     _is_github_models_provider,
     _ensure_fresh_github_models_token,
     COPILOT_STATIC_HEADERS,
+    ANTIGRAVITY_DEFAULT_MODELS,
+    VERTEX_DEFAULT_MODELS,
+    _mint_vertex_access_token,
+    _AG_CLIENT_ID,
+    _AG_CLIENT_SECRET,
+    _AG_DEFAULT_PROJECT,
 )
 from backend.app.database import get_db
 from backend.app.models import ProviderEndpoint, ModelRoute, MeshWorker, VirtualModel
@@ -300,6 +306,58 @@ def _is_gemini_cloudcode_provider(provider: ProviderEndpoint) -> bool:
     if name in {"google_gemini_cli", "google-gemini-cli", "gemini-cli"}:
         return True
     return False
+
+
+def _is_antigravity_provider(provider: ProviderEndpoint) -> bool:
+    """Check if a provider is Google Antigravity (sandbox endpoint)."""
+    if provider.provider_type == "google_antigravity":
+        return True
+    base = (provider.base_url or "").lower()
+    if "daily-cloudcode-pa.sandbox.googleapis.com" in base:
+        return True
+    name = (provider.name or "").lower()
+    if name.startswith("google antigravity") or name.startswith("google_antigravity"):
+        return True
+    return False
+
+
+def _is_vertex_provider(provider: ProviderEndpoint) -> bool:
+    """Check if a provider is Google Vertex AI (service account auth)."""
+    if provider.provider_type == "google_vertex":
+        return True
+    base = (provider.base_url or "").lower()
+    if "aiplatform.googleapis.com" in base:
+        return True
+    return False
+
+
+async def _build_vertex_headers(provider: ProviderEndpoint, db: Session) -> dict[str, str]:
+    """Return Authorization headers for Vertex AI, auto-refreshing the SA token when expired."""
+    api_key = provider.api_key or ""
+    try:
+        token_data = json.loads(api_key)
+    except (json.JSONDecodeError, TypeError):
+        return {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+
+    access_token = token_data.get("access_token", "")
+    expires_at = token_data.get("expires_at", 0)
+    sa_json = token_data.get("service_account_json")
+
+    if (not expires_at or time.time() >= expires_at) and sa_json:
+        try:
+            access_token, new_exp = await _mint_vertex_access_token(sa_json)
+            token_data["access_token"] = access_token
+            token_data["expires_at"] = new_exp
+            provider.api_key = json.dumps(token_data)
+            db.commit()
+            logger.info("Vertex AI token refreshed for provider '%s'", provider.name)
+        except Exception as exc:
+            logger.warning("Vertex token refresh failed for '%s': %s", provider.name, exc)
+
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}",
+    }
 
 
 def _is_lmstudio_provider(provider: ProviderEndpoint) -> bool:
@@ -836,6 +894,306 @@ async def _proxy_gemini_cloudcode(
     return JSONResponse(status_code=200, content=openai_resp)
 
 
+_ANTIGRAVITY_VERSION = "1.18.4"
+_ANTIGRAVITY_ENDPOINT_FALLBACKS = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    "https://autopush-cloudcode-pa.sandbox.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
+]
+
+
+async def _build_antigravity_headers(provider: ProviderEndpoint, db: Session) -> tuple[dict[str, str], str, str]:
+    """Build headers for Antigravity and return (headers, access_token, project_id).
+
+    Auto-refreshes the token using the AG hardcoded credentials.
+    """
+    api_key = provider.api_key or ""
+    try:
+        token_data = json.loads(api_key)
+    except (json.JSONDecodeError, TypeError):
+        return {}, "", ""
+
+    access_token = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+    project_id = token_data.get("project_id", _AG_DEFAULT_PROJECT)
+    expires_at = token_data.get("expires_at", 0)
+
+    # Refresh if expired
+    if (not expires_at or time.time() >= expires_at) and refresh_token:
+        ag_cid = token_data.get("ag_client_id", _AG_CLIENT_ID)
+        ag_csec = token_data.get("ag_client_secret", _AG_CLIENT_SECRET)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "client_id": ag_cid,
+                        "client_secret": ag_csec,
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                    },
+                )
+            if resp.status_code == 200:
+                payload = resp.json()
+                new_access = payload.get("access_token", "")
+                if new_access:
+                    access_token = new_access
+                    token_data["access_token"] = new_access
+                    new_exp = int(payload.get("expires_in", 3600))
+                    token_data["expires_at"] = time.time() + new_exp - 300
+                    if payload.get("refresh_token"):
+                        token_data["refresh_token"] = payload["refresh_token"]
+                    provider.api_key = json.dumps(token_data)
+                    db.commit()
+                    logger.info("Antigravity OAuth token refreshed")
+        except Exception as e:
+            logger.warning("Antigravity token refresh failed: %s", e)
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": f"antigravity/{_ANTIGRAVITY_VERSION} linux/x86_64",
+    }
+    return headers, access_token, project_id
+
+
+async def _proxy_antigravity(
+    provider: ProviderEndpoint, db: Session, body: dict
+) -> JSONResponse:
+    """Proxy an OpenAI-format request through Antigravity (sandbox Cloud Code Assist)."""
+    import asyncio
+
+    t0 = time.time()
+    model_name = body.get("model", "")
+    messages = body.get("messages", [])
+    max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 8192
+    max_tokens = min(int(max_tokens), 65536)
+    temperature = body.get("temperature")
+    is_streaming = body.get("stream", False)
+
+    req_headers, access_token, project_id = await _build_antigravity_headers(provider, db)
+    if not access_token:
+        return JSONResponse(status_code=401, content={"error": {"message": "No access token available for Antigravity"}})
+
+    # Convert messages
+    system_prompt, contents = _convert_openai_messages_to_gemini(messages)
+
+    # Build native Gemini request
+    generation_config: dict = {}
+    if max_tokens:
+        generation_config["maxOutputTokens"] = int(max_tokens)
+    if temperature is not None:
+        generation_config["temperature"] = temperature
+
+    gemini_request: dict = {"contents": contents}
+    if system_prompt:
+        gemini_request["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+    if generation_config:
+        gemini_request["generationConfig"] = generation_config
+
+    gemini_body: dict = {
+        "model": model_name,
+        "request": gemini_request,
+        "requestType": "agent",
+        "userAgent": "antigravity",
+        "requestId": f"agent-{int(time.time())}-{model_name}",
+    }
+    if project_id:
+        gemini_body["project"] = project_id
+
+    # Use fallback endpoints
+    base_url = (provider.base_url or "").rstrip("/")
+    endpoints = [base_url] if base_url else _ANTIGRAVITY_ENDPOINT_FALLBACKS
+
+    _MAX_RETRIES = 3
+    _MAX_RETRY_WAIT = 120
+
+    async def _make_ag_request(*, stream: bool):
+        last_err = None
+        ep_idx = 0
+        for attempt in range(_MAX_RETRIES + 1):
+            ep = endpoints[ep_idx] if ep_idx < len(endpoints) else endpoints[-1]
+            target_url = f"{ep}/v1internal:streamGenerateContent?alt=sse"
+            try:
+                if stream:
+                    req = http_client.build_request(
+                        "POST", target_url, headers=req_headers, json=gemini_body,
+                        timeout=httpx.Timeout(connect=15.0, read=180.0, write=30.0, pool=5.0),
+                    )
+                    resp = await http_client.send(req, stream=True)
+                else:
+                    resp = await http_client.post(
+                        target_url, headers=req_headers, json=gemini_body, timeout=180.0,
+                    )
+            except httpx.RequestError as e:
+                if attempt < _MAX_RETRIES:
+                    await asyncio.sleep(min(2 ** attempt * 2, _MAX_RETRY_WAIT))
+                    continue
+                return None, f"Failed to reach Antigravity: {e}"
+
+            if (resp.status_code in (403, 404)) and ep_idx < len(endpoints) - 1:
+                if stream:
+                    await resp.aread()
+                    await resp.aclose()
+                ep_idx += 1
+                continue
+
+            if resp.status_code == 429 and attempt < _MAX_RETRIES:
+                if stream:
+                    err_text = (await resp.aread()).decode(errors="replace")
+                    await resp.aclose()
+                else:
+                    err_text = resp.text
+                delay = _extract_gemini_retry_delay(err_text, resp.headers) or 2 ** attempt * 2
+                delay = min(delay, _MAX_RETRY_WAIT)
+                logger.warning("Antigravity 429, retry in %.1fs", delay)
+                await asyncio.sleep(delay)
+                if ep_idx < len(endpoints) - 1:
+                    ep_idx += 1
+                continue
+
+            if resp.status_code in (500, 502, 503, 504) and attempt < _MAX_RETRIES:
+                if stream:
+                    await resp.aread()
+                    await resp.aclose()
+                await asyncio.sleep(min(2 ** attempt * 2, _MAX_RETRY_WAIT))
+                continue
+
+            if resp.status_code != 200:
+                if stream:
+                    err = (await resp.aread()).decode(errors="replace")
+                    await resp.aclose()
+                else:
+                    err = resp.text
+                try:
+                    err = json.loads(err)
+                except Exception:
+                    err = {"error": {"message": err[:1000]}}
+                return None, err
+
+            return resp, None
+        return None, {"error": {"message": "Antigravity max retries exceeded"}, "_status": 429}
+
+    # Reuse the Gemini SSE parsing logic from _proxy_gemini_cloudcode
+    _MAX_EMPTY = 2
+    _EMPTY_DELAY_MS = 500
+
+    if is_streaming:
+        collected_lines: list[str] = []
+        final_usage: dict = {}
+        final_finish = "stop"
+
+        for ea in range(_MAX_EMPTY + 1):
+            if ea > 0:
+                await asyncio.sleep((_EMPTY_DELAY_MS / 1000.0) * (2 ** (ea - 1)))
+            response, err = await _make_ag_request(stream=True)
+            if response is None:
+                if isinstance(err, dict):
+                    st = err.pop("_status", 502)
+                    return JSONResponse(status_code=st, content=err)
+                return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+
+            has_content = False
+            collected_lines = []
+            final_usage = {}
+            final_finish = "stop"
+            try:
+                async for raw_line in response.aiter_lines():
+                    line = raw_line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload_str = line[len("data:"):].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    resp_data = chunk.get("response", chunk)
+                    candidates = resp_data.get("candidates", [])
+                    for cand in candidates:
+                        parts = cand.get("content", {}).get("parts", [])
+                        for p in parts:
+                            text = p.get("text")
+                            if text:
+                                has_content = True
+                                collected_lines.append(text)
+                        fr = cand.get("finishReason", "")
+                        if fr == "MAX_TOKENS":
+                            final_finish = "length"
+                        elif fr == "SAFETY":
+                            final_finish = "content_filter"
+                    um = resp_data.get("usageMetadata")
+                    if um:
+                        final_usage = {
+                            "prompt_tokens": int(um.get("promptTokenCount", 0)),
+                            "completion_tokens": int(um.get("candidatesTokenCount", 0)),
+                            "total_tokens": int(um.get("totalTokenCount", 0)),
+                        }
+            finally:
+                await response.aclose()
+            if has_content:
+                break
+
+        if not collected_lines:
+            return JSONResponse(status_code=502, content={"error": {"message": "Antigravity returned empty response after retries"}})
+
+        _chunk_id = f"chatcmpl-antigravity-{int(time.time())}"
+        _created = int(time.time())
+        _t0 = t0
+        _body = body
+
+        async def ag_generate_stream():
+            try:
+                role_chunk = {"id": _chunk_id, "object": "chat.completion.chunk", "created": _created, "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}
+                yield f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8")
+                for text in collected_lines:
+                    dc = {"id": _chunk_id, "object": "chat.completion.chunk", "created": _created, "model": model_name, "choices": [{"index": 0, "delta": {"content": text}}]}
+                    yield f"data: {json.dumps(dc)}\n\n".encode("utf-8")
+                sc = {"id": _chunk_id, "object": "chat.completion.chunk", "created": _created, "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": final_finish}]}
+                yield f"data: {json.dumps(sc)}\n\n".encode("utf-8")
+                if final_usage:
+                    uc = {"id": _chunk_id, "object": "chat.completion.chunk", "created": _created, "model": model_name, "choices": [], "usage": final_usage}
+                    yield f"data: {json.dumps(uc)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+            finally:
+                elapsed = time.time() - _t0
+                try:
+                    from backend.app.database import SessionLocal as _SL
+                    ndb = _SL()
+                    try:
+                        _log_completion_usage(_body, {"usage": final_usage or {}}, "antigravity", db=ndb, elapsed=elapsed)
+                    finally:
+                        ndb.close()
+                except Exception:
+                    pass
+
+        return StreamingResponse(ag_generate_stream(), media_type="text/event-stream")
+
+    # Non-streaming
+    for ea in range(_MAX_EMPTY + 1):
+        if ea > 0:
+            await asyncio.sleep((_EMPTY_DELAY_MS / 1000.0) * (2 ** (ea - 1)))
+        response, err = await _make_ag_request(stream=False)
+        if response is None:
+            if isinstance(err, dict):
+                st = err.pop("_status", 502)
+                return JSONResponse(status_code=st, content=err)
+            return JSONResponse(status_code=502, content={"error": {"message": str(err)}})
+        gemini_resp = _parse_gemini_sse_response(response.text)
+        openai_resp = _convert_gemini_to_openai(gemini_resp, model_name)
+        content_text = openai_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if content_text:
+            break
+
+    elapsed = time.time() - t0
+    _log_completion_usage(body, openai_resp, "antigravity", db=db, elapsed=elapsed)
+    if not content_text:
+        return JSONResponse(status_code=502, content={"error": {"message": "Antigravity returned empty response"}})
+    return JSONResponse(status_code=200, content=openai_resp)
+
+
 def _provider_headers(provider: ProviderEndpoint) -> dict[str, str]:
     headers = build_provider_headers(provider.api_key or "", provider.extra_headers or "")
     return headers
@@ -866,7 +1224,13 @@ async def _build_oauth_provider_headers(provider: ProviderEndpoint, db: Session)
     if needs_refresh and refresh_token:
         try:
             from backend.app.api.routers.provider_routes import _get_google_creds
-            client_id, client_secret = _get_google_creds()
+            # Antigravity uses its own credentials
+            is_ag = provider.provider_type == "google_antigravity" or token_data.get("ag_client_id")
+            if is_ag:
+                client_id = token_data.get("ag_client_id", _AG_CLIENT_ID)
+                client_secret = token_data.get("ag_client_secret", _AG_CLIENT_SECRET)
+            else:
+                client_id, client_secret = _get_google_creds()
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
                     "https://oauth2.googleapis.com/token",
@@ -977,6 +1341,8 @@ def _find_provider_by_known_models(db: Session, model_name: str) -> ProviderEndp
         GITHUB_COPILOT_DEFAULT_MODELS,
         GEMINI_CLI_DEFAULT_MODELS,
         GITHUB_MODELS_DEFAULT_MODELS,
+        ANTIGRAVITY_DEFAULT_MODELS,
+        VERTEX_DEFAULT_MODELS,
     )
 
     providers = (
@@ -988,7 +1354,7 @@ def _find_provider_by_known_models(db: Session, model_name: str) -> ProviderEndp
         base_url = (prov.base_url or "").rstrip("/").lower()
         prov_name = (prov.name or "").strip().lower()
 
-        catalog: list[dict[str, str]] = []
+        catalog: list[dict[str, any]] = []
         # Check by name first (more specific), then by base_url
         if prov_name in {"github_models", "github-models"}:
             catalog = GITHUB_MODELS_DEFAULT_MODELS
@@ -998,9 +1364,15 @@ def _find_provider_by_known_models(db: Session, model_name: str) -> ProviderEndp
             catalog = GEMINI_CLI_DEFAULT_MODELS
         elif "generativelanguage.googleapis.com" in base_url or prov_name in {"google_gemini_openai"}:
             catalog = GEMINI_CLI_DEFAULT_MODELS
+        elif prov.provider_type == "google_antigravity" or "daily-cloudcode-pa.sandbox.googleapis.com" in base_url or prov_name.startswith("google antigravity") or prov_name.startswith("google_antigravity"):
+            catalog = ANTIGRAVITY_DEFAULT_MODELS
+        elif prov.provider_type == "google_vertex" or "aiplatform.googleapis.com" in base_url:
+            catalog = VERTEX_DEFAULT_MODELS
 
         for item in catalog:
-            if item["id"] == model_name:
+            if item.get("id") == model_name:
+                if item.get("context_length"):
+                    prov.context_length = item["context_length"]
                 return prov
 
     return None
@@ -1169,7 +1541,7 @@ async def list_models(db: Session = Depends(get_db)):
             "owned_by": "provider-route",
         }
         if rule.context_length:
-            model_entry["context_length"] = rule.context_length
+            model_entry["context_window"] = rule.context_length
         data.append(model_entry)
 
     # Virtual model aliases (stable logical IDs)
@@ -1286,6 +1658,20 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
                 conversation_id=conversation_id,
             )
 
+        elif provider.provider_type == "google_antigravity":
+            request_stats.increment_remote()
+            result = await _proxy_antigravity(provider, db, route_body)
+
+        elif provider.provider_type == "google_vertex":
+            request_stats.increment_remote()
+            fwd_body = translate_tools(route_body, "openai_compatible")
+            headers = await _build_vertex_headers(provider, db)
+            result = await _proxy_openai_compatible(
+                build_provider_chat_url(provider.base_url), headers, fwd_body, db=db,
+                model_resolved=routed_model, provider_name=provider.name,
+                provider_type=provider.provider_type, conversation_id=conversation_id,
+            )
+
         elif provider.provider_type == "openai_compatible":
             if not provider.base_url:
                 raise HTTPException(status_code=500, detail=f"Provider '{provider.name}' base_url is empty")
@@ -1294,8 +1680,12 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             # Translate tools for the provider if needed
             fwd_body = translate_tools(route_body, provider.provider_type)
 
+            # Antigravity: use sandbox endpoint with Antigravity headers (legacy — provider_type == openai_compatible but detected by URL/name)
+            if _is_antigravity_provider(provider):
+                result = await _proxy_antigravity(provider, db, route_body)
+
             # Gemini Cloud Code: use native API translation
-            if _is_gemini_cloudcode_provider(provider):
+            elif _is_gemini_cloudcode_provider(provider):
                 result = await _proxy_gemini_cloudcode(provider, db, route_body)
 
             elif _is_copilot_provider(provider):
@@ -1469,6 +1859,20 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
     if provider:
         request_stats.increment_remote()
         fwd_body_cat = translate_tools(body, provider.provider_type)
+
+        # Antigravity: use sandbox endpoint
+        if _is_antigravity_provider(provider):
+            return await _proxy_antigravity(provider, db, body)
+
+        # Vertex AI: service-account token auth
+        if _is_vertex_provider(provider):
+            headers = await _build_vertex_headers(provider, db)
+            fwd_body_cat = translate_tools(body, "openai_compatible")
+            return await _proxy_openai_compatible(
+                build_provider_chat_url(provider.base_url or ""), headers, fwd_body_cat, db=db,
+                model_resolved=model_name, provider_name=provider.name,
+                provider_type=provider.provider_type, conversation_id=conversation_id,
+            )
 
         # Gemini Cloud Code: use native API translation
         if _is_gemini_cloudcode_provider(provider):

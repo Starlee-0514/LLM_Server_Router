@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.database import init_db
-from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes, dev_routes, virtual_model_routes, lmstudio_routes, ollama_routes, ollama_compat_router, inference_storage_routes, terminal_routes
+from backend.app.api.routers import model_routes, settings_routes, process_routes, benchmark_routes, openai_router, model_group_routes, metrics_routes, provider_routes, report_routes, runtime_routes, dev_routes, virtual_model_routes, lmstudio_routes, ollama_routes, ollama_compat_router, inference_storage_routes, terminal_routes, config_export_routes
 from backend.app.core.dev_logs import install_dev_log_handler
 from backend.app.core.process_manager import llama_process_manager
 from backend.app.database import SessionLocal
@@ -87,6 +87,7 @@ app.include_router(virtual_model_routes.router)
 app.include_router(lmstudio_routes.router)
 app.include_router(ollama_routes.router)
 app.include_router(terminal_routes.router)
+app.include_router(config_export_routes.router)
 
 
 @app.get("/")

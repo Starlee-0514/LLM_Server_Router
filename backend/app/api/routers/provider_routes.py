@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
@@ -269,6 +270,22 @@ COMMON_PROVIDER_TEMPLATES: dict[str, dict] = {
         "default_extra_headers": "",
         "oauth_method": "pkce",
     },
+    "google_antigravity": {
+        "label": "Google Antigravity (Gemini 3 / Claude / GPT-OSS)",
+        "provider_type": "google_antigravity",
+        "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+        "auth_hint": "Uses Google OAuth with Antigravity credentials — free with any Google account",
+        "default_extra_headers": "",
+        "oauth_method": "pkce",
+    },
+    "google_vertex": {
+        "label": "Google Vertex AI (Service Account)",
+        "provider_type": "google_vertex",
+        "base_url": "",   # built dynamically from project_id in SA JSON
+        "auth_hint": "Paste your Service Account JSON key (type=service_account). Project ID and location are read from the key.",
+        "default_extra_headers": "",
+        "oauth_method": "service_account",
+    },
 }
 
 # Copilot-specific headers required for GitHub Copilot API requests
@@ -319,6 +336,30 @@ GEMINI_CLI_DEFAULT_MODELS: list[dict[str, str]] = [
 ]
 
 
+ANTIGRAVITY_DEFAULT_MODELS: list[dict[str, str]] = [
+    {"id": "gemini-3-flash", "name": "Gemini 3 Flash (Antigravity)"},
+    {"id": "gemini-3.1-pro-high", "name": "Gemini 3.1 Pro High (Antigravity)"},
+    {"id": "gemini-3.1-pro-low", "name": "Gemini 3.1 Pro Low (Antigravity)"},
+    {"id": "claude-opus-4-5-thinking", "name": "Claude Opus 4.5 Thinking (Antigravity)"},
+    {"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6 Thinking (Antigravity)"},
+    {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5 (Antigravity)"},
+    {"id": "claude-sonnet-4-5-thinking", "name": "Claude Sonnet 4.5 Thinking (Antigravity)"},
+    {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Antigravity)"},
+    {"id": "gpt-oss-120b-medium", "name": "GPT-OSS 120B Medium (Antigravity)"},
+]
+
+
+# Vertex AI Express — models confirmed working with gen-lang-client-* projects
+# Model IDs include publisher prefix (google/, anthropic/, meta/) as required by the endpoint
+VERTEX_DEFAULT_MODELS: list[dict[str, any]] = [
+    {"id": "google/gemini-2.5-pro", "name": "Gemini 2.5 Pro (Vertex)", "context_length": 8192},
+    {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash (Vertex)", "context_length": 8192},
+    {"id": "google/gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite (Vertex)", "context_length": 8192},
+    {"id": "google/gemini-3-flash-preview", "name": "Gemini 3 Flash Preview (Vertex)", "context_length": 131072},
+    {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro Preview (Vertex)", "context_length": 131072},
+]
+
+
 GITHUB_MODELS_DEFAULT_MODELS: list[dict[str, str]] = [
     {"id": "gpt-4o", "name": "GPT-4o (GitHub Models)"},
     {"id": "gpt-4o-mini", "name": "GPT-4o Mini (GitHub Models)"},
@@ -338,7 +379,7 @@ def _get_default_provider_models(row: ProviderEndpoint) -> list[ProviderModelIte
     base_url = (row.base_url or "").rstrip("/").lower()
     provider_name = (row.name or "").strip().lower()
 
-    defaults: list[dict[str, str]] = []
+    defaults: list[dict[str, any]] = []
     source = ""
     if "api.individual.githubcopilot.com" in base_url or provider_name in {"github_copilot", "github-copilot"}:
         defaults = GITHUB_COPILOT_DEFAULT_MODELS
@@ -352,11 +393,18 @@ def _get_default_provider_models(row: ProviderEndpoint) -> list[ProviderModelIte
     elif "generativelanguage.googleapis.com" in base_url or provider_name in {"google_gemini_openai"}:
         defaults = GEMINI_CLI_DEFAULT_MODELS
         source = "google-gemini-openai"
+    elif row.provider_type == "google_antigravity" or "daily-cloudcode-pa.sandbox.googleapis.com" in base_url or provider_name.startswith("google_antigravity") or provider_name.startswith("google antigravity"):
+        defaults = ANTIGRAVITY_DEFAULT_MODELS
+        source = "google-antigravity"
+    elif row.provider_type == "google_vertex" or "aiplatform.googleapis.com" in base_url:
+        defaults = VERTEX_DEFAULT_MODELS
+        source = "google-vertex"
 
     return [
         ProviderModelItem(
             id=item["id"],
             provider_name=row.name,
+            context_length=item.get("context_length"),
             raw={
                 "id": item["id"],
                 "name": item["name"],
@@ -598,25 +646,160 @@ async def poll_device_code_flow(request: Request, db: Session = Depends(get_db))
 
 
 # ---------------------------------------------------------------------------
+# Antigravity OAuth — hardcoded credentials (same as pi-agent)
+# ---------------------------------------------------------------------------
+import base64 as _b64
+
+_AG_CLIENT_ID = get_google_client_id()
+_AG_CLIENT_SECRET = get_google_client_secret()
+_AG_SCOPES = [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/cclog",
+    "https://www.googleapis.com/auth/experimentsandconfigs",
+]
+_AG_DEFAULT_PROJECT = "rising-fact-p41fc"
+
+async def _discover_antigravity_project(access_token: str) -> str:
+    """Discover or provision Antigravity project (mirrors pi-agent behaviour)."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "google-api-nodejs-client/9.15.1",
+        "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+        "Client-Metadata": json.dumps({
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }),
+    }
+    endpoints = [
+        "https://cloudcode-pa.googleapis.com",
+        "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    ]
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for ep in endpoints:
+            try:
+                resp = await client.post(
+                    f"{ep}/v1internal:loadCodeAssist",
+                    headers=headers,
+                    json={
+                        "metadata": {
+                            "ideType": "IDE_UNSPECIFIED",
+                            "platform": "PLATFORM_UNSPECIFIED",
+                            "pluginType": "GEMINI",
+                        },
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    proj = data.get("cloudaicompanionProject", "")
+                    if isinstance(proj, dict):
+                        proj = proj.get("id", "")
+                    if proj:
+                        return proj
+            except Exception:
+                continue
+    return _AG_DEFAULT_PROJECT
+
+
+# ---------------------------------------------------------------------------
+# Vertex AI — Service Account JWT → access token (no extra deps, uses openssl)
+# ---------------------------------------------------------------------------
+import subprocess as _subprocess
+import tempfile as _tempfile
+
+
+def _vertex_base_url(project_id: str) -> str:
+    """Build the OpenAI-compatible Vertex AI Express endpoint URL."""
+    return f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/global/endpoints/openapi"
+
+
+def _mint_vertex_jwt(sa_json: dict) -> str:
+    """Build a signed RS256 JWT for Google service account token exchange."""
+    import os as _os
+
+    email = sa_json["client_email"]
+    pem = sa_json["private_key"]
+    now = int(time.time())
+
+    def b64url(data: bytes) -> str:
+        return _b64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    payload = b64url(json.dumps({
+        "iss": email,
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+        "aud": "https://oauth2.googleapis.com/token",
+        "iat": now,
+        "exp": now + 3600,
+    }).encode())
+
+    signing_input = f"{header}.{payload}".encode()
+
+    with _tempfile.NamedTemporaryFile(delete=False, suffix=".pem", mode="w") as f:
+        f.write(pem)
+        key_path = f.name
+    try:
+        result = _subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", key_path],
+            input=signing_input, capture_output=True, check=True,
+        )
+        sig = b64url(result.stdout)
+    finally:
+        _os.unlink(key_path)
+
+    return f"{header}.{payload}.{sig}"
+
+
+async def _mint_vertex_access_token(sa_json: dict) -> tuple[str, float]:
+    """Exchange a service account JWT for a Google OAuth access token.
+    Returns (access_token, expires_at_timestamp).
+    """
+    jwt_token = _mint_vertex_jwt(sa_json)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jwt_token,
+            },
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Vertex token mint failed ({resp.status_code}): {resp.text[:300]}")
+    data = resp.json()
+    expires_in = int(data.get("expires_in", 3600))
+    expires_at = time.time() + expires_in - 300  # 5-min buffer
+    return data["access_token"], expires_at
+
+
+# ---------------------------------------------------------------------------
 # Google Gemini — Authorization Code + PKCE  (like pi-mono's google-gemini-cli.ts)
 # ---------------------------------------------------------------------------
 @router.get("/common/oauth/start/{provider_key}")
 def start_common_provider_oauth(provider_key: str, request: Request, name_override: str = ""):
-    """Start Google Gemini OAuth with PKCE. Returns auth_url for the browser."""
-    if provider_key not in ("google_gemini_openai", "google_gemini_cli"):
-        raise HTTPException(status_code=400, detail="Browser-based OAuth is only supported for google_gemini_openai / google_gemini_cli. Use device code flow for github_models.")
+    """Start Google Gemini / Antigravity OAuth with PKCE. Returns auth_url for the browser."""
+    if provider_key not in ("google_gemini_openai", "google_gemini_cli", "google_antigravity"):
+        raise HTTPException(status_code=400, detail="Browser-based OAuth is only supported for google_gemini_openai / google_gemini_cli / google_antigravity. Use device code flow for github_models.")
 
     callback_url = str(request.url_for("common_provider_oauth_callback", provider_key=provider_key))
 
-    client_id, client_secret = _get_google_creds()
-    if not client_id or not client_secret:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET "
-                "in the repo root .env or save google_client_id/google_client_secret in Settings first."
-            ),
-        )
+    # Antigravity uses its own hardcoded credentials (like pi-agent)
+    if provider_key == "google_antigravity":
+        client_id = _AG_CLIENT_ID
+        scopes = " ".join(_AG_SCOPES)
+    else:
+        client_id, client_secret = _get_google_creds()
+        if not client_id or not client_secret:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET "
+                    "in the repo root .env or save google_client_id/google_client_secret in Settings first."
+                ),
+            )
+        scopes = "openid email profile https://www.googleapis.com/auth/cloud-platform"
 
     verifier, challenge = _generate_pkce()
     state = secrets.token_urlsafe(24)
@@ -634,7 +817,7 @@ def start_common_provider_oauth(provider_key: str, request: Request, name_overri
             "client_id": client_id,
             "redirect_uri": callback_url,
             "response_type": "code",
-            "scope": "openid email profile https://www.googleapis.com/auth/cloud-platform",
+            "scope": scopes,
             "access_type": "offline",
             "prompt": "consent select_account",
             "state": state,
@@ -649,7 +832,7 @@ def start_common_provider_oauth(provider_key: str, request: Request, name_overri
 async def common_provider_oauth_callback(
     provider_key: str, code: str = "", state: str = "", error: str = "", db: Session = Depends(get_db)
 ):
-    """OAuth callback for Google Gemini with PKCE verification."""
+    """OAuth callback for Google Gemini / Antigravity with PKCE verification."""
     if error:
         return HTMLResponse(f"<html><body><h3>OAuth failed: {error}</h3></body></html>")
     if not code or not state:
@@ -659,7 +842,7 @@ async def common_provider_oauth_callback(
     if not ctx or ctx.get("provider_key") != provider_key:
         return HTMLResponse("<html><body><h3>OAuth failed: invalid state</h3></body></html>")
 
-    if provider_key not in ("google_gemini_openai", "google_gemini_cli"):
+    if provider_key not in ("google_gemini_openai", "google_gemini_cli", "google_antigravity"):
         return HTMLResponse("<html><body><h3>OAuth callback not supported for this provider</h3></body></html>")
 
     template = COMMON_PROVIDER_TEMPLATES[provider_key]
@@ -667,7 +850,12 @@ async def common_provider_oauth_callback(
     redirect_uri = str(ctx.get("redirect_uri") or "")
     code_verifier = ctx.get("code_verifier", "")
 
-    client_id, client_secret = _get_google_creds()
+    # Antigravity uses its own hardcoded credentials
+    if provider_key == "google_antigravity":
+        client_id = _AG_CLIENT_ID
+        client_secret = _AG_CLIENT_SECRET
+    else:
+        client_id, client_secret = _get_google_creds()
 
     # Exchange authorization code with PKCE verifier
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -706,6 +894,14 @@ async def common_provider_oauth_callback(
     except Exception:
         _provider_logger.warning("Failed to fetch Google userinfo for account naming")
 
+    # For Antigravity: discover project ID
+    project_id = ""
+    if provider_key == "google_antigravity":
+        try:
+            project_id = await _discover_antigravity_project(access_token)
+        except Exception:
+            project_id = _AG_DEFAULT_PROJECT
+
     # Auto-generate provider name from email if no override given
     label = template["label"]
     if not ctx.get("name_override"):
@@ -714,18 +910,24 @@ async def common_provider_oauth_callback(
         # else keep original provider_key as fallback
 
     # Store refresh_token + access_token + expires_at as JSON in api_key
-    token_data = json.dumps({
+    token_data: dict = {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "expires_at": expires_at,
-    })
+    }
+    if provider_key == "google_antigravity":
+        token_data["project_id"] = project_id
+        token_data["ag_client_id"] = _AG_CLIENT_ID
+        token_data["ag_client_secret"] = _AG_CLIENT_SECRET
+
+    stored_key = json.dumps(token_data)
     extra_headers = template["default_extra_headers"]
 
     existing = db.query(ProviderEndpoint).filter(ProviderEndpoint.name == provider_name).first()
     if existing:
         existing.provider_type = template["provider_type"]
         existing.base_url = template["base_url"]
-        existing.api_key = token_data
+        existing.api_key = stored_key
         existing.extra_headers = extra_headers
         existing.enabled = 1
         db.commit()
@@ -734,7 +936,7 @@ async def common_provider_oauth_callback(
             name=provider_name,
             provider_type=template["provider_type"],
             base_url=template["base_url"],
-            api_key=token_data,
+            api_key=stored_key,
             extra_headers=extra_headers,
             enabled=1,
         )
@@ -743,7 +945,7 @@ async def common_provider_oauth_callback(
 
     html = """
     <html><body>
-    <h3>Google Gemini OAuth connected successfully. You can close this window.</h3>
+    <h3>OAuth connected successfully. You can close this window.</h3>
     <script>
       if (window.opener) {
         window.opener.postMessage({ type: 'provider-oauth-success' }, '*');
@@ -785,12 +987,18 @@ async def refresh_provider_token(provider_id: int, db: Session = Depends(get_db)
         db.commit()
         return {"status": "refreshed"}
 
-    # Google OAuth token refresh
+    # Google OAuth token refresh (Gemini CLI + Antigravity)
     refresh_token = token_data.get("refresh_token")
     if not refresh_token:
         raise HTTPException(status_code=400, detail="No refresh token available")
 
-    client_id, client_secret = _get_google_creds()
+    # Antigravity uses its own hardcoded credentials
+    is_antigravity = row.provider_type == "google_antigravity" or token_data.get("ag_client_id")
+    if is_antigravity:
+        client_id = token_data.get("ag_client_id", _AG_CLIENT_ID)
+        client_secret = token_data.get("ag_client_secret", _AG_CLIENT_SECRET)
+    else:
+        client_id, client_secret = _get_google_creds()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -827,6 +1035,107 @@ async def refresh_provider_token(provider_id: int, db: Session = Depends(get_db)
 @router.get("", response_model=list[ProviderEndpointResponse])
 def list_providers(db: Session = Depends(get_db)):
     return db.query(ProviderEndpoint).order_by(ProviderEndpoint.created_at.desc()).all()
+
+
+# ---------------------------------------------------------------------------
+# Vertex AI — Service Account Registration
+# ---------------------------------------------------------------------------
+
+class VertexRegisterRequest(BaseModel):
+    service_account_json: dict          # full SA JSON content
+    name_override: str = ""
+    location: str = "global"            # reserved for future per-location routing
+
+
+@router.post("/vertex/register", response_model=ProviderEndpointResponse, status_code=201)
+async def register_vertex_provider(request: VertexRegisterRequest, db: Session = Depends(get_db)):
+    """Register a Google Vertex AI provider using a Service Account JSON key.
+
+    - Validates the key fields
+    - Mints the first access token (proves the key works)
+    - Builds the OpenAI-compat Vertex Express endpoint URL
+    - Stores everything in ProviderEndpoint
+    """
+    sa = request.service_account_json
+
+    # Basic validation
+    required = {"type", "project_id", "client_email", "private_key"}
+    missing = required - sa.keys()
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Service Account JSON missing fields: {missing}")
+    if sa.get("type") != "service_account":
+        raise HTTPException(status_code=400, detail=f"Expected type=service_account, got: {sa.get('type')}")
+
+    project_id = sa["project_id"]
+
+    # Mint first access token to verify credentials
+    try:
+        access_token, expires_at = await _mint_vertex_access_token(sa)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to mint Vertex access token: {e}")
+
+    base_url = _vertex_base_url(project_id)
+    label = COMMON_PROVIDER_TEMPLATES["google_vertex"]["label"]
+    provider_name = request.name_override.strip() or f"{label} ({sa['client_email'].split('@')[0]})"
+
+    # Store SA JSON + access token together so token can be refreshed without user action
+    token_data = json.dumps({
+        "service_account_json": sa,
+        "access_token": access_token,
+        "expires_at": expires_at,
+        "project_id": project_id,
+    })
+
+    existing = db.query(ProviderEndpoint).filter(ProviderEndpoint.name == provider_name).first()
+    if existing:
+        existing.provider_type = "google_vertex"
+        existing.base_url = base_url
+        existing.api_key = token_data
+        existing.extra_headers = ""
+        existing.enabled = 1
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    row = ProviderEndpoint(
+        name=provider_name,
+        provider_type="google_vertex",
+        base_url=base_url,
+        api_key=token_data,
+        extra_headers="",
+        enabled=1,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.post("/vertex/refresh/{provider_id}", response_model=ProviderEndpointResponse)
+async def refresh_vertex_token(provider_id: int, db: Session = Depends(get_db)):
+    """Manually force-refresh the Vertex AI access token for a provider."""
+    row = db.query(ProviderEndpoint).filter(ProviderEndpoint.id == provider_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    if row.provider_type != "google_vertex":
+        raise HTTPException(status_code=400, detail="Not a Vertex AI provider")
+    try:
+        token_data = json.loads(row.api_key or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid token data")
+    sa = token_data.get("service_account_json")
+    if not sa:
+        raise HTTPException(status_code=400, detail="No service account JSON stored")
+    try:
+        access_token, expires_at = await _mint_vertex_access_token(sa)
+        token_data["access_token"] = access_token
+        token_data["expires_at"] = expires_at
+        row.api_key = json.dumps(token_data)
+        db.commit()
+        db.refresh(row)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Token refresh failed: {e}")
+    return row
 
 
 @router.post("", response_model=ProviderEndpointResponse, status_code=201)

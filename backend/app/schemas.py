@@ -425,4 +425,5 @@ class CommonProviderRegisterRequest(BaseModel):
 class ProviderModelItem(BaseModel):
     id: str
     provider_name: str
+    context_length: int | None = None
     raw: dict = Field(default_factory=dict)

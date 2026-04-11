@@ -57,6 +57,23 @@ def translate_tools_for_anthropic(openai_tools: list[dict]) -> list[dict]:
     return anthropic_tools
 
 
+def translate_tools_for_gemini(openai_tools: list[dict]) -> list[dict]:
+    """Convert OpenAI tools to Gemini native function declarations."""
+    gemini_tools: list[dict] = []
+    for tool in openai_tools:
+        if tool.get("type") != "function":
+            continue
+        func = tool.get("function") or {}
+        gemini_tools.append({
+            "functionDeclarations": [{
+                "name": func.get("name", ""),
+                "description": func.get("description", ""),
+                "parameters": func.get("parameters") or {"type": "object", "properties": {}},
+            }]
+        })
+    return gemini_tools
+
+
 def translate_tools_for_openai_compat(openai_tools: list[dict]) -> list[dict]:
     """Pass-through: OpenAI-compat providers already speak the same format."""
     return openai_tools
@@ -74,6 +91,10 @@ def translate_tools(body: dict, provider_type: str) -> dict:
     if provider_type == "anthropic":
         translated = translate_tools_for_anthropic(tools)
         # Anthropic uses top-level "tools" key (same name, different structure)
+        return {**body, "tools": translated}
+    
+    if provider_type in {"google_vertex", "google_gemini_cli"}:
+        translated = translate_tools_for_gemini(tools)
         return {**body, "tools": translated}
 
     # openai_compatible / local_process / mesh — no translation needed

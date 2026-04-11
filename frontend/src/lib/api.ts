@@ -13,6 +13,7 @@ function getApiBase(): string {
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const base = getApiBase();
   const res = await fetch(`${base}${path}`, {
+    cache: "no-store",
     headers: { "Content-Type": "application/json", ...options?.headers },
     ...options,
   });
@@ -200,7 +201,7 @@ export interface ChatCompletionResponse {
 export interface ProviderEndpoint {
   id: number;
   name: string;
-  provider_type: "openai_compatible" | "anthropic" | "local_process";
+  provider_type: "openai_compatible" | "anthropic" | "local_process" | "google_antigravity" | "google_vertex";
   base_url: string;
   api_key: string;
   extra_headers: string;
@@ -211,7 +212,7 @@ export interface ProviderEndpoint {
 
 export interface ProviderCreatePayload {
   name: string;
-  provider_type: "openai_compatible" | "anthropic" | "local_process";
+  provider_type: "openai_compatible" | "anthropic" | "local_process" | "google_antigravity" | "google_vertex";
   base_url: string;
   api_key: string;
   extra_headers: string;
@@ -235,7 +236,7 @@ export interface CommonProviderTemplate {
   base_url: string;
   auth_hint: string;
   default_extra_headers: string;
-  oauth_method: "api_key" | "device_code" | "pkce";
+  oauth_method: "api_key" | "device_code" | "pkce" | "none" | "service_account";
 }
 
 export interface CommonProviderRegisterPayload {
@@ -625,6 +626,19 @@ export const pollDeviceCodeFlow = (sessionId: string) =>
     method: "POST",
     body: JSON.stringify({ session_id: sessionId }),
   });
+
+export interface VertexRegisterPayload {
+  service_account_json: object;
+  name_override?: string;
+  location?: string;
+}
+export const registerVertexProvider = (payload: VertexRegisterPayload) =>
+  apiFetch<ProviderEndpoint>("/api/providers/vertex/register", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const refreshVertexToken = (providerId: number) =>
+  apiFetch<ProviderEndpoint>(`/api/providers/vertex/refresh/${providerId}`, { method: "POST" });
 export const refreshProviderToken = (providerId: number) =>
   apiFetch<{ status: string }>(`/api/providers/common/oauth/refresh/${providerId}`, {
     method: "POST",
@@ -1139,3 +1153,68 @@ export const deleteTerminalSession = (name: string) =>
   apiFetch<{ ok?: boolean; error?: string; name?: string }>(`/api/terminal/sessions/${encodeURIComponent(name)}`, {
     method: "DELETE",
   });
+
+// ==================
+// Config Export
+// ==================
+export interface ConfigExportTarget {
+  key: string;
+  label: string;
+  description: string;
+  formats: string[];
+  default_path: string;
+}
+
+export interface ConfigExportResult {
+  target: string;
+  format: string;
+  mode: string;          // "full" | "patch"
+  content: string;       // full merged output — what the file will look like
+  patch_entry: string;   // just the new entry (patch mode only)
+  model_count: number;
+  provider_count: number;
+}
+
+export interface ConfigWriteResult {
+  ok: boolean;
+  path: string;
+  message: string;
+}
+
+export interface ConfigCurrentFile {
+  exists: boolean;
+  path: string;
+  content: string;
+}
+
+export const getConfigExportTargets = () =>
+  apiFetch<ConfigExportTarget[]>("/api/config-export/targets");
+
+export const previewConfigExport = (
+  target: string,
+  format: string,
+  mode: string,
+  providerKey: string,
+  routerBaseUrl: string,
+) =>
+  apiFetch<ConfigExportResult>(
+    `/api/config-export/preview?target=${encodeURIComponent(target)}&format=${encodeURIComponent(format)}&mode=${encodeURIComponent(mode)}&provider_key=${encodeURIComponent(providerKey)}&router_base_url=${encodeURIComponent(routerBaseUrl)}`
+  );
+
+export const writeConfigExport = (
+  target: string,
+  format: string,
+  path: string,
+  mode: string,
+  providerKey: string,
+  routerBaseUrl: string,
+) =>
+  apiFetch<ConfigWriteResult>("/api/config-export/write", {
+    method: "POST",
+    body: JSON.stringify({ target, format, path, mode, provider_key: providerKey, router_base_url: routerBaseUrl }),
+  });
+
+export const readCurrentConfigFile = (target: string) =>
+  apiFetch<ConfigCurrentFile>(
+    `/api/config-export/current-file?target=${encodeURIComponent(target)}`
+  );

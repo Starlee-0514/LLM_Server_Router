@@ -155,7 +155,7 @@ class ProviderEndpoint(Base):
 
     @validates("provider_type")
     def validate_provider_type(self, key, value):
-        allowed = {"openai_compatible", "anthropic", "local_process"}
+        allowed = {"openai_compatible", "anthropic", "local_process", "google_antigravity", "google_vertex"}
         if value not in allowed:
             raise ValueError(f"provider_type 必須是 {allowed} 之一，收到: {value!r}")
         return value
