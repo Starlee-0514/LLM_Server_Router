@@ -58,20 +58,37 @@ def translate_tools_for_anthropic(openai_tools: list[dict]) -> list[dict]:
 
 
 def translate_tools_for_gemini(openai_tools: list[dict]) -> list[dict]:
-    """Convert OpenAI tools to Gemini native function declarations."""
-    gemini_tools: list[dict] = []
+    """Convert OpenAI tools to Gemini native function declarations.
+    
+    Gemini expects:
+    {
+      "tools": [{
+        "functionDeclarations": [
+          {"name": ..., "description": ..., "parameters": ..., "thoughtSignature": ...}
+        ]
+      }]
+    }
+    """
+    function_declarations = []
     for tool in openai_tools:
         if tool.get("type") != "function":
             continue
         func = tool.get("function") or {}
-        gemini_tools.append({
-            "functionDeclarations": [{
-                "name": func.get("name", ""),
-                "description": func.get("description", ""),
-                "parameters": func.get("parameters") or {"type": "object", "properties": {}},
-            }]
-        })
-    return gemini_tools
+        declaration = {
+            "name": func.get("name", ""),
+            "description": func.get("description", ""),
+            "parameters": func.get("parameters") or {"type": "object", "properties": {}},
+        }
+        # Add thoughtSignature if provided in the original tool definition
+        # Default to empty string if not provided (required by Gemini 2.5+)
+        if "thoughtSignature" in func:
+            declaration["thoughtSignature"] = func["thoughtSignature"]
+        else:
+            declaration["thoughtSignature"] = ""
+        function_declarations.append(declaration)
+    
+    # Return in the format Gemini expects: array with one object containing functionDeclarations
+    return [{"functionDeclarations": function_declarations}]
 
 
 def translate_tools_for_openai_compat(openai_tools: list[dict]) -> list[dict]:
