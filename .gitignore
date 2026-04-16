@@ -47,3 +47,6 @@ bug_reports/*
 
 # other ref repo
 ref_repo/
+
+# Pi Agent Session History
+.pi/
