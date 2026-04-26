@@ -20,9 +20,12 @@ from backend.app.database import SessionLocal
 from backend.app.models import Setting
 
 # 設定 logging
+# basicConfig 只寫到 console（stderr）供開發時即時查看；
+# DevLogHandler 負責寫入 session log 檔，兩者不重疊，避免重複。
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=None,   # 預設 stderr — 不要改成 FileHandler，由 DevLogHandler 負責檔案
 )
 install_dev_log_handler()
 logger = logging.getLogger(__name__)

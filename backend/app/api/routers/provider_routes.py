@@ -351,12 +351,16 @@ ANTIGRAVITY_DEFAULT_MODELS: list[dict[str, str]] = [
 
 # Vertex AI Express — models confirmed working with gen-lang-client-* projects
 # Model IDs include publisher prefix (google/, anthropic/, meta/) as required by the endpoint
+# location 欄位說明：
+#   "global"      → aiplatform.googleapis.com  (Vertex Express 預設全球端點)
+#   其他 GCP 區域（如 "us-central1"）→ {region}-aiplatform.googleapis.com
+#   若未列入此表則直接使用 provider.base_url
 VERTEX_DEFAULT_MODELS: list[dict[str, any]] = [
-    {"id": "google/gemini-2.5-pro", "name": "Gemini 2.5 Pro (Vertex)", "context_length": 8192},
-    {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash (Vertex)", "context_length": 8192},
-    {"id": "google/gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite (Vertex)", "context_length": 8192},
-    {"id": "google/gemini-3-flash-preview", "name": "Gemini 3 Flash Preview (Vertex)", "context_length": 131072},
-    {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro Preview (Vertex)", "context_length": 131072},
+    {"id": "google/gemini-2.5-pro",          "name": "Gemini 2.5 Pro (Vertex)",          "context_length": 8192,   "location": "global"},
+    {"id": "google/gemini-2.5-flash",        "name": "Gemini 2.5 Flash (Vertex)",        "context_length": 8192,   "location": "global"},
+    {"id": "google/gemini-2.5-flash-lite",   "name": "Gemini 2.5 Flash Lite (Vertex)",   "context_length": 8192,   "location": "global"},
+    {"id": "google/gemini-3-flash-preview",  "name": "Gemini 3 Flash Preview (Vertex)",  "context_length": 131072, "location": "global"},
+    {"id": "google/gemini-3.1-pro-preview",  "name": "Gemini 3.1 Pro Preview (Vertex)",  "context_length": 131072, "location": "global"},
 ]
 
 
@@ -711,9 +715,20 @@ import subprocess as _subprocess
 import tempfile as _tempfile
 
 
-def _vertex_base_url(project_id: str) -> str:
+def _vertex_base_url(project_id: str, location: str = "global") -> str:
     """Build the OpenAI-compatible Vertex AI Express endpoint URL."""
-    return f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/global/endpoints/openapi"
+    if location == "global":
+        return f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/global/endpoints/openapi"
+    # 區域端點使用 {region}-aiplatform.googleapis.com 主機名稱
+    return f"https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/{location}/endpoints/openapi"
+
+
+def _get_vertex_model_location(model_name: str) -> str | None:
+    """回傳指定 Vertex 模型所需的部署區域，若無特定限制則返回 None。"""
+    for item in VERTEX_DEFAULT_MODELS:
+        if item.get("id") == model_name:
+            return item.get("location")  # 可能是 "global", "us-central1" 等
+    return None
 
 
 def _mint_vertex_jwt(sa_json: dict) -> str:
@@ -1074,7 +1089,7 @@ async def register_vertex_provider(request: VertexRegisterRequest, db: Session =
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to mint Vertex access token: {e}")
 
-    base_url = _vertex_base_url(project_id)
+    base_url = _vertex_base_url(project_id, request.location or "global")
     label = COMMON_PROVIDER_TEMPLATES["google_vertex"]["label"]
     provider_name = request.name_override.strip() or f"{label} ({sa['client_email'].split('@')[0]})"
 

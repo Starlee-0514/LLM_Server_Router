@@ -15,6 +15,49 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/dev", tags=["dev"])
 
 
+@router.post("/mock-process")
+def inject_mock_process(identifier: str, port: int, model_path: str = "/mock/model.gguf"):
+    """[DEV/TEST ONLY] Inject a fake running process into the process manager for testing.
+
+    This allows integration tests to simulate a running model without launching a real
+    llama-server binary.  The process is registered as-if it were started normally.
+    Returns the registered process status.
+    """
+    from unittest.mock import MagicMock
+    from backend.app.core.process_manager import RunningProcess
+
+    if identifier in llama_process_manager._active_processes:
+        return JSONResponse(status_code=400, content={"error": f"Process '{identifier}' already exists"})
+
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    fake_proc.pid = 0
+    fake_proc.args = []
+    fake_proc.stdout = None
+    fake_proc.stderr = None
+
+    rp = RunningProcess(
+        process=fake_proc,
+        engine_type="mock",
+        model_path=model_path,
+        port=port,
+    )
+    rp.phase = "ready"
+    llama_process_manager._active_processes[identifier] = rp
+    logger.info("[DevMock] Injected fake process '%s' on port %d", identifier, port)
+    return {"identifier": identifier, "port": port, "model_path": model_path, "status": "injected"}
+
+
+@router.delete("/mock-process/{identifier}")
+def remove_mock_process(identifier: str):
+    """[DEV/TEST ONLY] Remove a previously injected mock process."""
+    if identifier not in llama_process_manager._active_processes:
+        return JSONResponse(status_code=404, content={"error": f"Process '{identifier}' not found"})
+    del llama_process_manager._active_processes[identifier]
+    logger.info("[DevMock] Removed mock process '%s'", identifier)
+    return {"identifier": identifier, "status": "removed"}
+
+
 @router.get("/events")
 def get_process_events(limit: int = Query(100, ge=1, le=500)):
     """Return recent process lifecycle events (newest first)."""

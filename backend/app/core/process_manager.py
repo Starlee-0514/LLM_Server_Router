@@ -477,6 +477,18 @@ class LlamaProcessManager:
                 return rp.port
         return None
 
+    def get_first_running_process(self) -> tuple[str, int] | None:
+        """回傳第一個正在運行中的 process 的 (identifier, port)，無則回傳 None。
+
+        用於 local_process 路由找不到名稱對應的 process 時的 fallback。
+        當用戶以邏輯別名（如 Local_Model_62k）設定 Route 但 process manager
+        以不同 identifier 啟動了模型時，允許路由仍能指向實際在跑的 process。
+        """
+        self._cleanup_dead_processes()
+        for idf, rp in self._active_processes.items():
+            return idf, rp.port
+        return None
+
 
 # 全域單例
 llama_process_manager = LlamaProcessManager()

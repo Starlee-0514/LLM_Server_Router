@@ -1768,11 +1768,6 @@ async def _proxy_openai_compatible(
         _conversation_id = conversation_id
         _tool_calls_count = tool_calls_count
         _cache_thought_sigs = cache_thought_sigs
-        # Track whether the *original client* explicitly requested usage in the stream.
-        # We unconditionally inject stream_options.include_usage=True upstream for logging,
-        # but we only forward the usage chunk back to clients that asked for it.
-        # (Copilot and some other clients crash on choices:[] chunks, so we keep them hidden.)
-        _client_wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
         _usage: dict = {}
 
         async def generate():
@@ -1888,9 +1883,12 @@ async def _proxy_openai_compatible(
 
                         except (json.JSONDecodeError, KeyError):
                             pass
-                    # If client explicitly requested include_usage, inject a usage chunk
-                    # right before [DONE] so they can see token counts.
-                    if line == "data: [DONE]" and _client_wants_usage and _usage:
+                    # Always inject a usage chunk right before [DONE] when upstream
+                    # returned usage data — this lets pi-agent and other clients
+                    # track token counts without needing to send stream_options.include_usage.
+                    # (Copilot-style clients that can't handle choices:[] should set
+                    #  stream_options.include_usage=false or avoid this flag entirely.)
+                    if line == "data: [DONE]" and _usage:
                         usage_chunk = {
                             "id": f"chatcmpl-usage-{int(time.time())}",
                             "object": "chat.completion.chunk",
