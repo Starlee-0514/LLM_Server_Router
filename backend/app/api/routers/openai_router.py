@@ -1,7 +1,10 @@
 """OpenAI-compatible routing for local, provider, and mesh backends."""
 import json
 import logging
+import threading
 import time
+import uuid
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Request, HTTPException, Depends
@@ -24,6 +27,8 @@ from backend.app.api.routers.provider_routes import (
     _AG_CLIENT_ID,
     _AG_CLIENT_SECRET,
     _AG_DEFAULT_PROJECT,
+    _vertex_base_url,
+    _get_vertex_model_location,
 )
 from backend.app.database import get_db
 from backend.app.models import ProviderEndpoint, ModelRoute, MeshWorker, VirtualModel
@@ -51,6 +56,311 @@ router = APIRouter(prefix="/v1", tags=["openai"])
 http_client = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=15.0, read=5.0, write=30.0, pool=5.0)
 )
+
+
+# ===========================================================================
+# Vertex AI thought-signature cache
+# ===========================================================================
+# Gemini 2.5+ thinking models attach an opaque ``thought_signature`` to every
+# function call they emit.  Subsequent requests that replay those calls in the
+# conversation history MUST include the same signature, or Vertex AI returns
+# HTTP 400 "missing a thought_signature".
+#
+# Clients like GitHub Copilot / VS Code speak the Ollama or plain OpenAI
+# protocol and therefore drop the ``thought_signature`` field when they send
+# the conversation history back to us.  This cache lets the proxy re-inject
+# the signatures transparently before forwarding to Vertex AI.
+
+class _ThoughtSigCache:
+    """Thread-safe TTL cache (in-memory + JSON file):  tool_call_id → thought_signature.
+
+    Persisted to ``logs/thought_sigs.json`` so the cache survives server restarts.
+    Copilot and other clients carry long multi-turn conversations across restarts;
+    without persistence every restart would cause Vertex AI 400 errors because the
+    thought_signature is missing from the replayed function-call blocks.
+    """
+
+    _TTL  = 7 * 24 * 3600   # 7 days – long enough for any realistic conversation
+    _FILE = Path("logs/thought_sigs.json")
+
+    def __init__(self) -> None:
+        self._lock  = threading.Lock()
+        self._store: dict[str, tuple[str, float]] = {}
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def put(self, call_id: str, sig: str) -> None:
+        if not call_id or not sig:
+            return
+        expiry = time.time() + self._TTL
+        with self._lock:
+            self._store[call_id] = (sig, expiry)
+        self._save_async()
+
+    def get(self, call_id: str) -> str | None:
+        with self._lock:
+            entry = self._store.get(call_id)
+            if not entry:
+                return None
+            sig, expiry = entry
+            if time.time() > expiry:
+                del self._store[call_id]
+                return None
+            return sig
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def _load(self) -> None:
+        """Load persisted cache from disk, dropping expired entries."""
+        try:
+            if not self._FILE.exists():
+                return
+            raw: dict[str, list] = json.loads(self._FILE.read_text(encoding="utf-8"))
+            now = time.time()
+            loaded = 0
+            for call_id, (sig, expiry) in raw.items():
+                if expiry > now:
+                    self._store[call_id] = (sig, expiry)
+                    loaded += 1
+            if loaded:
+                logger.info("[ThoughtSig] Loaded %d cached signatures from %s", loaded, self._FILE)
+        except Exception as exc:
+            logger.warning("[ThoughtSig] Could not load cache file: %s", exc)
+
+    def _save(self) -> None:
+        """Write current (non-expired) cache to disk."""
+        try:
+            self._FILE.parent.mkdir(parents=True, exist_ok=True)
+            now = time.time()
+            with self._lock:
+                data = {
+                    k: list(v)
+                    for k, v in self._store.items()
+                    if v[1] > now
+                }
+            self._FILE.write_text(json.dumps(data), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("[ThoughtSig] Could not save cache file: %s", exc)
+
+    def _save_async(self) -> None:
+        """Fire-and-forget background save so put() never blocks a request."""
+        threading.Thread(target=self._save, daemon=True).start()
+
+    def _cleanup(self) -> None:
+        now = time.time()
+        with self._lock:
+            expired = [k for k, (_, exp) in self._store.items() if now > exp]
+            for k in expired:
+                del self._store[k]
+
+
+_thought_sig_cache = _ThoughtSigCache()
+
+
+def _cache_thought_sigs_from_response(resp_json: dict) -> None:
+    """Extract and cache ``thought_signature`` from a non-streaming Vertex AI response.
+
+    Vertex AI returns the signature inside ``extra_content.google.thought_signature``
+    within each tool_call object (not at the top level of the tool_call).
+    """
+    for choice in (resp_json.get("choices") or []):
+        msg = choice.get("message") or {}
+        for tc in (msg.get("tool_calls") or []):
+            # Primary location: extra_content.google.thought_signature (Vertex AI)
+            sig = ((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature")
+            # Fallback: top-level thought_signature (future-proofing)
+            if not sig:
+                sig = tc.get("thought_signature")
+            call_id = tc.get("id")
+            if sig and call_id:
+                _thought_sig_cache.put(call_id, sig)
+                logger.debug("[ThoughtSig] Cached signature for tool_call_id=%s", call_id)
+
+
+def _cache_thought_sigs_from_sse_chunk(chunk: dict) -> None:
+    """Extract and cache ``thought_signature`` from a single streaming SSE delta chunk.
+
+    Vertex AI returns the signature inside ``extra_content.google.thought_signature``
+    within each tool_call delta object.
+    """
+    for choice in (chunk.get("choices") or []):
+        delta = choice.get("delta") or {}
+        for tc in (delta.get("tool_calls") or []):
+            sig = ((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature")
+            if not sig:
+                sig = tc.get("thought_signature")
+            call_id = tc.get("id")
+            if sig and call_id:
+                _thought_sig_cache.put(call_id, sig)
+                logger.debug("[ThoughtSig] Cached streaming signature for tool_call_id=%s", call_id)
+
+
+def _inject_thought_sigs(body: dict) -> dict:
+    """Re-inject cached ``thought_signature`` values into assistant tool_calls.
+
+    Vertex AI requires that any function call in the conversation history that
+    was originally produced by a thinking model carries its ``thought_signature``
+    inside ``extra_content.google.thought_signature``.
+
+    Clients that don't understand this field (e.g. GitHub Copilot / Ollama-compat
+    consumers) silently drop it, so we look it up from our local cache and
+    restore it before forwarding the request to Vertex AI.
+    """
+    messages = body.get("messages")
+    if not messages:
+        return body
+
+    new_messages = []
+    injected_any = False
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            new_messages.append(msg)
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not tool_calls:
+            new_messages.append(msg)
+            continue
+
+        new_tool_calls = []
+        for tc in tool_calls:
+            # Check if thought_signature already present (either location)
+            existing_sig = (
+                ((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature")
+                or tc.get("thought_signature")
+            )
+            if existing_sig:
+                new_tool_calls.append(tc)
+            else:
+                call_id = tc.get("id")
+                sig = _thought_sig_cache.get(call_id) if call_id else None
+                if sig:
+                    # Re-inject in the format Vertex AI expects:
+                    # tool_call.extra_content.google.thought_signature
+                    new_tc = dict(tc)
+                    extra_content = dict(new_tc.get("extra_content") or {})
+                    google_extra = dict(extra_content.get("google") or {})
+                    google_extra["thought_signature"] = sig
+                    extra_content["google"] = google_extra
+                    new_tc["extra_content"] = extra_content
+                    new_tool_calls.append(new_tc)
+                    injected_any = True
+                    logger.debug("[ThoughtSig] Re-injected signature for tool_call_id=%s", call_id)
+                else:
+                    new_tool_calls.append(tc)
+
+        new_messages.append({**msg, "tool_calls": new_tool_calls})
+
+    if not injected_any:
+        return body
+    return {**body, "messages": new_messages}
+
+
+def _is_missing_thought_sig_error(resp_body: bytes | str) -> bool:
+    """Return True if Vertex AI rejected the request due to a missing thought_signature."""
+    try:
+        text = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+        return "thought_signature" in text and "missing" in text
+    except Exception:
+        return False
+
+
+def _sanitize_messages_for_vertex(messages: list[dict]) -> list[dict]:
+    """Clean up message content so Vertex AI accepts it.
+
+    Vertex AI restrictions (as of 2025):
+    * ``tool`` role messages must have a plain string ``content``.
+      Copilot sometimes sends a list of content parts that includes
+      ``{type: "image_url", ...}`` blocks — those are rejected with HTTP 400.
+    * ``user`` role messages DO support inline base64 images via ``image_url``.
+
+    Strategy for list-typed content:
+    - If role == "tool":
+        1. Keep all ``{type: "text"}`` parts and join their text with newlines.
+        2. Drop ``{type: "image_url"}`` parts (and any other unknown types).
+        3. Return plain string.
+    - If role == "user":
+        1. Leave it untouched (pass image_url parts through so Vertex AI can see them).
+    """
+    cleaned: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content")
+        
+        if role == "tool" and isinstance(content, list):
+            text_parts = [
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            dropped = sum(
+                1 for part in content
+                if isinstance(part, dict) and part.get("type") != "text"
+            )
+            if dropped:
+                logger.debug(
+                    "[VertexSanitize] Dropped %d non-text content part(s) from tool message",
+                    dropped,
+                )
+            cleaned.append({**msg, "content": "\n".join(text_parts)})
+        else:
+            cleaned.append(msg)
+    return cleaned
+
+
+def _strip_old_tool_calls(body: dict) -> dict | None:
+    """Emergency fallback: rebuild the message list keeping only the last user turn.
+
+    When we cannot inject thought_signatures (e.g. after a server restart), Vertex AI
+    returns HTTP 400.  Rather than surfacing a hard error to the user we trim the
+    conversation down to just the system prompt (if any) + the latest user message
+    and retry.  Context is lost but the conversation can continue.
+
+    Returns None if there is no user message to recover.
+    """
+    messages = body.get("messages") or []
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    # Walk backwards to find the last user message
+    last_user = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user = m
+            break
+    if last_user is None:
+        return None
+    new_messages = system_msgs + [last_user]
+    logger.warning(
+        "[ThoughtSig] Missing thought_signature — stripping %d old messages, "
+        "retrying with only the last user turn.",
+        len(messages) - len(new_messages),
+    )
+    return {**body, "messages": new_messages}
+
+
+# Vertex AI thinking budget: cap the model's reasoning to prevent multi-minute stalls.
+# gemini-3.1-pro-preview (and other thinking models) can reason indefinitely on large
+# contexts; setting thinking_budget keeps requests under ~30 seconds in practice.
+_VERTEX_THINKING_BUDGET = 8192  # tokens; tune per model if needed
+
+
+def _prepare_vertex_body(body: dict) -> dict:
+    """Prepare a request body for Vertex AI's OpenAI-compatible endpoint.
+
+    1. Sanitizes messages (strips image_url from tool messages).
+    2. Re-injects thought_signatures.
+    3. Injects thinking_config.thinking_budget to cap reasoning time.
+    """
+    prepared = translate_tools(body, "openai_compatible")
+    prepared["messages"] = _sanitize_messages_for_vertex(prepared.get("messages") or [])
+    prepared = _inject_thought_sigs(prepared)
+    # Inject thinking budget only if the request doesn't already set one
+    if "thinking_config" not in prepared:
+        prepared["thinking_config"] = {"thinking_budget": _VERTEX_THINKING_BUDGET}
+    return prepared
 
 
 def _log_completion_usage(body: dict, resp_json: dict, target_url: str, db: Session | None = None, elapsed: float | None = None,
@@ -360,6 +670,40 @@ async def _build_vertex_headers(provider: ProviderEndpoint, db: Session) -> dict
     }
 
 
+def _build_vertex_chat_url(provider: ProviderEndpoint, model_name: str) -> str:
+    """Build the Vertex AI chat/completions URL, 根據模型自動選擇適合的部署區域。
+
+    Vertex AI GA 模型（gemini-2.5-*）使用 global 端點；
+    Preview / 實驗性模型（gemini-3.x）需要指定區域（如 us-central1）。
+    """
+    model_location = _get_vertex_model_location(model_name)
+    if not model_location:
+        # 未登錄在 VERTEX_DEFAULT_MODELS 中，直接使用 provider.base_url
+        return build_provider_chat_url(provider.base_url)
+
+    # 嘗試從 api_key JSON 提取 project_idï＼＾
+    try:
+        token_data = json.loads(provider.api_key or "{}")
+        project_id = token_data.get("project_id", "")
+    except (json.JSONDecodeError, TypeError):
+        project_id = ""
+
+    if not project_id:
+        # 無法得知 project_id，回退至 provider.base_url
+        logger.warning(
+            "[Vertex] Cannot extract project_id for model '%s'; falling back to provider base_url",
+            model_name,
+        )
+        return build_provider_chat_url(provider.base_url)
+
+    base = _vertex_base_url(project_id, model_location)
+    logger.debug(
+        "[Vertex] model='%s' 路由到區域='%s' url='%s'",
+        model_name, model_location, base,
+    )
+    return f"{base}/chat/completions"
+
+
 def _is_lmstudio_provider(provider: ProviderEndpoint) -> bool:
     """Return True if this provider points to a local or network LM Studio server."""
     base = (provider.base_url or "").lower().rstrip("/")
@@ -598,7 +942,7 @@ async def _proxy_gemini_cloudcode(
         "model": model_name,
         "request": gemini_request,
         "userAgent": "llm-server-router",
-        "requestId": f"router-{int(time.time())}-{model_name}",
+        "requestId": f"router-{uuid.uuid4().hex}-{model_name}",
     }
     if project_id:
         gemini_body["project"] = project_id
@@ -997,7 +1341,7 @@ async def _proxy_antigravity(
         "request": gemini_request,
         "requestType": "agent",
         "userAgent": "antigravity",
-        "requestId": f"agent-{int(time.time())}-{model_name}",
+        "requestId": f"agent-{uuid.uuid4().hex}-{model_name}",
     }
     if project_id:
         gemini_body["project"] = project_id
@@ -1388,31 +1732,31 @@ async def _proxy_openai_compatible(
     provider_type: str | None = None,
     conversation_id: str | None = None,
     tool_calls_count: int = 0,
+    cache_thought_sigs: bool = False,
 ):
     is_streaming = body.get("stream", False)
     t0 = time.time()
     if is_streaming:
+        import asyncio as _asyncio
         # Inject stream_options so the upstream returns usage in the final SSE chunk
         streaming_body = dict(body)
         streaming_body.setdefault("stream_options", {})["include_usage"] = True
 
-        # 串流超時：連線 15s，每個 chunk 之間最多等 120s
-        # timeout must be set on build_request (httpx 0.28+ dropped timeout kwarg on send())
+        # 串流超時：連線 15s，每個 chunk 之間最多等 600s
+        # 600s (10 min) read timeout is necessary for large-context local models:
+        # a 12k-token prefill on a 27B Q4 Vulkan model can take several minutes
+        # before the first streaming token arrives.  Remote providers (Vertex, Copilot)
+        # are unaffected because they respond within seconds.
+        _stream_timeout = httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=5.0)
         req = http_client.build_request(
             "POST", target_url, headers=headers, json=streaming_body,
-            timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=5.0),
+            timeout=_stream_timeout,
         )
-        response = await http_client.send(req, stream=True)
-
-        if response.status_code != 200:
-            err_body = await response.aread()
-            await response.aclose()
-            logger.warning("Upstream error %s from %s: %s", response.status_code, target_url, err_body[:500])
-            try:
-                err_json = json.loads(err_body)
-            except Exception:
-                err_json = {"error": {"message": err_body.decode(errors="replace")[:1000]}}
-            return JSONResponse(status_code=response.status_code, content=err_json)
+        # NOTE: do NOT await http_client.send() here.
+        # For large contexts Vertex AI takes 10-20s to send even the HTTP 200 headers.
+        # If we block here, FastAPI cannot return 200 OK to Copilot, so Copilot times out
+        # and shows "Response contained no choices" before we even start streaming.
+        # Instead, connect inside generate() and send SSE keep-alive comments while waiting.
 
         # Capture closure vars for post-stream recording
         _t0 = t0
@@ -1423,11 +1767,81 @@ async def _proxy_openai_compatible(
         _provider_type = provider_type
         _conversation_id = conversation_id
         _tool_calls_count = tool_calls_count
+        _cache_thought_sigs = cache_thought_sigs
+        # Track whether the *original client* explicitly requested usage in the stream.
+        # We unconditionally inject stream_options.include_usage=True upstream for logging,
+        # but we only forward the usage chunk back to clients that asked for it.
+        # (Copilot and some other clients crash on choices:[] chunks, so we keep them hidden.)
+        _client_wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
         _usage: dict = {}
 
         async def generate():
+            _sent_any_choice = False
+
+            # --- Phase 1: connect to upstream, keep client alive with SSE comments ---
+            # Use wait_for+shield so we exit the keepalive loop the moment the
+            # connection is ready, without burning an extra 3-second sleep cycle.
+            connect_task = _asyncio.ensure_future(http_client.send(req, stream=True))
             try:
-                async for line in response.aiter_lines():
+                while not connect_task.done():
+                    try:
+                        await _asyncio.wait_for(_asyncio.shield(connect_task), timeout=3.0)
+                        break  # connected before timeout
+                    except _asyncio.TimeoutError:
+                        # Still waiting — send keep-alive to reset client read-timeout
+                        yield b": keepalive\n\n"
+                    except Exception as conn_exc:
+                        # connect_task raised a non-asyncio exception (e.g. httpx.ReadTimeout,
+                        # httpx.ConnectError) while we were inside wait_for(shield(…)).
+                        # asyncio.shield propagates it through wait_for without converting
+                        # to TimeoutError, so it would normally escape the generator and
+                        # surface as an ASGI 500.  Catch it here and return a clean SSE error.
+                        logger.warning(
+                            "[Proxy] Upstream connection error during streaming connect: %s %s",
+                            type(conn_exc).__name__, conn_exc,
+                        )
+                        err = {"error": {"message": str(conn_exc),
+                                         "type": "connection_error", "code": 503}}
+                        yield f"data: {json.dumps(err)}\n\ndata: [DONE]\n\n".encode()
+                        return
+            except _asyncio.CancelledError:
+                connect_task.cancel()
+                return
+
+            try:
+                response = connect_task.result()
+            except Exception as exc:
+                err = {"error": {"message": str(exc), "type": "connection_error", "code": 503}}
+                yield f"data: {json.dumps(err)}\n\ndata: [DONE]\n\n".encode()
+                return
+
+            if response.status_code == 429:
+                # Rate-limited: wait briefly and tell the client to retry.
+                # We can't retry transparently here (streaming already started),
+                # so surface a clear error message.
+                err_body = await response.aread()
+                await response.aclose()
+                wait_hint = 30
+                logger.warning("[Vertex] 429 Rate Limit from %s — retry in %ds", target_url, wait_hint)
+                err_json = {"error": {"message": f"Vertex AI rate limit (429). Please wait ~{wait_hint}s and try again.", "code": 429, "type": "rate_limit_error"}}
+                yield f"data: {json.dumps(err_json)}\n\ndata: [DONE]\n\n".encode()
+                return
+
+            if response.status_code != 200:
+                err_body = await response.aread()
+                await response.aclose()
+                logger.warning("Upstream error %s from %s: %s",
+                               response.status_code, target_url, err_body[:500])
+                try:
+                    err_json = json.loads(err_body)
+                except Exception:
+                    err_json = {"error": {"message": err_body.decode(errors="replace")[:1000]}}
+                yield f"data: {json.dumps(err_json)}\n\ndata: [DONE]\n\n".encode()
+                return
+
+            # --- Phase 2: stream chunks from upstream to client ---
+            try:
+                async for line in response.aiter_lines():  # noqa: E501
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
                             d = json.loads(line[6:])
@@ -1437,30 +1851,81 @@ async def _proxy_openai_compatible(
                             if has_usage:
                                 _usage.update(d["usage"])
 
-                            # 1) If it has NO choices and NO usage, it's likely a prompt_filter_results chunk.
-                            # Strict OpenAI clients might crash on choices: [] without usage.
-                            if not has_choices and not has_usage:
-                                continue
+                            # Cache thought_signatures from Vertex AI thinking models
+                            if _cache_thought_sigs:
+                                _cache_thought_sigs_from_sse_chunk(d)
 
-                            # 2) If it has BOTH choices and usage (GitHub Copilot anomaly).
-                            # Strict OpenAI spec requires choices: [] when usage is present in stream.
+                            # Never forward chunks with empty choices.
+                            # We inject stream_options.include_usage so we can record
+                            # usage internally, but Copilot (and many other clients)
+                            # crash on any chunk where choices is [] or missing.
+                            if not has_choices:
+                                continue  # drop: pure usage / filter-results chunk
+
+                            # Ensure every streaming choice has a `delta` field.
+                            # Vertex AI omits `delta` on finish-only chunks (e.g. when
+                            # all tokens were used for reasoning).  Copilot treats
+                            # choices without `delta` as invalid and reports "no choices".
+                            choices = d.get("choices") or []
+                            patched = False
+                            for ch in choices:
+                                if "delta" not in ch:
+                                    ch["delta"] = {"content": "", "role": "assistant"}
+                                    patched = True
+                            if patched:
+                                line = "data: " + json.dumps(d)
+
+                            # Strip usage before forwarding if it's bundled with choices
+                            # (Vertex AI anomaly: sends choices+usage in one chunk).
                             if has_choices and has_usage:
-                                # Yield choices chunk first without usage
-                                d_choices = dict(d)
-                                del d_choices["usage"]
-                                yield f"data: {json.dumps(d_choices)}\n\n".encode("utf-8")
-
-                                # Yield usage chunk with empty choices
-                                d_usage = dict(d)
-                                d_usage["choices"] = []
-                                yield f"data: {json.dumps(d_usage)}\n\n".encode("utf-8")
+                                d_fwd = dict(d)
+                                del d_fwd["usage"]
+                                _sent_any_choice = True
+                                yield f"data: {json.dumps(d_fwd)}\n\n".encode("utf-8")
                                 continue
+
+                            _sent_any_choice = True
 
                         except (json.JSONDecodeError, KeyError):
                             pass
-                    
+                    # If client explicitly requested include_usage, inject a usage chunk
+                    # right before [DONE] so they can see token counts.
+                    if line == "data: [DONE]" and _client_wants_usage and _usage:
+                        usage_chunk = {
+                            "id": f"chatcmpl-usage-{int(time.time())}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": _body.get("model", ""),
+                            "choices": [],
+                            "usage": _usage,
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
                     yield (line + "\n").encode("utf-8")
+            except (httpx.TimeoutException, httpx.TransportError) as stream_exc:
+                # Mid-stream network error (e.g. model server timed out between tokens,
+                # or TCP connection was reset).  Catch it here so the ASGI layer never
+                # sees an unhandled exception — instead send a clean SSE error event.
+                logger.warning(
+                    "[Proxy] Upstream stream interrupted (%s): %s",
+                    type(stream_exc).__name__, stream_exc,
+                )
+                if not _sent_any_choice:
+                    err = {"error": {"message": f"Upstream stream error: {stream_exc}",
+                                     "type": "stream_error", "code": 503}}
+                    yield f"data: {json.dumps(err)}\n\ndata: [DONE]\n\n".encode()
+                else:
+                    yield b"data: [DONE]\n\n"
+                return
             finally:
+                # If Vertex AI returned nothing useful (safety block, pure reasoning, etc.)
+                # synthesize a minimal valid chunk so clients don't crash.
+                if not _sent_any_choice:
+                    fallback = (
+                        'data: {"choices":[{"delta":{"content":"","role":"assistant"},'
+                        '"finish_reason":"stop","index":0}],"object":"chat.completion.chunk"}'
+                    )
+                    yield (fallback + "\n\n").encode("utf-8")
+                    yield b"data: [DONE]\n\n"
                 await response.aclose()
                 # Record benchmark/completion log after stream ends
                 completion_tokens = _usage.get("completion_tokens") or 0
@@ -1486,17 +1951,30 @@ async def _proxy_openai_compatible(
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    response = await http_client.post(target_url, headers=headers, json=body, timeout=120.0)
+    try:
+        response = await http_client.post(target_url, headers=headers, json=body, timeout=120.0)
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        # Network-level error on the non-streaming path (connection refused, timeout, etc.).
+        # Return a clean JSON 502 so callers always get structured JSON, never a raw 500.
+        logger.warning("[Proxy] Upstream connection error (non-streaming): %s %s", type(exc).__name__, exc)
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": str(exc), "type": "connection_error", "code": 502}},
+        )
     elapsed = time.time() - t0
     if response.status_code != 200:
         logger.warning("Upstream error %s from %s: %s", response.status_code, target_url, response.text[:500])
     else:
+        resp_json = response.json()
+        if cache_thought_sigs:
+            _cache_thought_sigs_from_response(resp_json)
         _log_completion_usage(
-            body, response.json(), target_url, db=db, elapsed=elapsed,
+            body, resp_json, target_url, db=db, elapsed=elapsed,
             model_resolved=model_resolved, provider_name=provider_name,
             provider_type=provider_type, conversation_id=conversation_id,
             tool_calls_count=tool_calls_count,
         )
+        return JSONResponse(status_code=response.status_code, content=resp_json)
     return JSONResponse(status_code=response.status_code, content=response.json())
 
 
@@ -1648,13 +2126,42 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
 
         if provider.provider_type == "local_process":
             port = llama_process_manager.get_router_port_for_model(routed_model)
+            fallback_identifier: str | None = None
             if port is None:
-                raise HTTPException(status_code=503, detail=f"Local model '{routed_model}' is not currently running")
+                # Fallback: the route alias (e.g. 'Local_Model_62k') may not match the
+                # process-manager identifier (e.g. 'GLM-4.7-Flash-Q8_0').  When there
+                # is at least one running local process, route to the best-match one.
+                #
+                # Priority:
+                #   1. Exact/substring match already tried above (port is None → no match)
+                #   2. If exactly ONE process is running → use it unconditionally.
+                #   3. If multiple processes running → use the first one but log a warning
+                #      so the user knows to set target_model for deterministic behaviour.
+                fallback = llama_process_manager.get_first_running_process()
+                if fallback:
+                    fallback_identifier, port = fallback
+                    logger.warning(
+                        "[LocalProcess] Route '%s': no running process matched '%s'; "
+                        "falling back to '%s' on port %d. "
+                        "Set 'target_model' in the route to the process identifier to "
+                        "avoid this ambiguity.",
+                        rule.route_name, routed_model, fallback_identifier, port,
+                    )
+            if port is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Local model '{routed_model}' is not currently running and "
+                        f"no fallback local process is available. "
+                        f"Please start the model first or check the route configuration."
+                    ),
+                )
             request_stats.increment_local()
             target_url = f"http://127.0.0.1:{port}/v1/chat/completions"
             result = await _proxy_openai_compatible(
                 target_url, {"Content-Type": "application/json"}, route_body, db=db,
-                model_resolved=routed_model, provider_name="local", provider_type="local_process",
+                model_resolved=fallback_identifier or routed_model,
+                provider_name=provider.name, provider_type="local_process",
                 conversation_id=conversation_id,
             )
 
@@ -1664,13 +2171,29 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
 
         elif provider.provider_type == "google_vertex":
             request_stats.increment_remote()
-            fwd_body = translate_tools(route_body, "openai_compatible")
+            fwd_body = _prepare_vertex_body(route_body)
             headers = await _build_vertex_headers(provider, db)
+            vertex_url = _build_vertex_chat_url(provider, routed_model)
             result = await _proxy_openai_compatible(
-                build_provider_chat_url(provider.base_url), headers, fwd_body, db=db,
+                vertex_url, headers, fwd_body, db=db,
                 model_resolved=routed_model, provider_name=provider.name,
                 provider_type=provider.provider_type, conversation_id=conversation_id,
+                cache_thought_sigs=True,
             )
+            # --- Fallback: missing thought_signature after server restart ---
+            if (
+                result is not None
+                and getattr(result, "status_code", None) == 400
+                and _is_missing_thought_sig_error(getattr(result, "body", b""))
+            ):
+                stripped = _strip_old_tool_calls(fwd_body)
+                if stripped is not None:
+                    result = await _proxy_openai_compatible(
+                        vertex_url, headers, stripped, db=db,
+                        model_resolved=routed_model, provider_name=provider.name,
+                        provider_type=provider.provider_type, conversation_id=conversation_id,
+                        cache_thought_sigs=True,
+                    )
 
         elif provider.provider_type == "openai_compatible":
             if not provider.base_url:
@@ -1867,11 +2390,12 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
         # Vertex AI: service-account token auth
         if _is_vertex_provider(provider):
             headers = await _build_vertex_headers(provider, db)
-            fwd_body_cat = translate_tools(body, "openai_compatible")
+            fwd_body_cat = _prepare_vertex_body(body)
             return await _proxy_openai_compatible(
-                build_provider_chat_url(provider.base_url or ""), headers, fwd_body_cat, db=db,
+                _build_vertex_chat_url(provider, model_name), headers, fwd_body_cat, db=db,
                 model_resolved=model_name, provider_name=provider.name,
                 provider_type=provider.provider_type, conversation_id=conversation_id,
+                cache_thought_sigs=True,
             )
 
         # Gemini Cloud Code: use native API translation
@@ -1995,6 +2519,16 @@ async def chat_completions(request: Request, db: Session = Depends(get_db)):
             raise HTTPException(status_code=502, detail="Bad Gateway: Unable to reach Anthropic")
 
     port = llama_process_manager.get_router_port_for_model(model_name)
+    if port is None:
+        # Fallback: try the first running process when name doesn't match
+        fallback = llama_process_manager.get_first_running_process()
+        if fallback:
+            fallback_id, port = fallback
+            logger.warning(
+                "[LocalProcess] No route or exact match for '%s'; "
+                "falling back to running process '%s' on port %d.",
+                model_name, fallback_id, port,
+            )
     if port is None:
         raise HTTPException(
             status_code=503,
